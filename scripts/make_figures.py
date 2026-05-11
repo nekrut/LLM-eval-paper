@@ -778,6 +778,193 @@ def fig_qwen3p6_27b_error_per_platform(out: Path,
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Manuscript figures (Altair / Vega-Lite renderer).
+# Same data, same layout decisions as the matplotlib versions above; output
+# is rendered via vl-convert to PNG at the same paths the writeup embeds.
+# ────────────────────────────────────────────────────────────────────────────
+def fig_5080_implementer_gradient_altair(df: pd.DataFrame, out: Path):
+    """Headline figure (Altair): 6 open-weight implementers × 7 plan variants
+    on RTX 5080. Cells are mean variant-overlap score across 3 seeds; grey =
+    untested combination."""
+    import altair as alt
+
+    sub = df[(df["hardware"] == "5080") & (df["model"].isin(LINEUP_5080))]
+    pivot = sub.pivot_table(index="model", columns="plan_col", values="M3", aggfunc="mean")
+    cnt   = sub.pivot_table(index="model", columns="plan_col", values="M3", aggfunc="count")
+    cols  = [c for c in PLAN_COLS if c in pivot.columns]
+    pivot = pivot.reindex(index=LINEUP_5080, columns=cols)
+    cnt   = cnt.reindex(index=LINEUP_5080, columns=cols)
+
+    rows = []
+    for m in LINEUP_5080:
+        for c in cols:
+            v = pivot.at[m, c]; n = cnt.at[m, c]
+            rows.append({
+                "model_label":  pretty(m),
+                "model_order":  LINEUP_5080.index(m),
+                "plan":         c,
+                "score":        None if pd.isna(v) else float(v),
+                "n":            None if pd.isna(n) else int(n),
+                "label":        f"{v:.2f}\n(n={int(n)})" if not pd.isna(v) else "",
+            })
+    src = pd.DataFrame(rows)
+    plotted = src.dropna(subset=["score"])
+
+    cell_w, cell_h = 78, 56
+    chart_w = cell_w * len(cols)
+    chart_h = cell_h * len(LINEUP_5080)
+    model_axis = alt.Axis(labelFontSize=10, labelAngle=0, title=None)
+    plan_axis  = alt.Axis(labelFontSize=11, title="Plan variant (lean → detailed; B = no plan)",
+                          titleFontSize=11, orient="bottom")
+    base = alt.Chart(plotted).encode(
+        x=alt.X("plan:N", sort=cols, axis=plan_axis),
+        y=alt.Y("model_label:N",
+                sort=alt.SortField(field="model_order", order="ascending"),
+                axis=model_axis),
+    )
+    rect = base.mark_rect(stroke="white", strokeWidth=0.5).encode(
+        color=alt.Color("score:Q",
+                        scale=alt.Scale(scheme="redyellowgreen", domain=[0, 1]),
+                        legend=alt.Legend(title="mean score (Jaccard)", orient="right",
+                                          gradientLength=chart_h * 0.6)),
+        tooltip=["model_label:N", "plan:N", alt.Tooltip("score:Q", format=".3f"), "n:Q"],
+    )
+    text = base.mark_text(fontSize=9, lineBreak="\n").encode(
+        text="label:N",
+        color=alt.condition(
+            "datum.score < 0.25 || datum.score > 0.85",
+            alt.value("white"), alt.value("black"),
+        ),
+    )
+    layered = (rect + text).properties(
+        width=chart_w, height=chart_h,
+        title=alt.TitleParams(
+            text="Six latest open-weight implementers × seven Opus-authored plans on RTX 5080",
+            fontSize=12, anchor="start"),
+    ).configure_view(stroke=None).configure_axis(
+        domain=False, ticks=False, labelFontSize=10).configure_axisX(labelPadding=4)
+
+    layered.save(str(out), ppi=130)
+    print(f"[fig_5080_implementer_gradient_altair] wrote {out}")
+
+
+def fig_qwen3p6_27b_error_per_platform_altair(out: Path,
+                                              runs_dir: Path = BENCH / "runs_inject"):
+    """Altair version of the qwen3.6:27b vs Opus cross-platform error matrix.
+    Vertical-concat of three platforms; horizontal-concat of v2 vs v2_defensive
+    within each platform. Each subplot: 2 models × N pattern@target cells,
+    coloured by modal handle category across 3 seeds."""
+    import altair as alt
+
+    df_inject = collect_inject_runs(runs_dir)
+    if df_inject.empty:
+        print(f"[fig_qwen3p6_27b_error_per_platform_altair] no runs in {runs_dir} — skipping")
+        return
+    df_inject = df_inject[df_inject["plan"].isin(["v2", "v2_defensive"])]
+    df_inject = df_inject[df_inject["model"].isin(["qwen3.6_27b", "claude-opus-4-7"])].copy()
+    df_inject = df_inject.drop_duplicates(
+        subset=["model","plan","pattern","target","seed","hardware"], keep="last")
+
+    platforms  = ["jetson", "m4", "a5000"]
+    plat_label = {"jetson": "NVIDIA Jetson AGX Orin",
+                  "m4":     "MacBook Pro M4 Pro",
+                  "a5000":  "2× RTX A5000 workstation"}
+    models = ["claude-opus-4-7", "qwen3.6_27b"]
+    plans  = ["v2", "v2_defensive"]
+    patterns = sorted(df_inject["pattern"].unique())
+    targets  = sorted(df_inject["target"].unique())
+    cells    = [(p, t) for p in patterns for t in targets
+                if not df_inject[(df_inject["pattern"]==p) & (df_inject["target"]==t)].empty]
+    cell_keys = [f"{p}@{t}" for p, t in cells]
+
+    rows = []
+    for hw in platforms:
+        for plan in plans:
+            sub = df_inject[(df_inject["hardware"] == hw) & (df_inject["plan"] == plan)]
+            for m in models:
+                for p, t in cells:
+                    ms = sub[(sub["model"]==m) & (sub["pattern"]==p) & (sub["target"]==t)]
+                    modal = _modal_handle(ms["handle"]) if len(ms) else None
+                    rows.append({
+                        "hardware":      hw,
+                        "platform_label": plat_label[hw],
+                        "plan":          plan,
+                        "model":         pretty(m),
+                        "model_order":   models.index(m),
+                        "cell":          f"{p}@{t}",
+                        "handle":        modal if modal in HANDLE_ORDER else None,
+                    })
+    src = pd.DataFrame(rows)
+    src_present = src.dropna(subset=["handle"])
+
+    cell_w  = 38
+    cell_h  = 26
+    sub_w   = cell_w * len(cells)
+    sub_h   = cell_h * len(models)
+
+    color_scale = alt.Scale(domain=HANDLE_ORDER,
+                            range=[HANDLE_COLOR[h] for h in HANDLE_ORDER])
+
+    def make_panel(hw: str, plan: str, show_y: bool, show_x: bool, show_title: bool):
+        d = src_present[(src_present["hardware"] == hw) & (src_present["plan"] == plan)]
+        y_axis = alt.Axis(labelFontSize=9, title=None) if show_y else None
+        x_axis = alt.Axis(labelFontSize=8, labelAngle=-30, title=None) if show_x else None
+        chart = alt.Chart(d).mark_rect(stroke="white", strokeWidth=0.5).encode(
+            x=alt.X("cell:N", sort=cell_keys, axis=x_axis),
+            y=alt.Y("model:N",
+                    sort=alt.SortField(field="model_order", order="ascending"),
+                    axis=y_axis),
+            color=alt.Color("handle:N", scale=color_scale,
+                            legend=None,
+                            sort=HANDLE_ORDER),
+            tooltip=["platform_label:N", "plan:N", "model:N", "cell:N", "handle:N"],
+        ).properties(width=sub_w, height=sub_h)
+        if show_title:
+            chart = chart.properties(title=alt.TitleParams(text=plan, fontSize=11, anchor="middle"))
+        return chart
+
+    rows_charts = []
+    for ri, hw in enumerate(platforms):
+        is_first_row = ri == 0
+        is_last_row  = ri == len(platforms) - 1
+        # Header row label (vertical band) + two panels
+        # Each platform row is a horizontal concat of v2 + v2_defensive.
+        panels = [make_panel(hw, plan, show_y=(ci == 0),
+                             show_x=is_last_row,
+                             show_title=is_first_row)
+                  for ci, plan in enumerate(plans)]
+        row = alt.hconcat(*panels, spacing=18).properties(
+            title=alt.TitleParams(text=plat_label[hw], fontSize=10,
+                                  anchor="start", align="left", offset=4),
+        )
+        rows_charts.append(row)
+
+    legend_df = pd.DataFrame({"handle": HANDLE_ORDER})
+    legend_chart = alt.Chart(legend_df).mark_square(size=180).encode(
+        y=alt.Y("handle:N", sort=HANDLE_ORDER, axis=alt.Axis(orient="right",
+                                                             title=None,
+                                                             labelFontSize=10,
+                                                             ticks=False, domain=False)),
+        color=alt.Color("handle:N", scale=color_scale, legend=None,
+                        sort=HANDLE_ORDER),
+    ).properties(
+        width=20, height=cell_h * len(HANDLE_ORDER),
+        title=alt.TitleParams(text="modal handle (n=3 seeds)",
+                              fontSize=10, anchor="start"),
+    )
+
+    body = alt.vconcat(*rows_charts, spacing=22)
+    full = alt.hconcat(body, legend_chart, spacing=24).properties(
+        title=alt.TitleParams(
+            text="qwen3.6:27b matches claude-opus-4-7 across platforms on the error matrix",
+            fontSize=12, anchor="start"),
+    ).configure_view(stroke=None).configure_axis(domain=False, ticks=False)
+
+    full.save(str(out), ppi=130)
+    print(f"[fig_qwen3p6_27b_error_per_platform_altair] wrote {out}")
+
+
+# ────────────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--all", action="store_true")
@@ -809,8 +996,8 @@ def main():
     elif args.fig1_per_platform:
         fig1_per_platform(df, FIGS)
     elif args.manuscript:
-        fig_5080_implementer_gradient(df, FIGS / "ms_fig2_5080_gradient.png")
-        fig_qwen3p6_27b_error_per_platform(FIGS / "ms_fig4_qwen3p6_27b_error.png")
+        fig_5080_implementer_gradient_altair(df, FIGS / "ms_fig2_5080_gradient.png")
+        fig_qwen3p6_27b_error_per_platform_altair(FIGS / "ms_fig4_qwen3p6_27b_error.png")
     else:
         funcs[args.fig]()
         print(f"wrote figures/fig{args.fig}_*.png")
