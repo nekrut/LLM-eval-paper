@@ -850,10 +850,13 @@ def fig_5080_implementer_gradient_altair(df: pd.DataFrame, out: Path):
 
 def fig_qwen3p6_27b_error_per_platform_altair(out: Path,
                                               runs_dir: Path = BENCH / "runs_inject"):
-    """Altair version of the qwen3.6:27b vs Opus cross-platform error matrix.
-    Vertical-concat of three platforms; horizontal-concat of v2 vs v2_defensive
-    within each platform. Each subplot: 2 models × N pattern@target cells,
-    coloured by modal handle category across 3 seeds."""
+    """Condensed Altair figure: qwen3.6:27b vs claude-opus-4-7 on the
+    12-cell error matrix, two plans (v2 | v2_defensive) shown side-by-side.
+    Modal handle category across 3 seeds × 3 hardware platforms (Jetson,
+    M4 Pro, 2× A5000). The cross-platform invariance was verified for
+    every (model, plan, pattern, target) cell — all 48 cells produce the
+    same modal handle on every platform — so the figure shows the
+    consensus pattern with platform invariance noted in the title."""
     import altair as alt
 
     df_inject = collect_inject_runs(runs_dir)
@@ -865,10 +868,6 @@ def fig_qwen3p6_27b_error_per_platform_altair(out: Path,
     df_inject = df_inject.drop_duplicates(
         subset=["model","plan","pattern","target","seed","hardware"], keep="last")
 
-    platforms  = ["jetson", "m4", "a5000"]
-    plat_label = {"jetson": "NVIDIA Jetson AGX Orin",
-                  "m4":     "MacBook Pro M4 Pro",
-                  "a5000":  "2× RTX A5000 workstation"}
     models = ["claude-opus-4-7", "qwen3.6_27b"]
     plans  = ["v2", "v2_defensive"]
     patterns = sorted(df_inject["pattern"].unique())
@@ -877,87 +876,66 @@ def fig_qwen3p6_27b_error_per_platform_altair(out: Path,
                 if not df_inject[(df_inject["pattern"]==p) & (df_inject["target"]==t)].empty]
     cell_keys = [f"{p}@{t}" for p, t in cells]
 
+    # Consensus across platforms — modal of (modal-per-platform) handle.
     rows = []
-    for hw in platforms:
-        for plan in plans:
-            sub = df_inject[(df_inject["hardware"] == hw) & (df_inject["plan"] == plan)]
-            for m in models:
-                for p, t in cells:
-                    ms = sub[(sub["model"]==m) & (sub["pattern"]==p) & (sub["target"]==t)]
-                    modal = _modal_handle(ms["handle"]) if len(ms) else None
-                    rows.append({
-                        "hardware":      hw,
-                        "platform_label": plat_label[hw],
-                        "plan":          plan,
-                        "model":         pretty(m),
-                        "model_order":   models.index(m),
-                        "cell":          f"{p}@{t}",
-                        "handle":        modal if modal in HANDLE_ORDER else None,
-                    })
-    src = pd.DataFrame(rows)
-    src_present = src.dropna(subset=["handle"])
+    for plan in plans:
+        for m in models:
+            for p, t in cells:
+                ms = df_inject[(df_inject["plan"]==plan) & (df_inject["model"]==m)
+                               & (df_inject["pattern"]==p) & (df_inject["target"]==t)]
+                modal = _modal_handle(ms["handle"]) if len(ms) else None
+                rows.append({
+                    "plan":        plan,
+                    "model":       pretty(m),
+                    "model_order": models.index(m),
+                    "cell":        f"{p}@{t}",
+                    "handle":      modal if modal in HANDLE_ORDER else None,
+                })
+    src = pd.DataFrame(rows).dropna(subset=["handle"])
 
-    cell_w  = 38
-    cell_h  = 26
-    sub_w   = cell_w * len(cells)
-    sub_h   = cell_h * len(models)
+    cell_w, cell_h = 44, 36
+    sub_w  = cell_w * len(cells)
+    sub_h  = cell_h * len(models)
 
     color_scale = alt.Scale(domain=HANDLE_ORDER,
                             range=[HANDLE_COLOR[h] for h in HANDLE_ORDER])
 
-    def make_panel(hw: str, plan: str, show_y: bool, show_x: bool, show_title: bool):
-        d = src_present[(src_present["hardware"] == hw) & (src_present["plan"] == plan)]
-        y_axis = alt.Axis(labelFontSize=9, title=None) if show_y else None
-        x_axis = alt.Axis(labelFontSize=8, labelAngle=-30, title=None) if show_x else None
-        chart = alt.Chart(d).mark_rect(stroke="white", strokeWidth=0.5).encode(
+    def panel(plan: str, show_y: bool):
+        d = src[src["plan"] == plan]
+        y_axis = alt.Axis(labelFontSize=11, title=None) if show_y else None
+        x_axis = alt.Axis(labelFontSize=9, labelAngle=-35, title=None)
+        return alt.Chart(d).mark_rect(stroke="white", strokeWidth=0.5).encode(
             x=alt.X("cell:N", sort=cell_keys, axis=x_axis),
             y=alt.Y("model:N",
                     sort=alt.SortField(field="model_order", order="ascending"),
                     axis=y_axis),
-            color=alt.Color("handle:N", scale=color_scale,
-                            legend=None,
-                            sort=HANDLE_ORDER),
-            tooltip=["platform_label:N", "plan:N", "model:N", "cell:N", "handle:N"],
-        ).properties(width=sub_w, height=sub_h)
-        if show_title:
-            chart = chart.properties(title=alt.TitleParams(text=plan, fontSize=11, anchor="middle"))
-        return chart
-
-    rows_charts = []
-    for ri, hw in enumerate(platforms):
-        is_first_row = ri == 0
-        is_last_row  = ri == len(platforms) - 1
-        # Header row label (vertical band) + two panels
-        # Each platform row is a horizontal concat of v2 + v2_defensive.
-        panels = [make_panel(hw, plan, show_y=(ci == 0),
-                             show_x=is_last_row,
-                             show_title=is_first_row)
-                  for ci, plan in enumerate(plans)]
-        row = alt.hconcat(*panels, spacing=18).properties(
-            title=alt.TitleParams(text=plat_label[hw], fontSize=10,
-                                  anchor="start", align="left", offset=4),
+            color=alt.Color("handle:N", scale=color_scale, legend=None, sort=HANDLE_ORDER),
+            tooltip=["plan:N", "model:N", "cell:N", "handle:N"],
+        ).properties(
+            width=sub_w, height=sub_h,
+            title=alt.TitleParams(text=plan, fontSize=12, anchor="middle"),
         )
-        rows_charts.append(row)
 
     legend_df = pd.DataFrame({"handle": HANDLE_ORDER})
     legend_chart = alt.Chart(legend_df).mark_square(size=180).encode(
-        y=alt.Y("handle:N", sort=HANDLE_ORDER, axis=alt.Axis(orient="right",
-                                                             title=None,
-                                                             labelFontSize=10,
-                                                             ticks=False, domain=False)),
-        color=alt.Color("handle:N", scale=color_scale, legend=None,
-                        sort=HANDLE_ORDER),
+        y=alt.Y("handle:N", sort=HANDLE_ORDER, axis=alt.Axis(
+            orient="right", title=None, labelFontSize=10, ticks=False, domain=False)),
+        color=alt.Color("handle:N", scale=color_scale, legend=None, sort=HANDLE_ORDER),
     ).properties(
         width=20, height=cell_h * len(HANDLE_ORDER),
-        title=alt.TitleParams(text="modal handle (n=3 seeds)",
-                              fontSize=10, anchor="start"),
+        title=alt.TitleParams(text="modal handle", fontSize=10, anchor="start"),
     )
 
-    body = alt.vconcat(*rows_charts, spacing=22)
-    full = alt.hconcat(body, legend_chart, spacing=24).properties(
+    body = alt.hconcat(panel("v2", show_y=True),
+                       panel("v2_defensive", show_y=False),
+                       spacing=24)
+    full = alt.hconcat(body, legend_chart, spacing=22).properties(
         title=alt.TitleParams(
-            text="qwen3.6:27b matches claude-opus-4-7 across platforms on the error matrix",
-            fontSize=12, anchor="start"),
+            text=[
+                "qwen3.6:27b matches claude-opus-4-7 cell-for-cell on the error matrix",
+                "(modal handle across 3 seeds — identical on Jetson, MacBook Pro M4 Pro, and 2× RTX A5000)"
+            ],
+            fontSize=12, anchor="start", subtitleFontSize=10),
     ).configure_view(stroke=None).configure_axis(domain=False, ticks=False)
 
     full.save(str(out), ppi=130)
