@@ -29,6 +29,7 @@ open('$(TMP)','w').write(out)"
 	    -V fontsize=10pt \
 	    -V colorlinks=true \
 	    --lua-filter=tablewidths.lua \
+	    --lua-filter=tablecaptions.lua \
 	    -H $(HEADER) \
 	    --toc
 	@rm -f $(TMP)
