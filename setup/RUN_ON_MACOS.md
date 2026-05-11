@@ -1,8 +1,43 @@
-# Running plan-eval on a MacBook Air M4 (24 GB)
+# Running LLM-eval-paper on a MacBook Air M4 (24 GB)
 
-This file is a self-contained recipe for an agent (or a person) starting fresh on a MacBook Air M4 with 24 GB unified RAM. The goal: replicate the error-handling experiment (`README.md` §2.6) on Apple silicon, so the existing Jetson + RTX 5080 result picks up a third hardware platform.
+This file is a self-contained recipe for an agent (or a person) starting fresh on a MacBook Air M4 with 24 GB unified RAM. Two scoped recipes are provided: a **quick single-model check** for `qwen3.6:27b` (the manuscript's protagonist), and the **full overnight error-handling matrix** that adds Apple silicon as a third hardware platform.
 
-The experiment matrix from §2.6 is 5 models × 7 injection patterns × 1–2 target tools × 2 recipe variants × 3 seeds = ≈ 390 cells per model class. We'll run 3 Anthropic models + 4 fitting open-weight models, in parallel, overnight.
+## Quick single-model check — `qwen3.6:27b` on v2 (≤ 30 min wall time if it fits)
+
+The MacBook Air M4 has 24 GB unified RAM. `qwen3.6:27b` at 4-bit quantization needs ~17 GB resident, leaving ~6–7 GB for macOS — which is the tightest configuration the manuscript reports. The MacBook Pro M4 Pro (48 GB) ran each generation in ~92 s; the Air may sit a few times slower or, in the worst case, OOM. Use this decision tree:
+
+1. **One-time setup.** Run *Prerequisites* and *Setup the repo* (below). Then `ollama pull qwen3.6:27b` — about 17 GB on disk; takes 5–10 min on a fast connection.
+2. **Close other apps.** Quit Chrome/Slack/Spotify/Photos and anything else with high "Memory" pressure in Activity Monitor before starting. Aim for the *Memory Pressure* graph to be solid green.
+3. **Run three seeds, one at a time, foreground:**
+
+    ```bash
+    for seed in 42 43 44; do
+        time python3 harness/run_one.py \
+            --model qwen3.6:27b --track A --think off --seed $seed
+    done
+    python3 score/aggregate.py
+    ```
+
+    Watch Activity Monitor's *Memory Pressure* graph and the *Swap Used* number. Healthy: pressure stays green/yellow, swap < 2 GB.
+
+4. **Decision tree on the first generation:**
+
+    | Symptom | Diagnosis | Action |
+    |---|---|---|
+    | First generation completes in < 10 min, M3 = 1.000 | Model fits in unified memory; the Air is just slower than the Pro M4. | Continue with seeds 43 + 44. Report the per-seed wall time. |
+    | First generation completes but takes 10–60 min and Memory Pressure stays red | Ollama is spilling to swap; the model technically fits but constantly pages. | Continue if you have time; expect 5–10× the M4 Pro's wall time per seed. The result is still a valid finding ("qwen3.6:27b runs on a 24 GB Air at the cost of constant paging"). |
+    | First generation hangs > 90 min with no progress in `runs/qwen3.6_27b_*/raw_response.txt` | Likely live-locked on swap. | `kill` the run and the `ollama runner` process. Free more memory, retry once. If it hangs again, fall back to a smaller model (next row). |
+    | Run dies with an Ollama error like "model requires more system memory than is available" or kernel OOM kills `ollama runner` | The model does not fit. | Fall back to one of: `qwen3:14b` (~9 GB, dense, fits comfortably), `qwen3.6:35b-a3b` (~6 GB active per token from a 23 GB MoE — fits if Ollama only resident-pins active experts; borderline on 24 GB), or `granite4` (~2 GB, fastest, but defensive-scripting floor — won't pass v1 on its own per Results 2 of the manuscript). Re-run the same loop with `--model <fallback>`. |
+
+5. **Report back.** For whichever model ran end-to-end, note (a) per-seed mean variant-overlap score (target = 1.000 on the v2 plan), (b) per-seed wall_seconds_generation from `meta.json`, (c) peak Memory Pressure / swap usage during the run, (d) which model you ended up using if you fell back from `qwen3.6:27b`.
+
+The manuscript's headline finding is that `qwen3.6:27b` reproduces frontier accuracy on every platform tested. If it OOMs on the 24 GB Air but `qwen3:14b` reaches the same M3 = 1.000, that is itself a useful data point — `qwen3:14b` becomes the implementer of choice for the 24 GB tier.
+
+---
+
+## Full error-handling matrix (overnight)
+
+The experiment matrix is 5 models × 7 injection patterns × 1–2 target tools × 2 recipe variants × 3 seeds = ≈ 390 cells per model class. We'll run 3 Anthropic models + 4 fitting open-weight models, in parallel, overnight.
 
 ## Prerequisites (one-time, ~10 min)
 
@@ -28,7 +63,7 @@ All four should print versions. If `claude` errors with "not authenticated", run
 ## Setup the repo (~5 min)
 
 ```bash
-git clone https://github.com/nekrut/plan-eval && cd plan-eval
+git clone https://github.com/nekrut/LLM-eval-paper && cd LLM-eval-paper
 bash setup/install.sh                       # detects Darwin + arm64, pulls Miniforge3-MacOSX-arm64.sh, creates the bench env
 bash setup/fetch_data.sh                    # 9 files, ~838 KB
 bash ground_truth/canonical.sh              # produces ground_truth/results/
