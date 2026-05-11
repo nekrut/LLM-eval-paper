@@ -122,20 +122,20 @@ flowchart LR
 
 We asked the free implementers to perform variant calling under conditions of varying recipe detail — from no plan at all to a very-detailed step-by-step specification (Table 4; full text in the Supplement). Every plan was authored by claude-opus-4-7 in the planner role of the recipe-implementer split. Briefly, Opus wrote v1 (the lean reference recipe); v2 (a hyper-detailed recipe authored in response to v1's poor implementer performance — see Results); v1.25 and v1.5 (controls that localize which part of v2 carries the score improvement); v1g (a robustness check authored mechanically from the Galaxy IUC tool registry rather than by Opus); v0.5 (a no-recipe condition with only the tool order); and v2_defensive (v2 plus an error-handling skeleton).
 
-Each model is run under one of two conditions, which we call tracks. In Track A, the model receives a written plan (one of the rows of Table 4 with a non-empty *File* column) together with the tool inventory and writes `run.sh` from the plan. In Track B, the model receives the problem statement and the tool inventory only — no plan — and writes `run.sh` from scratch. Track B exists to bound how much of the implementer's behaviour comes from the model's prior training versus from the supplied recipe; every other plan in Table 4 is a Track A condition.
+Each model is run under one of two conditions, which we call tracks. In Track A, the model receives a written plan (any row in Table 4 except *Track B*) together with the tool inventory and writes `run.sh` from the plan. In Track B, the model receives the problem statement and the tool inventory only — no plan — and writes `run.sh` from scratch. Track B exists to bound how much of the implementer's behaviour comes from the model's prior training versus from the supplied recipe; every other plan in Table 4 is a Track A condition.
 
-**Table 4.** Plan variants used in this study. Plans of increasing granularity, plus two "no-plan" controls. File sizes are bytes; full text for each plan file is in the Supplement.
+**Table 4.** Plan variants used in this study. Plans of increasing granularity, plus two "no-plan" controls. Sizes are bytes; the verbatim text of every plan is reproduced in the Supplement.
 
-| Plan | File | Size | Short summary | Hypothesis tested |
-|---|---|---:|---|---|
-| **Track B** | *(no plan)* | 0 | Problem statement + tool inventory only; no implementation hints | How much can a model do from scratch? |
-| **v0.5** | `prompts/track_b_with_order_user.tmpl` | 1.4 KB | Track B + one line giving the tool order: `bwa → samtools → lofreq → bcftools → awk` | Does sequencing alone help local models? |
-| **v1 (lean)** | `plan/PLAN_v1.md` | 3.1 KB | Numbered bullets naming tools and key flags; no exact command lines | Reference lean plan |
-| **v1.25** | `plan/PLAN_v1p25.md` | 3.1 KB | v1 + the exact `lofreq call-parallel` command line | Does one full command bridge the v1 → v2 gap? |
-| **v1.5** | `plan/PLAN_v1p5.md` | 1.3 KB | v2 with every prose paragraph and Gotchas block stripped — code fences only | Are the prose explanations load-bearing or decorative? |
-| **v1g** | `plan/PLAN_v1g.md` | 4.2 KB | v1 + a Galaxy-IUC-mechanical `lofreq` snippet (extracted from `tools-iuc@39e7456`) | Can a tool registry replace a human plan author? |
-| **v2 (detailed)** | `plan/PLAN.md` | 4.6 KB | Every step gives the exact command line plus Gotchas block | Reference detailed plan |
-| **v2_defensive** | `plan/PLAN_v2_defensive.md` | 6.5 KB | v2 + `try()` helper, output validation after every step, retry-once, per-sample isolation, structured failure log | Does explicit error-handling prose make implementer scripts defensive against runtime tool failures? |
+| Plan | Size | Short summary | Hypothesis tested |
+|---|---:|---|---|
+| **Track B** | 0 | Problem statement + tool inventory only; no implementation hints | How much can a model do from scratch? |
+| **v0.5** | 1.4 KB | Track B + one line giving the tool order: `bwa → samtools → lofreq → bcftools → awk` | Does sequencing alone help local models? |
+| **v1 (lean)** | 3.1 KB | Numbered bullets naming tools and key flags; no exact command lines | Reference lean plan |
+| **v1.25** | 3.1 KB | v1 + the exact `lofreq call-parallel` command line | Does one full command bridge the v1 → v2 gap? |
+| **v1.5** | 1.3 KB | v2 with every prose paragraph and Gotchas block stripped — code fences only | Are the prose explanations load-bearing or decorative? |
+| **v1g** | 4.2 KB | v1 + a Galaxy-IUC-mechanical `lofreq` snippet (extracted from `tools-iuc@39e7456`) | Can a tool registry replace a human plan author? |
+| **v2 (detailed)** | 4.6 KB | Every step gives the exact command line plus Gotchas block | Reference detailed plan |
+| **v2_defensive** | 6.5 KB | v2 + `try()` helper, output validation after every step, retry-once, per-sample isolation, structured failure log | Does explicit error-handling prose make implementer scripts defensive against runtime tool failures? |
 
 ### Error simulation
 
