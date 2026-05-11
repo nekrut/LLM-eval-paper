@@ -893,17 +893,20 @@ def fig_qwen3p6_27b_error_per_platform_altair(out: Path,
                 })
     src = pd.DataFrame(rows).dropna(subset=["handle"])
 
-    cell_w, cell_h = 44, 36
+    cell_w, cell_h = 48, 38
     sub_w  = cell_w * len(cells)
     sub_h  = cell_h * len(models)
 
     color_scale = alt.Scale(domain=HANDLE_ORDER,
                             range=[HANDLE_COLOR[h] for h in HANDLE_ORDER])
 
-    def panel(plan: str, show_y: bool):
+    def panel(plan: str, show_x: bool):
         d = src[src["plan"] == plan]
-        y_axis = alt.Axis(labelFontSize=11, title=None) if show_y else None
-        x_axis = alt.Axis(labelFontSize=9, labelAngle=-35, title=None)
+        # Y axis (model names) shown on every panel; X axis labels only on
+        # the bottom panel since the columns are identical between panels.
+        y_axis = alt.Axis(labelFontSize=11, title=None)
+        x_axis = (alt.Axis(labelFontSize=9, labelAngle=-35, title=None)
+                  if show_x else alt.Axis(labels=False, ticks=False, title=None))
         return alt.Chart(d).mark_rect(stroke="white", strokeWidth=0.5).encode(
             x=alt.X("cell:N", sort=cell_keys, axis=x_axis),
             y=alt.Y("model:N",
@@ -913,7 +916,7 @@ def fig_qwen3p6_27b_error_per_platform_altair(out: Path,
             tooltip=["plan:N", "model:N", "cell:N", "handle:N"],
         ).properties(
             width=sub_w, height=sub_h,
-            title=alt.TitleParams(text=plan, fontSize=12, anchor="middle"),
+            title=alt.TitleParams(text=plan, fontSize=12, anchor="start"),
         )
 
     legend_df = pd.DataFrame({"handle": HANDLE_ORDER})
@@ -926,9 +929,9 @@ def fig_qwen3p6_27b_error_per_platform_altair(out: Path,
         title=alt.TitleParams(text="modal handle", fontSize=10, anchor="start"),
     )
 
-    body = alt.hconcat(panel("v2", show_y=True),
-                       panel("v2_defensive", show_y=False),
-                       spacing=24)
+    body = alt.vconcat(panel("v2", show_x=False),
+                       panel("v2_defensive", show_x=True),
+                       spacing=10)
     full = alt.hconcat(body, legend_chart, spacing=22).properties(
         title=alt.TitleParams(
             text=[
