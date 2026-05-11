@@ -202,14 +202,14 @@ qwen3.6:27b matches claude-opus-4-7 cell-for-cell on the error-injection matrix.
 
 ![Figure 3. Per-cell modal handle category (recover / partial / propagate / crash) for claude-opus-4-7 and qwen3.6:27b across the 12-cell PATH-shim error matrix. Left panel = v2 baseline plan; right panel = v2_defensive plan. Rows within each panel are the two models. Cells are color-coded by the modal handle category across three seeds; the pattern shown is identical on the Jetson AGX Orin, MacBook Pro M4 Pro, and 2× RTX A5000 platforms (verified for every one of the 48 cells), so a single cross-platform consensus is shown.](../figures/ms_fig4_qwen3p6_27b_error.png)
 
-**Table 8.** Per-cell behaviour signature and mean variant-overlap score for `qwen3.6:27b` and `claude-opus-4-7` on the 36-cell error matrix (12 patterns × 3 seeds), across Jetson, M4 Pro, and 2× A5000. Both plans, both models, all three platforms summarised.
+**Table 8.** Per-cell behaviour signature and mean variant-overlap score for qwen3.6:27b and claude-opus-4-7 on the 36-cell error matrix (12 patterns × 3 seeds). Counts and mean score are identical across Jetson, MacBook Pro M4 Pro, and 2× RTX A5000 for every (model, plan) row.
 
-| Model | Plan | Platform | recover | partial | propagate | crash | mean score |
-|---|---|---|---:|---:|---:|---:|---:|
-| `claude-opus-4-7` | v2          | Jetson, M4, A5000 (identical) | 15 | 0 | 6 | 15 | 0.333 |
-| `claude-opus-4-7` | v2_defensive | Jetson, A5000, M4 r2 (identical) | 21 | 15 | 0 | 0 | 0.625 |
-| `qwen3.6:27b`     | v2          | Jetson, M4 r2, A5000 (identical) | 15 | 0 | 6 | 15 | 0.333 |
-| `qwen3.6:27b`     | v2_defensive | Jetson, M4 r2, A5000 (identical) | 21 | 15 | 0 | 0 | 0.625 |
+| Model | Plan | recover | partial | propagate | crash | mean score |
+|---|---|---:|---:|---:|---:|---:|
+| claude-opus-4-7 | v2 | 15 | 0 | 6 | 15 | 0.333 |
+| claude-opus-4-7 | v2_defensive | 21 | 15 | 0 | 0 | 0.625 |
+| qwen3.6:27b | v2 | 15 | 0 | 6 | 15 | 0.333 |
+| qwen3.6:27b | v2_defensive | 21 | 15 | 0 | 0 | 0.625 |
 
 The error-injection result closes the loop on the recipe-implementer architecture: under both the happy-path plan and a defensive plan, a free, locally-runnable Apache-2.0 implementer handles the same workload as the frontier API author at the same accuracy.
 

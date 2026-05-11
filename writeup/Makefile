@@ -28,6 +28,7 @@ open('$(TMP)','w').write(out)"
 	    -V geometry:margin=1in \
 	    -V fontsize=10pt \
 	    -V colorlinks=true \
+	    --lua-filter=tablewidths.lua \
 	    -H $(HEADER) \
 	    --toc
 	@rm -f $(TMP)
