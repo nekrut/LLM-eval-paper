@@ -33,26 +33,9 @@ open('$(TMP)','w').write(out)"
 	    --toc
 	@rm -f $(TMP)
 
-$(HEADER):
-	@printf '%s\n' \
-	    '\usepackage{newunicodechar}' \
-	    '\newunicodechar{≈}{$$\approx$$}' \
-	    '\newunicodechar{≥}{$$\geq$$}' \
-	    '\newunicodechar{≤}{$$\leq$$}' \
-	    '\newunicodechar{×}{$$\times$$}' \
-	    '\newunicodechar{→}{$$\to$$}' \
-	    '\newunicodechar{·}{$$\cdot$$}' \
-	    '\newunicodechar{…}{\ldots}' \
-	    '\newunicodechar{✓}{\checkmark}' \
-	    '\newunicodechar{✗}{$$\times$$}' \
-	    '\newunicodechar{∈}{$$\in$$}' \
-	    '\newunicodechar{Δ}{$$\Delta$$}' \
-	    '\newunicodechar{σ}{$$\sigma$$}' \
-	    '\newunicodechar{α}{$$\alpha$$}' \
-	    '\newunicodechar{β}{$$\beta$$}' \
-	    '\newunicodechar{μ}{$$\mu$$}' \
-	    '\newunicodechar{π}{$$\pi$$}' \
-	    > $@
+# writeup.header.tex is a versioned file (not auto-generated). It carries
+# the newunicodechar declarations for math/Greek glyphs and the fvextra
+# Highlighting redefinition that wraps long lines in fenced code blocks.
 
 # Re-render the workflow DAG from its mermaid source (block in writeup.md).
 # Uses npx to fetch mermaid-cli on the fly; needs network on first run.
@@ -68,4 +51,4 @@ open('$(TMP).mmd','w').write(m.group(1))"
 	@rm -f $(TMP).mmd puppeteer-cfg.json
 
 clean:
-	rm -f $(PDF) $(TMP) $(HEADER)
+	rm -f $(PDF) $(TMP)
