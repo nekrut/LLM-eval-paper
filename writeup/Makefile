@@ -30,8 +30,7 @@ open('$(TMP)','w').write(out)"
 	    -V colorlinks=true \
 	    --lua-filter=tablewidths.lua \
 	    --lua-filter=tablecaptions.lua \
-	    -H $(HEADER) \
-	    --toc
+	    -H $(HEADER)
 	@rm -f $(TMP)
 
 # writeup.header.tex is a versioned file (not auto-generated). It carries
