@@ -172,16 +172,17 @@ Within the six-implementer lineup, two implementers pass v1 with score 1.000 —
 
 ### Cross-platform: same accuracy, different wall time
 
-Hardware does not limit accuracy on the v2 plan — only wall time. We tested qwen3.6:27b on the three remaining platforms — Jetson AGX Orin, MacBook Pro M4 Pro, and 2× RTX A5000 — under the v2 plan; mean score 1.000 on every platform on every seed. However, wall-clock generation time differs sharply (Table 7). The 2× A5000 returns a generation in under half a minute (median 29 s), the M4 Pro and Jetson take 1.5 to 2 minutes (92 s and 105 s), and the RTX 5080 takes about 5 minutes (302 s). The 5080 row reflects the model partially spilling out of its 16 GB VRAM into system RAM — Ollama handles the spill automatically but slowly. None of the wall times is too slow for a working lab; pick the cheapest box that fits the model in dedicated or unified memory and the score is unchanged.
+Hardware does not limit accuracy on the v2 plan — only wall time. We tested qwen3.6:27b on the four remaining platforms — Jetson AGX Orin, MacBook Pro M4 Pro, MacBook Air M4 (24 GB), and 2× RTX A5000 — under the v2 plan; mean score 1.000 on every platform on every seed. However, wall-clock generation time differs sharply, and on the most memory-constrained platforms swap behaviour dominates the variance (Table 7). The 2× A5000 returns a generation in under half a minute (median 29 s), the M4 Pro and Jetson take 1.5 to 2 minutes (92 s and 105 s), and the RTX 5080 and MacBook Air sit between 5 and 7 minutes (302 s and 518 s, respectively); both reflect the model partially spilling out of dedicated VRAM (5080, 16 GB) or constrained unified memory (Air, 24 GB) into system RAM or swap, which Ollama handles automatically but slowly. The MacBook Air is the worst-case configuration in our lineup — `qwen3.6:27b` at ~17 GB sits within ~1 GB of the macOS reservation, so a single seed (43) where background processes consumed extra memory ran 47× slower than its sibling seeds (4,345 s vs 276 s on seed 42). The accuracy was unaffected; the wall time was not. None of the platforms is too slow to be useful for a working lab; pick the cheapest box that fits the model in dedicated or unified memory with headroom and the score is unchanged. For the tightest hardware tier (16–24 GB), `qwen3:14b` (~9 GB at 4-bit) is a comfortable fallback — on the same MacBook Air it ran in median 99 s with no swap penalty (3/3 seeds, mean score 1.000).
 
-**Table 7.** qwen3.6:27b on the v2 plan: median wall-clock time per generation (seconds), inter-quartile range in brackets. score 1.000 on every cell across every platform.
+**Table 7.** qwen3.6:27b on the v2 plan: median wall-clock time per generation (seconds), inter-quartile range or full range in brackets. Score 1.000 on every cell across every platform.
 
-| Platform | VRAM/UMA | Median wall time (s) | IQR (Q1–Q3) | n |
+| Platform | VRAM/UMA | Median wall time (s) | Range (s) | n |
 |---|---|---:|---:|---:|
-| 2× RTX A5000 | 48 GB total VRAM (fits) | 29 | [24–31] | 36 |
-| MacBook Pro M4 Pro | 48 GB unified (fits) | 92 | [91–136] | 36 |
-| NVIDIA Jetson AGX Orin | 64 GB unified (fits) | 105 | [98–107] | 36 |
-| RTX 5080 desktop | 16 GB VRAM (spills to RAM) | 302 | [288–322] | 6 |
+| 2× RTX A5000 | 48 GB total VRAM (fits) | 29 | [24–31] (IQR) | 36 |
+| MacBook Pro M4 Pro | 48 GB unified (fits) | 92 | [91–136] (IQR) | 36 |
+| NVIDIA Jetson AGX Orin | 64 GB unified (fits) | 105 | [98–107] (IQR) | 36 |
+| RTX 5080 desktop | 16 GB VRAM (spills to RAM) | 302 | [288–322] (IQR) | 6 |
+| MacBook Air M4 | 24 GB unified (tight; swap-sensitive) | 518 | [276–4,345] (full) | 3 |
 
 ### Defensive scripting under error injection — qwen3.6:27b matches Opus on every platform
 
