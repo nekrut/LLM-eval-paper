@@ -20,7 +20,8 @@ all: $(PDF)
 $(PDF): $(SRC) $(HEADER)
 	@python3 -c "import re; \
 src = open('$(SRC)').read(); \
-out = re.sub(r'\`\`\`mermaid\n.*?\n\`\`\`', '![]($(FIGS_DIR)/fig1_workflow_dag.png)', src, count=1, flags=re.DOTALL); \
+m = re.search(r'\*\*Figure 1\.\*\* ([^\n]+)\n+\`\`\`mermaid\n.*?\n\`\`\`', src, flags=re.DOTALL); \
+out = re.sub(r'\*\*Figure 1\.\*\* [^\n]+\n+\`\`\`mermaid\n.*?\n\`\`\`', '![' + (m.group(1) if m else '') + ']($(FIGS_DIR)/fig1_workflow_dag.png)', src, count=1, flags=re.DOTALL) if m else re.sub(r'\`\`\`mermaid\n.*?\n\`\`\`', '![]($(FIGS_DIR)/fig1_workflow_dag.png)', src, count=1, flags=re.DOTALL); \
 open('$(TMP)','w').write(out)"
 	pandoc $(TMP) -o $@ \
 	    --pdf-engine=pdflatex \

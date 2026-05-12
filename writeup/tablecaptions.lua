@@ -20,7 +20,7 @@ function Para(para)
   if FORMAT ~= "latex" and FORMAT ~= "beamer" then return nil end
   if not is_table_caption(para) then return nil end
   return {
-    pandoc.RawBlock("latex", "\\begingroup\\small"),
+    pandoc.RawBlock("latex", "\\begingroup\\footnotesize"),
     para,
     pandoc.RawBlock("latex", "\\endgroup"),
   }
