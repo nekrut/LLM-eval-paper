@@ -179,7 +179,7 @@ We tested an alternative source for the canonical command line with **v1g** = v1
 
 ### qwen3.6:27b is the winner
 
-Within the six-implementer lineup, two implementers pass v1 with score 1.000 — qwen3.6:27b (Apache 2.0, Alibaba; 17 GB at 4-bit) and glm-4.7-flash (Z.ai; comparable size). qwen3.6:27b is the cleaner choice for a working lab: an Apache-2.0 license with no field-of-use restrictions, a single-file `ollama pull qwen3.6:27b` deployment, and a memory footprint that fits the 24 GB VRAM tier on Table 2 with room to spare. We therefore selected qwen3.6:27b as the protagonist for the cross-platform validation that follows.
+Within the six-implementer lineup, qwen3.6:27b (Apache 2.0, Alibaba; 17 GB at 4-bit) is the only one that reaches score 1.000 on every v1 seed. The next-strongest, glm-4.7-flash (Z.ai; comparable size), passes two of three seeds for a mean of 0.667 — close enough to confirm the threshold response is not a single-model artifact, but not consistent enough to recommend the model for production. qwen3.6:27b also has a permissive Apache-2.0 license with no field-of-use restrictions, ships as a single-file `ollama pull qwen3.6:27b` deployment, and fits the 24 GB VRAM tier on Table 2 with room to spare. We therefore selected qwen3.6:27b as the protagonist for the cross-platform validation that follows.
 
 ### Cross-platform: same accuracy, different wall time
 
