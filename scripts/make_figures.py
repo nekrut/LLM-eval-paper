@@ -978,7 +978,7 @@ def main():
         fig1_per_platform(df, FIGS)
     elif args.manuscript:
         fig_5080_implementer_gradient_altair(df, FIGS / "ms_fig2_5080_gradient.png")
-        fig_qwen3p6_27b_error_per_platform_altair(FIGS / "ms_fig4_qwen3p6_27b_error.png")
+        fig_qwen3p6_27b_error_per_platform_altair(FIGS / "ms_fig3_qwen3p6_27b_error.png")
     else:
         funcs[args.fig]()
         print(f"wrote figures/fig{args.fig}_*.png")
