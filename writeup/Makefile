@@ -28,6 +28,8 @@ open('$(TMP)','w').write(out)"
 	    -V geometry:margin=1in \
 	    -V fontsize=10pt \
 	    -V colorlinks=true \
+	    -V documentclass=article \
+	    -V classoption=titlepage \
 	    --lua-filter=tablewidths.lua \
 	    --lua-filter=tablecaptions.lua \
 	    -H $(HEADER)

@@ -1,4 +1,14 @@
-# Evaluating free LLMs for genomic analysis orchestration in a typical lab
+---
+title: "Evaluating free LLMs for genomic analysis orchestration in a typical lab"
+author: |
+  | Anton Nekrutenko
+  |
+  | Department of Biochemistry and Molecular Biology
+  | Penn State University, University Park, PA 16802
+  |
+  | Correspondence should be addressed to: <anton@nekrut.org>
+date: ""
+---
 
 ## Abstract
 
