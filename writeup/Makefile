@@ -17,7 +17,7 @@ PDF_GR    := writeup_GR.pdf
 SRC_GR    := writeup_GR.md
 TMP_GR    := writeup_GR.pandoc.md
 
-.PHONY: all clean render-dag gr cover-letter
+.PHONY: all clean render-dag gr cover-letter supp-gr
 
 cover-letter: cover_letter_GR.pdf
 
@@ -25,6 +25,18 @@ cover_letter_GR.pdf: cover_letter_GR.md
 	pandoc cover_letter_GR.md -o $@ \
 	    --pdf-engine=pdflatex \
 	    -V colorlinks=true
+
+supp-gr: supplement_GR.pdf
+
+supplement_GR.pdf: supplement_GR.md $(HEADER)
+	pandoc supplement_GR.md -o $@ \
+	    --pdf-engine=pdflatex \
+	    --resource-path=.:..:$(FIGS_DIR) \
+	    -V geometry:margin=1in \
+	    -V fontsize=10pt \
+	    -V colorlinks=true \
+	    -V documentclass=article \
+	    -H $(HEADER)
 
 all: $(PDF)
 
