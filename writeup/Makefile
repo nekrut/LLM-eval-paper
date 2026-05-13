@@ -17,7 +17,14 @@ PDF_GR    := writeup_GR.pdf
 SRC_GR    := writeup_GR.md
 TMP_GR    := writeup_GR.pandoc.md
 
-.PHONY: all clean render-dag gr
+.PHONY: all clean render-dag gr cover-letter
+
+cover-letter: cover_letter_GR.pdf
+
+cover_letter_GR.pdf: cover_letter_GR.md
+	pandoc cover_letter_GR.md -o $@ \
+	    --pdf-engine=pdflatex \
+	    -V colorlinks=true
 
 all: $(PDF)
 
