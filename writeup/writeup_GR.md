@@ -84,7 +84,7 @@ Hardware does not limit accuracy on the v2 plan — only execution (wall) time. 
 
 | Platform | VRAM/UMA | Median wall time (s) | Range (s) | n |
 |---|---|---:|---:|---:|
-| 2× RTX A5000 | 48 GB total VRAM (fits) | 29 | (Tang et al. 2024; Sarwal et al. 2023; Rajesh and Siwo 2025; Mitchener et al. 2025; Su et al. 2025; Mehandru et al. 2025; Alam and Roy 2025; Cynthia and Roy 2025) (IQR) | 36 |
+| 2× RTX A5000 | 48 GB total VRAM (fits) | 29 | [3–10] (IQR) | 36 |
 | MacBook Pro M4 Pro | 48 GB unified (fits) | 92 | [91–136] (IQR) | 36 |
 | NVIDIA Jetson AGX Orin | 64 GB unified (fits) | 105 | [98–107] (IQR) | 36 |
 | RTX 5080 desktop | 16 GB VRAM (spills to RAM) | 302 | [288–322] (IQR) | 6 |
