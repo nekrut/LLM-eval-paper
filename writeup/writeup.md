@@ -240,6 +240,12 @@ There are also several potential limitations of our approach. First, our study c
 
 ---
 
+## Acknowledgements
+
+This work was supported by the National Institutes of Health (NIH) and the National Science Foundation (NSF). NIH support: U24HG006620 from the National Human Genome Research Institute (NHGRI), *Democratization of Data Analysis in Life Sciences Through Galaxy* (contact PI: A.N.); U24AI183870 from the National Institute of Allergy and Infectious Diseases (NIAID), *An integrated platform for multiomic analyses of pathogen and host data using scalable public infrastructure* (contact PI: A.N.); U24HG010263 from NHGRI, *Expanding the AnVIL (Analysis, Visualization, and Informatics Lab-space)* (contact PI: M. Schatz, Johns Hopkins University; A.N. as MPI); OT2OD037936 from the NIH Common Fund / Office of the Director, *The CFDE Cloud Workspace* (contact PI: J. P. Carson, University of Texas at Austin; A.N. as MPI); and R01GM151683 from the National Institute of General Medical Sciences (NIGMS), *Hypothesis Testing using Phylogenies for the 21st century* (contact PI: S. L. Kosakovsky Pond, Temple University; A.N. as MPI). NSF support: award 2419522 (Cross-BIO Activities), *Understanding biodiversity through a global platform for assembly and analysis of large genomes* (PI: A.N.). The content is solely the responsibility of the author and does not necessarily represent the official views of the NIH or NSF.
+
+---
+
 ## References
 
 [1] Jin Q, Yang Y, Chen Q, Lu Z. GeneGPT: augmenting large language models with domain tools for improved access to biomedical information. *Bioinformatics.* 2024;40(2):btae075. doi:10.1093/bioinformatics/btae075. PMID:38341654.
