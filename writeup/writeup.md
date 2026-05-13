@@ -242,7 +242,7 @@ There are also several potential limitations of our approach. First, our study c
 
 ## Acknowledgements
 
-This study was supported by NIH grants U24HG006620, U24AI183870, U24HG010263, OT2OD037936, and R01GM151683, as well as NSF award 2419522. The content is solely the responsibility of the author and does not necessarily represent the official views of the NIH or NSF.
+This study was supported by NIH grants U24HG006620, U24AI183870, U24HG010263, OT2OD037936, and R01GM151683, as well as NSF award 2419522. The author thanks the Galaxy team for support and advice. The content is solely the responsibility of the author and does not necessarily represent the official views of the NIH or NSF.
 
 ---
 
