@@ -13,9 +13,34 @@ HEADER    := writeup.header.tex
 FIGS_DIR  := ../figures
 DAG_PNG   := $(FIGS_DIR)/fig1_workflow_dag.png
 
-.PHONY: all clean render-dag
+PDF_GR    := writeup_GR.pdf
+SRC_GR    := writeup_GR.md
+TMP_GR    := writeup_GR.pandoc.md
+
+.PHONY: all clean render-dag gr
 
 all: $(PDF)
+
+gr: $(PDF_GR)
+
+$(PDF_GR): $(SRC_GR) $(HEADER)
+	@python3 -c "import re; \
+src = open('$(SRC_GR)').read(); \
+m = re.search(r'\*\*Figure 1\.\*\* ([^\n]+)\n+\`\`\`mermaid\n.*?\n\`\`\`', src, flags=re.DOTALL); \
+out = re.sub(r'\*\*Figure 1\.\*\* [^\n]+\n+\`\`\`mermaid\n.*?\n\`\`\`', '![' + (m.group(1) if m else '') + ']($(FIGS_DIR)/fig1_workflow_dag.png)', src, count=1, flags=re.DOTALL) if m else re.sub(r'\`\`\`mermaid\n.*?\n\`\`\`', '![]($(FIGS_DIR)/fig1_workflow_dag.png)', src, count=1, flags=re.DOTALL); \
+open('$(TMP_GR)','w').write(out)"
+	pandoc $(TMP_GR) -o $@ \
+	    --pdf-engine=pdflatex \
+	    --resource-path=.:..:$(FIGS_DIR) \
+	    -V geometry:margin=1in \
+	    -V fontsize=10pt \
+	    -V colorlinks=true \
+	    -V documentclass=article \
+	    --lua-filter=tablewidths.lua \
+	    --lua-filter=tablecaptions.lua \
+	    -H $(HEADER)
+	@rm -f $(TMP_GR)
+
 
 $(PDF): $(SRC) $(HEADER)
 	@python3 -c "import re; \
