@@ -22,7 +22,7 @@ Cold Spring Harbor Laboratory Press
 
 Dear Editor,
 
-I am submitting the enclosed manuscript, **"Evaluating open LLMs for agentic analysis orchestration in a typical biomedical lab"**, for consideration as a Methods article in *Genome Research*.
+I am submitting the enclosed manuscript, **"Evaluating open LLMs for agentic analysis orchestration in a typical biomedical lab"**, for consideration in *Genome Research*.
 
 Within the next few years, a substantial fraction of routine biological data analysis will run inside agentic tools — software environments where a large language model plans the work, calls external tools, executes code, and iterates on the result. The shift is well underway in software engineering and is now arriving at the bench. The per-call inference cost of the frontier models that drive this shift is already prohibitive for laboratories that re-run the same workflow against new data many times per week. The work submitted here addresses that cost directly.
 
