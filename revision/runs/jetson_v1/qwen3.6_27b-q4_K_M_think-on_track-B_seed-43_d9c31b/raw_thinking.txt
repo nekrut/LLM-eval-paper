@@ -1,0 +1,469 @@
+The user wants a bash script that performs variant calling on 4 paired-end MiSeq amplicon samples mapped to the human mitochondrial reference (chrM).
+
+Let me break down what needs to be done:
+
+1. Index the reference genome (chrM.fa) using bwa and samtools
+2. For each sample, align reads using bwa mem
+3. Sort and index BAM files
+4. Call variants using bcftools mpileup + call or lofreq
+5. Compress and index VCF files
+6. Create a collapsed TSV with columns: sample, chrom, pos, ref, alt, af
+
+Let me think about the workflow:
+
+1. Reference indexing:
+   - `bwa index data/ref/chrM.fa`
+   - `samtools faidx data/ref/chrM.fa`
+
+2. For each sample (M117-bl, M117-ch, M117C1-bl, M117C1-ch):
+   - Align with bwa mem
+   - Convert SAM to BAM, sort, index
+   - Call variants with bcftools mpileup + call or lofreq call
+   
+3. For variant calling on mitochondrial DNA, I should use appropriate parameters:
+   - bcftools mpileup with appropriate settings for mtDNA
+   - Or lofreq which is good for low-frequency variants
+
+Let me think about the variant calling approach. Since these are amplicon samples of chrM (mitochondrial), I'll use bcftools mpileup + call or lofreq. Given that lofreq is in the tool inventory and is specifically designed for sensitive variant detection, it might be a good choice. However, bcftools is also fine.
+
+Let me use bcftools mpileup with appropriate parameters for mitochondrial DNA:
+- `-f` reference
+- `--min-BQ 13` or similar quality filters
+- Use `bcftools call -mv` for variant calling
+
+Actually, let me think more carefully. For mitochondrial amplicon sequencing, we want to detect variants including heteroplasmies. Let me use bcftools mpileup with appropriate settings.
+
+For the collapsed.tsv, I need to extract: sample, chrom, pos, ref, alt, af from each VCF.
+
+Let me design the script:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Configuration
+REF="data/ref/chrM.fa"
+RAW_DIR="data/raw"
+OUT_DIR="results"
+THREADS="${THREADS:-4}"
+
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p "$OUT_DIR"
+
+# Index reference if not already indexed
+if [[ ! -f "${REF}.bwt" ]]; then
+    bwa index "$REF"
+fi
+if [[ ! -f "${REF}.fai" ]]; then
+    samtools faidx "$REF"
+fi
+
+for SAMPLE in "${SAMPLES[@]}"; do
+    R1="${RAW_DIR}/${SAMPLE}_1.fq.gz"
+    R2="${RAW_DIR}/${SAMPLE}_2.fq.gz"
+    BAM="${OUT_DIR}/${SAMPLE}.bam"
+    BAI="${BAM}.bai"
+    VCF="${OUT_DIR}/${SAMPLE}.vcf.gz"
+    TBI="${VCF}.tbi"
+    
+    # Align if BAM doesn't exist
+    if [[ ! -f "$BAI" ]]; then
+        bwa mem -t "$THREADS" "$REF" "$R1" "$R2" | \
+            samtools view -bS -@ "$THREADS" -o "${BAM}.tmp" -
+        samtools sort -@ "$THREADS" -o "$BAM" "${BAM}.tmp"
+        rm -f "${BAM}.tmp"
+        samtools index "$BAM"
+    fi
+    
+    # Call variants if VCF doesn't exist
+    if [[ ! -f "$TBI" ]]; then
+        bcftools mpileup -f "$REF" -O u -@ "$THREADS" "$BAM" | \
+            bcftools call -mv -O z -o "$VCF"
+        tabix -p vcf "$VCF"
+    fi
+done
+
+# Create collapsed.tsv
+{
+    printf "sample\tchrom\tpos\tref\talt\taf\n"
+    for SAMPLE in "${SAMPLES[@]}"; do
+        VCF="${OUT_DIR}/${SAMPLE}.vcf.gz"
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' "$VCF" | \
+            awk -v sample="$SAMPLE" '{print sample"\t"$0}'
+    done
+} > "${OUT_DIR}/collapsed.tsv"
+```
+
+Wait, I need to be careful about the AF field. In bcftools, AF is the allele frequency. Let me check the format string.
+
+Actually, for mitochondrial DNA, there might be multiple alternate alleles at a position. The `%ALT[\t%AF]` syntax should handle that. But let me think about this more carefully.
+
+The `bcftools query` format:
+- `%CHROM` - chromosome
+- `%POS` - position
+- `%REF` - reference allele
+- `%ALT` - alternate allele(s)
+- `%AF` - allele frequency
+
+For multiple ALT alleles, `%ALT[\t%AF]` would print each ALT followed by its AF on separate lines? No, actually the `[]` syntax in bcftools query means "for each element in the array, print with the separator". So if there are multiple ALTs, it would print them separated by tabs.
+
+But the output format requested is: sample, chrom, pos, ref, alt, af - one row per variant. If there are multiple ALTs at a position, we might need to split them. Let me use a different approach.
+
+Actually, let me use `bcftools query` with proper formatting and then process with awk if needed. Or I can use `bcftools norm` to normalize first, but that might not be necessary for mtDNA amplicons.
+
+Let me reconsider the bcftools call parameters. For mitochondrial DNA, I should probably use:
+- `bcftools mpileup -f $REF --min-BQ 13 --min-MQ 250 -O u` (or similar)
+- `bcftools call -mv -O z`
+
+Actually, for amplicon sequencing of mtDNA, I should be careful about:
+1. PCR duplicates - but with bwa mem and samtools, we don't have a duplicate marking step in the tool inventory
+2. Base quality recalibration - not available either
+
+Let me keep it simple and use bcftools mpileup + call with reasonable defaults.
+
+For the AF field, I need to make sure it's properly extracted. Let me check: in VCF format, AF is an INFO field. For biallelic sites, there's one AF value. For multiallelic sites, there are multiple AF values.
+
+Let me use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'` or similar. Actually, the simpler approach is:
+
+```
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' "$VCF"
+```
+
+This should work for biallelic sites. For multiallelic sites, it would print multiple ALTs and AFs separated by tabs within the same line. But the expected output format has one alt per row (based on the column names being singular: ref, alt, af).
+
+Let me use `bcftools norm -m -any` to split multiallelic sites first, or handle it in the query. Actually, let me just use bcftools query and if there are multiallelics, they'll have multiple columns. But for mtDNA amplicons, most variants should be biallelic anyway.
+
+Actually, a better approach: use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\n'` which will print one line per ALT allele when there are multiple ALTs. Wait, no - that's not how it works. Let me check the bcftools query documentation.
+
+From bcftools docs:
+- `%ALT` prints all alternate alleles separated by commas
+- To iterate over arrays, use `[]` syntax
+
+So for a site with REF=A and ALT=T,C, using `%ALT[\t%AF]` would print:
+```
+T 0.3
+C 0.1
+```
+on separate lines? No, actually the `[]` syntax repeats the entire format string for each element. So `%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n` would print:
+```
+chrM  1234  A  T  0.3
+chrM  1234  A  C  0.1
+```
+
+That's exactly what we want! One row per alternate allele.
+
+Let me refine the script:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+REF="data/ref/chrM.fa"
+RAW_DIR="data/raw"
+OUT_DIR="results"
+THREADS="${THREADS:-4}"
+
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p "$OUT_DIR"
+
+# Index reference if needed
+[[ -f "${REF}.bwt" ]] || bwa index "$REF"
+[[ -f "${REF}.fai" ]] || samtools faidx "$REF"
+
+for SAMPLE in "${SAMPLES[@]}"; do
+    R1="${RAW_DIR}/${SAMPLE}_1.fq.gz"
+    R2="${RAW_DIR}/${SAMPLE}_2.fq.gz"
+    BAM="${OUT_DIR}/${SAMPLE}.bam"
+    BAI="${BAM}.bai"
+    VCF="${OUT_DIR}/${SAMPLE}.vcf.gz"
+    TBI="${VCF}.tbi"
+    
+    # Alignment and sorting
+    if [[ ! -f "$BAI" ]]; then
+        bwa mem -t "$THREADS" "$REF" "$R1" "$R2" | \
+            samtools view -b -@ "$THREADS" -o "${BAM}.unsorted.bam" -
+        samtools sort -@ "$THREADS" -o "$BAM" "${BAM}.unsorted.bam"
+        rm -f "${BAM}.unsorted.bam"
+        samtools index "$BAM"
+    fi
+    
+    # Variant calling
+    if [[ ! -f "$TBI" ]]; then
+        bcftools mpileup -f "$REF" -O u -@ "$THREADS" "$BAM" | \
+            bcftools call -mv -O z -o "$VCF"
+        tabix -p vcf "$VCF"
+    fi
+done
+
+# Create collapsed.tsv
+{
+    printf "sample\tchrom\tpos\tref\talt\taf\n"
+    for SAMPLE in "${SAMPLES[@]}"; do
+        VCF="${OUT_DIR}/${SAMPLE}.vcf.gz"
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' "$VCF" | \
+            awk -v s="$SAMPLE" '{print s"\t"$0}'
+    done
+} > "${OUT_DIR}/collapsed.tsv"
+```
+
+Wait, I need to think about the `bcftools query` format more carefully. The `%ALT[\t%AF]` syntax: when there's one ALT, it prints `ALT\tAF`. When there are multiple ALTs, it repeats for each. So the output would be:
+- For biallelic: `chrM  1234  A  T  0.85`
+- For multiallelic (two alts): two lines like `chrM  1234  A  T  0.7` and `chrM  1234  A  C  0.15`
+
+That seems correct for the collapsed.tsv format.
+
+But wait, I should also consider that `bcftools call -mv` might not include AF in the INFO field by default. Let me check... Actually, `bcftools call` does include AF when using `-m` (multiallelic caller). The AF is computed from the pileup data.
+
+Actually, I realize there might be an issue with how bcftools handles AF for mitochondrial DNA. Since mtDNA is haploid (or rather, we're looking at a population of mitochondria), the ploidy should be set appropriately. Let me add `-P` or use `--ploidy` option.
+
+For mitochondrial DNA, the effective ploidy can be high due to heteroplasmy. But for variant calling, we typically treat it as diploid or use a higher ploidy. Actually, for mtDNA, it's common to use `--ploidy 1` or even higher. Let me check bcftools mpileup options...
+
+Actually, `bcftools mpileup` has `-p` or `--ploidy` option. For mtDNA, using a higher ploidy (like 100) can help detect low-frequency heteroplasmies. But the default might work fine too. Let me keep it simple and not specify ploidy unless needed.
+
+Actually wait - I should also consider using lofreq instead of bcftools for variant calling, since lofreq is specifically designed for sensitive detection of low-frequency variants which is important for mtDNA heteroplasmy. But bcftools should work fine too.
+
+Let me stick with bcftools for simplicity and reliability.
+
+One more thing: I need to make sure the script is idempotent. The current checks (`[[ ! -f "$BAI" ]]` and `[[ ! -f "$TBI" ]]`) should handle that.
+
+Also, I should consider whether to use `bcftools norm` to normalize variants before querying. For mtDNA amplicons, this might not be strictly necessary, but it's good practice. However, it adds complexity and the tool inventory doesn't explicitly mention bcftools norm (though it's part of bcftools). Let me skip normalization for now.
+
+Let me also think about the `bcftools query` format string again. The `%AF` tag might not be present if there are no alternate alleles or if the variant is homozygous reference. But since we're using `-mv` (variants only, multiallelic), we should only get variant sites.
+
+Actually, I just realized that `bcftools call -mv` outputs only variants (not reference calls). The AF field should be present for all variant sites.
+
+Let me also consider the case where a sample might have no variants. In that case, the bcftools query would produce no output for that sample, which is fine.
+
+One more consideration: the `bcftools mpileup` command might need additional parameters for mtDNA. Common recommendations include:
+- `--min-BQ 13` (minimum base quality)
+- `--min-MQ 250` (minimum mapping quality, though for mtDNA this might be too strict)
+- `-A` (include anomalous read pairs)
+
+Actually, for amplicon sequencing, we might want to be less stringent on mapping quality since reads are expected to map perfectly to the target region. Let me keep defaults.
+
+Let me also think about whether I need to filter variants. The task doesn't specify filtering, so I'll output all called variants.
+
+Now let me reconsider the collapsed.tsv format. The columns are: sample, chrom, pos, ref, alt, af. The `bcftools query` with `%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n` should produce exactly this format (with sample prepended by awk).
+
+Wait, I need to double-check the bcftools query syntax for iterating over ALT and AF arrays. From the documentation:
+- `%ALT` prints all alternate alleles separated by commas (e.g., "A,T")
+- To iterate, use `[]` with a separator
+
+So `%ALT[\t%AF]` would print each ALT followed by its corresponding AF, separated by tabs. For a biallelic site with one ALT, it prints `ALT\tAF`. For a multiallelic site with two ALTs, it prints two lines (because the entire format string is repeated for each element).
+
+Actually, I need to verify this behavior. Let me think... The `[]` syntax in bcftools query means "for each element in the array, print the content inside []". So if the format is `%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n`, for a site with REF=A and ALT=T,C:
+- First iteration (ALT=T): `chrM\t1234\tA\tT\t0.7\n`
+- Second iteration (ALT=C): `chrM\t1234\tA\tC\t0.15\n`
+
+Yes, that's correct. Each alternate allele gets its own line with the corresponding AF.
+
+Now, one issue: what if AF is not available or is a special value? For mtDNA, AF should always be computable from the pileup. But just in case, I might need to handle missing values. Let me add a fallback or use `%INFO/AF` instead.
+
+Actually, `%AF` is a shorthand for the AF INFO field. It should work fine.
+
+Let me also consider using `bcftools +fill-tags` or similar to ensure AF is populated, but that might be overkill.
+
+One more thing: I should make sure the VCF files are properly formatted before querying. Using `bcftools view -O z` and then `tabix` should be fine.
+
+Let me finalize the script:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+REF="data/ref/chrM.fa"
+RAW_DIR="data/raw"
+OUT_DIR="results"
+THREADS="${THREADS:-4}"
+
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p "$OUT_DIR"
+
+# Index reference if needed
+[[ -f "${REF}.bwt" ]] || bwa index "$REF"
+[[ -f "${REF}.fai" ]] || samtools faidx "$REF"
+
+for SAMPLE in "${SAMPLES[@]}"; do
+    R1="${RAW_DIR}/${SAMPLE}_1.fq.gz"
+    R2="${RAW_DIR}/${SAMPLE}_2.fq.gz"
+    BAM="${OUT_DIR}/${SAMPLE}.bam"
+    BAI="${BAM}.bai"
+    VCF="${OUT_DIR}/${SAMPLE}.vcf.gz"
+    TBI="${VCF}.tbi"
+    
+    # Alignment and sorting (skip if index exists)
+    if [[ ! -f "$BAI" ]]; then
+        bwa mem -t "$THREADS" "$REF" "$R1" "$R2" | \
+            samtools view -b -@ "$THREADS" -o "${BAM}.unsorted.bam" -
+        samtools sort -@ "$THREADS" -o "$BAM" "${BAM}.unsorted.bam"
+        rm -f "${BAM}.unsorted.bam"
+        samtools index "$BAM"
+    fi
+    
+    # Variant calling (skip if TBI exists)
+    if [[ ! -f "$TBI" ]]; then
+        bcftools mpileup -f "$REF" -O u -@ "$THREADS" "$BAM" | \
+            bcftools call -mv -O z -o "$VCF"
+        tabix -p vcf "$VCF"
+    fi
+done
+
+# Create collapsed.tsv
+{
+    printf "sample\tchrom\tpos\tref\talt\taf\n"
+    for SAMPLE in "${SAMPLES[@]}"; do
+        VCF="${OUT_DIR}/${SAMPLE}.vcf.gz"
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' "$VCF" | \
+            awk -v s="$SAMPLE" '{print s"\t"$0}'
+    done
+} > "${OUT_DIR}/collapsed.tsv"
+```
+
+Wait, I need to reconsider the idempotency. The script checks for BAI and TBI existence before doing work. But what if the BAM exists but BAI doesn't? Or VCF exists but TBI doesn't? The current logic handles this correctly because it only checks for the final index files.
+
+Actually, there's a subtle issue: if `results/M117-bl.bam` exists but `results/M117-bl.bam.bai` doesn't, the script will try to re-align and sort, which would overwrite the BAM. That's fine for idempotency in terms of correctness, but it might redo work unnecessarily. However, the constraint says "rerunning on a populated results/ directory must exit 0 without redoing work or erroring." So if all files are present, it should skip everything. The current checks handle this.
+
+But wait - what if only some files are present? The script should still work correctly. If BAI is missing, it re-aligns (which is correct behavior). If TBI is missing, it re-calls variants (also correct).
+
+One more thing: I should consider whether to use `bcftools mpileup` with the `-a` option to include additional INFO fields. The default should include AF, but let me verify... Actually, `bcftools call` computes AF from the pileup data, so it should be present in the output VCF.
+
+Let me also think about whether I need to handle the case where bcftools query might fail if the VCF is empty (no variants). The `bcftools query` command should handle empty VCFs gracefully by producing no output.
+
+Actually, I just realized there might be an issue with the `bcftools call -mv` output. The `-m` flag enables the multiallelic caller, and `-v` outputs only variant sites. This should work fine.
+
+Let me also consider using `lofreq call` instead of bcftools for potentially better sensitivity on mtDNA heteroplasmy. But bcftools is simpler and should be sufficient. Let me stick with bcftools.
+
+One final check: the script uses `set -euo pipefail`, which means any command failure will cause the script to exit. This is good for robustness. The idempotency checks ensure that on a second run, no commands are executed (except mkdir and the collapsed.tsv generation, which should be fast).
+
+Actually wait - the collapsed.tsv generation runs every time. That's fine since it's just reading existing VCFs and producing a TSV. It won't error if files exist.
+
+Hmm, but what if I want to make the collapsed.tsv generation also idempotent in terms of not redoing work? The constraint says "without redoing work or erroring". Generating the TSV from existing VCFs is minimal work, so it should be fine. But to be extra safe, I could check if collapsed.tsv exists and skip it. However, the VCFs might change between runs (though unlikely in this context), so regenerating is probably the right behavior.
+
+Actually, re-reading the constraint: "rerunning on a populated results/ directory must exit 0 without redoing work or erroring." This suggests that if all output files exist, nothing should be redone. So I should also check for collapsed.tsv existence.
+
+Let me add that check:
+
+```bash
+if [[ ! -f "${OUT_DIR}/collapsed.tsv" ]]; then
+    {
+        printf "sample\tchrom\tpos\tref\talt\taf\n"
+        for SAMPLE in "${SAMPLES[@]}"; do
+            VCF="${OUT_DIR}/${SAMPLE}.vcf.gz"
+            bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' "$VCF" | \
+                awk -v s="$SAMPLE" '{print s"\t"$0}'
+        done
+    } > "${OUT_DIR}/collapsed.tsv"
+fi
+```
+
+This ensures that if collapsed.tsv already exists, it won't be regenerated.
+
+Let me also think about edge cases:
+1. What if a VCF has no variants? bcftools query will produce no output for that sample, which is correct.
+2. What if AF is missing? This shouldn't happen with bcftools call -mv, but just in case, the query might print "." or similar. That's acceptable.
+
+One more consideration: the `bcftools mpileup` command might need the `-d` option to set maximum depth. For mtDNA amplicons, coverage can be very high, and bcftools might downsample by default. Let me add `-d 250000` or similar to avoid downsampling issues. Actually, the default max depth is 250, which might be too low for amplicon sequencing. Let me set it higher.
+
+Actually, looking at bcftools mpileup documentation, the default `-d` is 250, and `-D` (max depth per sample) defaults to unlimited. For mtDNA amplicons, coverage can easily exceed 250x, so I should increase `-d`. Let me use `-d 10000` or even higher.
+
+Wait, actually for bcftools mpileup, the `-d` option sets the maximum depth per position. If coverage exceeds this, reads are randomly subsampled. For mtDNA variant calling, we want to use all available data, so I should set a high value. Let me use `-d 250000` (250k) which should be more than enough for MiSeq amplicon data.
+
+Actually, let me reconsider. The default behavior of bcftools mpileup with high coverage is to subsample, which might lose information about low-frequency variants. Setting `-d` to a very high value ensures all reads are used. Let me add `-d 250000`.
+
+Also, I should consider using `--max-depth` or similar. Actually, `-d` is the correct option.
+
+Let me update the mpileup command:
+```bash
+bcftools mpileup -f "$REF" -O u -@ "$THREADS" -d 250000 "$BAM" | \
+    bcftools call -mv -O z -o "$VCF"
+```
+
+Actually, I just realized that for mitochondrial DNA, we might also want to use `--min-BQ` and `--min-MQ` to filter low-quality bases and mappings. But since these are amplicon reads mapping to chrM, they should have high quality. Let me keep defaults for simplicity.
+
+One more thing: I should consider whether to use `bcftools norm` to left-align and normalize indels before querying. For mtDNA, indels are less common than SNPs, but they can occur. Normalization ensures consistent representation. However, it adds complexity and might not be strictly necessary. Let me skip it for now.
+
+Actually, let me reconsider the variant calling approach. Since these are amplicon samples, there might be PCR artifacts. Using `bcftools call -mv` with default parameters should handle this reasonably well. The `-m` flag uses a multiallelic caller that's more robust than the default Bayesian caller.
+
+Let me finalize the script with all considerations:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+REF="data/ref/chrM.fa"
+RAW_DIR="data/raw"
+OUT_DIR="results"
+THREADS="${THREADS:-4}"
+
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p "$OUT_DIR"
+
+# Index reference if needed
+[[ -f "${REF}.bwt" ]] || bwa index "$REF"
+[[ -f "${REF}.fai" ]] || samtools faidx "$REF"
+
+for SAMPLE in "${SAMPLES[@]}"; do
+    R1="${RAW_DIR}/${SAMPLE}_1.fq.gz"
+    R2="${RAW_DIR}/${SAMPLE}_2.fq.gz"
+    BAM="${OUT_DIR}/${SAMPLE}.bam"
+    BAI="${BAM}.bai"
+    VCF="${OUT_DIR}/${SAMPLE}.vcf.gz"
+    TBI="${VCF}.tbi"
+    
+    # Alignment and sorting (skip if index exists)
+    if [[ ! -f "$BAI" ]]; then
+        bwa mem -t "$THREADS" "$REF" "$R1" "$R2" | \
+            samtools view -b -@ "$THREADS" -o "${BAM}.unsorted.bam" -
+        samtools sort -@ "$THREADS" -o "$BAM" "${BAM}.unsorted.bam"
+        rm -f "${BAM}.unsorted.bam"
+        samtools index "$BAM"
+    fi
+    
+    # Variant calling (skip if TBI exists)
+    if [[ ! -f "$TBI" ]]; then
+        bcftools mpileup -f "$REF" -O u -@ "$THREADS" -d 250000 "$BAM" | \
+            bcftools call -mv -O z -o "$VCF"
+        tabix -p vcf "$VCF"
+    fi
+done
+
+# Create collapsed.tsv (skip if exists)
+if [[ ! -f "${OUT_DIR}/collapsed.tsv" ]]; then
+    {
+        printf "sample\tchrom\tpos\tref\talt\taf\n"
+        for SAMPLE in "${SAMPLES[@]}"; do
+            VCF="${OUT_DIR}/${SAMPLE}.vcf.gz"
+            bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' "$VCF" | \
+                awk -v s="$SAMPLE" '{print s"\t"$0}'
+        done
+    } > "${OUT_DIR}/collapsed.tsv"
+fi
+```
+
+Wait, I need to double-check the bcftools query format. The `%ALT[\t%AF]` syntax: when there's one ALT allele, it prints `ALT\tAF`. When there are multiple ALT alleles, it repeats the entire format string for each. So for a site with REF=A and ALT=T,C with AF=0.7 and AF=0.15:
+- Line 1: `chrM\t1234\tA\tT\t0.7`
+- Line 2: `chrM\t1234\tA\tC\t0.15`
+
+This is exactly what we want for the collapsed.tsv format.
+
+But wait, I need to verify that `%AF` corresponds to each ALT allele correctly. In VCF format, the AF INFO field is an array with one value per alternate allele. So `%ALT[\t%AF]` should pair each ALT with its corresponding AF. Yes, this is correct.
+
+One more thing: I should consider whether to use `bcftools query -H` to suppress header output. By default, bcftools query doesn't print VCF headers when using `-f`, so this shouldn't be an issue. But let me add it explicitly for safety... Actually, `-H` is for suppressing the VCF header in normal output mode, not with `-f`. With `-f`, no header is printed by default. So it's fine.
+
+Let me also think about whether the script handles the case where a sample has no variants correctly. If bcftools call produces an empty VCF (no variant sites), then bcftools query will produce no output for that sample. The collapsed.tsv will simply not have rows for that sample, which is correct behavior.
+
+Actually, I realize there might be an issue with how bcftools handles the AF field when using `-mv`. Let me check... The `-m` flag enables the multiallelic caller, which should compute AF correctly. The AF is based on the proportion of reads supporting each alternate allele.
+
+One final consideration: the script uses `set -euo pipefail`, which means if any command in a pipeline fails, the entire pipeline fails. This is good for robustness. However, I need to make sure that bcftools query doesn't fail on empty VCFs or VCFs with no variants. It shouldn't, as it would simply produce no output.
+
+I think the script is ready. Let me do a final review:
+
+1. Reference indexing: bwa index and samtools faidx, with idempotency checks.
+2. For each sample: align with bwa mem, convert to BAM, sort, index, call variants with bcftools mpileup + call, compress and index VCF. All with idempotency checks.
+3. Create collapsed.tsv by querying each VCF and prepending sample name. With idempotency check.
+
+The script looks correct and complete. Let me output it.

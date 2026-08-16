@@ -1,0 +1,169 @@
+We need to produce a self-contained bash script with first line "#!/usr/bin/env bash" (note typo? It says env). Must be exactly that. Second line set -euo pipefail.
+
+Script must be idempotent, use only tools listed, no absolute paths. Use relative paths.
+
+We need to implement steps 1-9 as described.
+
+Key points:
+
+- Define THREADS=4 and sample list.
+
+- Create results/ if missing: mkdir -p results
+
+- Reference indexing: samtools faidx data/ref/chrM.fa -> chrM.fa.fti? Actually output is .fai. Use samtools faidx data/ref/chrM.fa (creates chrM.fa.fai). Then bwa index data/ref/chrM.fa creates .amb .ann .bwt .pac .sa.
+
+- Skip if already exist and newer than input? We'll just check existence: if file exists, skip.
+
+But need idempotent: each step only runs if output missing or inputs older.
+
+Simplify: use conditional checks.
+
+We'll write script with functions maybe.
+
+Steps:
+
+1. mkdir -p results
+
+2. Index reference: samtools faidx data/ref/chrM.fa; bwa index data/ref/chrM.fa
+
+But need to check if .fai exists and is newer than input? We'll just run both commands only if not exist.
+
+Similarly for bwa index.
+
+3. For each sample:
+
+   - Align: bwa mem -t $THREADS -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz > results/${sample}.bam
+
+   But need to ensure output file not exist or older.
+
+   - Sort BAM: samtools sort -@ $THREADS -o results/${sample}.bam (overwrite)
+
+   - Index BAM: samtools index -@ $THREADS results/${sample}.bam
+
+4. Variant calling with lofreq call-parallel:
+
+   lofreq call-parallel --pp-threads 4 --verbose --ref data/ref/chrM.fa --out results/${sample}.vcf --sig --bonf results/${sample}.bam
+
+But note: the command expects positional argument at end. We'll pass bam as last.
+
+We need to ensure output .vcf not exist or older than inputs.
+
+5. Compress VCF with bgzip: bgzip -@ $THREADS results/${sample}.vcf -> results/${sample}.vcf.gz
+
+   Index with tabix -p vcf results/${sample}.vcf.gz -> results/${sample}.vcf.gz.tbi
+
+   Remove intermediate .vcf.
+
+6. Collapse step:
+
+   For each sample, bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz > tmp_${sample}.tsv
+
+   Then concatenate all tmp files into results/collapsed.tsv with header.
+
+   Use cat -<(printf "sample\tchrom\tpos\tref\talt\taf")? Actually need header line first, then lines.
+
+Simplify: create temporary file collapsed.tsv with header and append each sample's query output.
+
+But idempotent: only rebuild if any input VCF.gz is newer than TSV.
+
+We'll implement check: if results/collapsed.tsv exists and all VCF.gz older -> skip.
+
+7. Idempotency final pass: script ends, no further checks needed.
+
+Now produce script with proper shebang line "#!/usr/bin/env bash". Note it's env not env? The line says "env". We'll write exactly as given.
+
+Second line set -euo pipefail
+
+Now script content:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+samples="M117-bl M117-ch M117C1-bl M117C1-ch"
+results_dir="results"
+
+mkdir -p "$results_dir"
+
+# Reference indexing (once)
+if [ ! -f "data/ref/chrM.fa.fai" ] || [ "data/ref/chrM.fa" -nt "data/ref/chrM.fa.fai" ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+if [ ! -f "data/ref/chrM.amb" ] || [ "data/ref/chrM.fa" -nt "data/ref/chrM.amb" ]; then
+    bwa index data/ref/chrM.fa
+fi
+
+# Per-sample processing
+for sample in $samples; do
+    # Align
+    if [ ! -f "results/${sample}.bam" ] || [ "data/raw/${sample}_1.2.fq.gz" -nt "results/${sample}.bam" ]; then
+        bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            data/raw/${sample}_1.2.fq.gz > results/${sample}.bam
+    fi
+
+    # Sort BAM
+    if [ ! -f "results/${sample}.bam" ] || [ "data/raw/${sample}_1.2.fq.gz" -nt "results/${sample}.bam" ]; then
+        samtools sort -@ "$THREADS" -o results/${sample}.bam
+    fi
+
+    # Index BAM
+    if [ ! -f "results/${sample}.bai" ] || [ "data/raw/${sample}_1.2.fq.gz" -nt "results/${sample}.bam" ]; then
+        samtools index -@ "$THREADS" results/${sample}.bam
+    fi
+
+    # Variant calling with lofreq call-parallel
+    if [ ! -f "results/${sample}.vcf" ] || [ "data/raw/${sample}_1.2.fq.gz" -nt "results/${sample}.vcf" ]; then
+        lofreq call-parallel --pp-threads 4 --verbose \
+            --ref data/ref/chrM.fa --out results/${sample}.vcf \
+            --sig --bonf results/${sample}.bam
+    fi
+
+    # Compress VCF with bgzip and index with tabix, remove intermediate .vcf
+    if [ ! -f "results/${sample}.vcf.gz" ] || [ "data/raw/${sample}_1.2.fq.gz" -nt "results/${sample}.vcf.gz" ]; then
+        bgzip -@ "$THREADS" results/${sample}.vcf > results/${sample}.vcf.gz
+        tabix -p vcf results/${sample}.vcf.gz > results/${sample}.vcf.gz.tbi
+        rm -f results/${sample}.vcf
+    fi
+
+done
+
+# Collapse step
+if [ ! -f "results/collapsed.tsv" ] || [ "$(find results -name '*.vcf.gz' | sort -r | head -n1)" -nt "results/collapsed.tsv" ]; then
+    # Build collapsed.tsv
+    {
+        echo "sample\tchrom\tpos\tref\talt\taf"
+        for sample in $samples; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> results/collapsed.tsv
+        done
+    } > results/collapsed.tsv.tmp && mv results/collapsed.tsv.tmp results/collapsed.tsv
+fi
+
+exit 0
+```
+
+But need to ensure no absolute paths, all relative.
+
+Check: bwa mem -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/raw/${sample}_1.2.fq.gz > results/${sample}.bam
+
+Note file name: M117-bl_1.2.fq.gz? Actually files are _1.2.fq.gz (compressed). Good.
+
+But earlier we used ${sample}_1.2.fq.gz which is correct.
+
+Now check idempotency: each step checks if output exists and inputs older.
+
+Potential issue: samtools index -@ $THREADS results/${sample}.bam creates .bai; our condition uses existence of .bai? We check for .bai not exist. Good.
+
+But we also need to ensure that bwa mem output is newer than input? Condition checks if output exists or inputs older: [ ! -f ... ] || [ "data/..." -nt "results/${sample}.bam" ]; That's fine.
+
+Now final script.
+
+Need first line exactly "#!usr/bin/env bash"? Actually given: #!/usr/bin/env bash. So we must write that exact string.
+
+Thus:
+
+#!/usr/bin/env bash
+
+Second line set -euo pipefail
+
+Now produce final answer with only script lines, no markdown.

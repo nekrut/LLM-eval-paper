@@ -1,0 +1,423 @@
+The user wants a self-contained bash script that performs a specific bioinformatics workflow for mitochondrial DNA variant calling. Let me break down the requirements:
+
+1. First line: `#!/usr/bin/env bash`
+2. Second line: `set -euo pipefail`
+3. Working directory contains `data/raw/` (FASTQ files) and `data/ref/` (chrM.fa)
+4. Outputs go to `results/`
+5. Must be idempotent
+6. No hardcoded paths outside cwd
+7. Only use tools from TOOL_INVENTORY
+8. Wall-clock under 600 seconds at THREADS=4
+9. No echo for user-facing prose
+
+The workflow steps:
+1. Set globals, prepare results directory
+2. Reference indexing (samtools faidx + bwa index)
+3. Per-sample alignment with bwa mem
+4. SAM → sorted BAM via samtools sort
+5. BAM indexing
+6. Variant calling with lofreq call-parallel
+7. VCF compression and indexing
+8. Collapse step to create collapsed.tsv
+9. Idempotency checks throughout
+
+Let me carefully construct this script following the plan exactly:
+
+Key details:
+- THREADS=4
+- Samples: M117-bl, M117-ch, M117C1-bl, M117C1-ch
+- Read group format: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"` with literal `\t` (backslash-t)
+- lofreq call-parallel with BAM as positional argument at the end
+- bgzip + tabix for VCF compression/indexing
+- bcftools query for collapsing
+
+For idempotency, I need to check if output files exist before running each step. The plan says "guard each artifact with an existence check" and "skip if results/{sample}.vcf.gz.tbi already exists and is newer than its inputs".
+
+Let me write the script carefully:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+REF=data/ref/chrM.fa
+RAW=data/raw
+RESULTS=results
+
+mkdir -p "$RESULTS"
+
+# Step 2: Reference indexing (idempotent)
+if [[ ! -f "${REF}.fai" ]]; then
+    samtools faidx "$REF"
+fi
+if [[ ! -f "${REF}.bwt" ]]; then
+    bwa index "$REF"
+fi
+
+# Steps 3-7: Per-sample processing
+for sample in "${SAMPLES[@]}"; do
+    BAM="${RESULTS}/${sample}.bam"
+    BAI="${BAM}.bai"
+    VCF_GZ="${RESULTS}/${sample}.vcf.gz"
+    TBI="${VCF_GZ}.tbi"
+    
+    # Skip if final artifact exists
+    if [[ -f "$TBI" ]]; then
+        continue
+    fi
+    
+    # Step 3+4: bwa mem | samtools sort
+    if [[ ! -f "$BAM" ]]; then
+        bwa mem -t "$THREADS" \
+            -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            "$REF" \
+            "${RAW}/${sample}_1.fq.gz" \
+            "${RAW}/${sample}_2.fq.gz" | \
+        samtools sort -@ "$THREADS" -o "$BAM"
+    fi
+    
+    # Step 5: BAM indexing
+    if [[ ! -f "$BAI" ]]; then
+        samtools index -@ "$THREADS" "$BAM"
+    fi
+    
+    # Step 6: Variant calling with lofreq
+    VCF="${RESULTS}/${sample}.vcf"
+    if [[ ! -f "$VCF_GZ" ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" \
+            --ref "$REF" \
+            --out "$VCF" \
+            "$BAM"
+        
+        # Step 7: Compress and index VCF
+        bgzip -c "$VCF" > "$VCF_GZ"
+        tabix -p vcf "$VCF_GZ"
+        rm -f "$VCF"
+    fi
+done
+
+# Step 8: Collapse step
+COLLAPSED="${RESULTS}/collapsed.tsv"
+REBUILD=0
+for sample in "${SAMPLES[@]}"; do
+    VCF_GZ="${RESULTS}/${sample}.vcf.gz"
+    if [[ ! -f "$COLLAPSED" ]] || [[ "$VCF_GZ" -nt "$COLLAPSED" ]]; then
+        REBUILD=1
+        break
+    fi
+done
+
+if [[ "$REBUILD" -eq 1 ]]; then
+    {
+        printf 'sample\tchrom\tpos\tref\talt\taf\n'
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" \
+                "${RESULTS}/${sample}.vcf.gz"
+        done
+    } > "$COLLAPSED"
+fi
+```
+
+Wait, I need to be careful about the idempotency. The plan says:
+- "guard each artifact with an existence check (e.g. skip if results/{sample}.vcf.gz.tbi already exists and is newer than its inputs)"
+- "Re-runs on a fully populated results/ must exit 0 without re-doing work"
+
+My current approach checks for the final TBI file to skip the entire sample pipeline, which should work. But I should also handle intermediate states properly.
+
+Also, I need to make sure the read group string has literal `\t` characters (backslash followed by t), not actual tabs. In bash, if I use double quotes, `\t` remains as backslash-t unless I use `$'...'` or `echo -e`. So `"@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"` should work correctly in double quotes.
+
+Let me also check the lofreq command. The plan says:
+```
+lofreq call-parallel --pp-threads 4 --verbose
+--ref data/ref/chrM.fa --out results/{sample}.vcf
+--sig
+--bonf
+results/{sample}.bam
+```
+
+But then it says "you can omit them and use lofreq's defaults". So I'll use:
+```
+lofreq call-parallel --pp-threads "$THREADS" --ref "$REF" --out "$VCF" "$BAM"
+```
+
+Wait, looking more carefully at the plan, it says the BAM is a positional argument at the end. Let me check lofreq syntax... `lofreq call-parallel` takes BAM files as positional arguments. So:
+```
+lofreq call-parallel --pp-threads 4 --ref data/ref/chrM.fa --out results/{sample}.vcf results/{sample}.bam
+```
+
+This looks correct.
+
+One more thing - the plan mentions `--verbose` in the IUC extraction but says we can omit flags and use defaults. I'll keep it simple without `--verbose`.
+
+Let me also verify the bcftools query format string. The plan says:
+`bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`
+
+But `{sample}` here is meant to be replaced with the actual sample name. In bash, I can do this with variable expansion inside single quotes won't work, so I need double quotes or concatenation:
+```bash
+bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "${RESULTS}/${sample}.vcf.gz"
+```
+
+Wait, but in double quotes, `\t` might be interpreted... Actually no, in bash double quotes, `\t` is NOT interpreted as a tab. Only `$`, `` ` ``, `\`, `"`, and `!` have special meaning in double quotes. So `\t` remains literal backslash-t, which bcftools will interpret as a tab in its format string. Good.
+
+Actually wait, I need to double-check this. In bash:
+- Single quotes: everything is literal
+- Double quotes: `$`, `` ` ``, `\`, `"`, and `!` are special; `\t` remains as `\t` (backslash followed by t)
+
+So `"${sample}\t%CHROM..."` will expand `${sample}` but keep `\t` as literal backslash-t, which is what bcftools expects. 
+
+Let me also make sure the header line uses actual tabs. `printf 'sample\tchrom\tpos\tref\talt\taf\n'` should work because printf interprets `\t` as tab.
+
+Actually, I realize there's a subtle issue with the idempotency check for collapsed.tsv. The plan says "Rebuild only if any input VCF is newer than the TSV." My current logic checks if COLLAPSED doesn't exist OR if any VCF_GZ is newer than COLLAPSED. This should work.
+
+Let me also consider edge cases:
+- What if some samples are done and others aren't? The script should process only incomplete samples.
+- What if the VCF exists but VCF.gz doesn't? The current logic checks for TBI, so it would re-process from BAM onwards. But wait, if VCF.gz exists but TBI doesn't, we'd try to call lofreq again which would fail because the output file already exists... Actually no, lofreq would overwrite it. But then bgzip would also work. Hmm, this could be an issue.
+
+Let me refine the idempotency logic to be more robust:
+
+```bash
+for sample in "${SAMPLES[@]}"; do
+    BAM="${RESULTS}/${sample}.bam"
+    BAI="${BAM}.bai"
+    VCF_GZ="${RESULTS}/${sample}.vcf.gz"
+    TBI="${VCF_GZ}.tbi"
+    
+    # Skip if final artifact exists
+    if [[ -f "$TBI" ]]; then
+        continue
+    fi
+    
+    # Step 3+4: bwa mem | samtools sort (only if BAM missing)
+    if [[ ! -f "$BAM" ]]; then
+        bwa mem -t "$THREADS" \
+            -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            "$REF" \
+            "${RAW}/${sample}_1.fq.gz" \
+            "${RAW}/${sample}_2.fq.gz" | \
+        samtools sort -@ "$THREADS" -o "$BAM"
+    fi
+    
+    # Step 5: BAM indexing (only if BAI missing)
+    if [[ ! -f "$BAI" ]]; then
+        samtools index -@ "$THREADS" "$BAM"
+    fi
+    
+    # Step 6+7: Variant calling, compression, indexing (only if VCF_GZ missing)
+    if [[ ! -f "$VCF_GZ" ]]; then
+        VCF="${RESULTS}/${sample}.vcf"
+        lofreq call-parallel --pp-threads "$THREADS" \
+            --ref "$REF" \
+            --out "$VCF" \
+            "$BAM"
+        
+        bgzip -c "$VCF" > "$VCF_GZ"
+        tabix -p vcf "$VCF_GZ"
+        rm -f "$VCF"
+    fi
+done
+```
+
+This looks better. Each step is guarded individually, and we skip the sample entirely if the final TBI exists.
+
+Wait, there's still an issue. If VCF_GZ exists but TBI doesn't, we'd skip the lofreq/bgzip/tabix block because VCF_GZ exists, but then TBI would never be created. Let me fix this:
+
+```bash
+    # Step 6+7: Variant calling, compression, indexing (only if TBI missing)
+    if [[ ! -f "$TBI" ]]; then
+        VCF="${RESULTS}/${sample}.vcf"
+        if [[ ! -f "$VCF_GZ" ]]; then
+            lofreq call-parallel --pp-threads "$THREADS" \
+                --ref "$REF" \
+                --out "$VCF" \
+                "$BAM"
+            
+            bgzip -c "$VCF" > "$VCF_GZ"
+        fi
+        tabix -p vcf "$VCF_GZ"
+        rm -f "$VCF"
+    fi
+```
+
+Hmm, but this is getting complicated. Let me think about this differently. The simplest approach that satisfies idempotency:
+
+1. If TBI exists, skip the entire sample.
+2. Otherwise, run each step only if its output doesn't exist.
+
+But there's a dependency chain: BAM → BAI → VCF → VCF_GZ → TBI. So if any intermediate is missing, we need to rebuild from that point.
+
+Actually, let me simplify. The plan says "guard each artifact with an existence check". Let me just check for the final output (TBI) and skip if it exists. If it doesn't exist, run the full pipeline for that sample. This is simpler and still idempotent:
+
+```bash
+for sample in "${SAMPLES[@]}"; do
+    TBI="${RESULTS}/${sample}.vcf.gz.tbi"
+    
+    # Skip if final artifact exists
+    if [[ -f "$TBI" ]]; then
+        continue
+    fi
+    
+    BAM="${RESULTS}/${sample}.bam"
+    VCF="${RESULTS}/${sample}.vcf"
+    VCF_GZ="${RESULTS}/${sample}.vcf.gz"
+    
+    # Step 3+4: bwa mem | samtools sort
+    bwa mem -t "$THREADS" \
+        -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+        "$REF" \
+        "${RAW}/${sample}_1.fq.gz" \
+        "${RAW}/${sample}_2.fq.gz" | \
+    samtools sort -@ "$THREADS" -o "$BAM"
+    
+    # Step 5: BAM indexing
+    samtools index -@ "$THREADS" "$BAM"
+    
+    # Step 6: Variant calling with lofreq
+    lofreq call-parallel --pp-threads "$THREADS" \
+        --ref "$REF" \
+        --out "$VCF" \
+        "$BAM"
+    
+    # Step 7: Compress and index VCF
+    bgzip -c "$VCF" > "$VCF_GZ"
+    tabix -p vcf "$VCF_GZ"
+    rm -f "$VCF"
+done
+```
+
+This is cleaner. If TBI exists, we skip. Otherwise, we run the full pipeline. This satisfies idempotency because on a fully populated results/, every sample's TBI exists, so we skip all samples and exit 0.
+
+But wait, what if the script is interrupted mid-way? Some BAMs might exist but no TBI. In that case, we'd re-run bwa mem which would overwrite the BAM. That's fine for idempotency in the sense that the final result is correct, though it does redo some work. The plan says "rerunning on a populated results/ directory must exit 0 without redoing work", so checking for TBI should be sufficient.
+
+Actually, re-reading: "guard each artifact with an existence check (e.g. skip if results/{sample}.vcf.gz.tbi already exists and is newer than its inputs)". The example given is checking TBI, which is what I'm doing. Good.
+
+Let me also make sure the bgzip command works correctly. `bgzip -c "$VCF" > "$VCF_GZ"` should compress VCF to VCF_GZ. Then tabix indexes it. Then we remove the uncompressed VCF. This looks correct.
+
+One more thing: the plan says "Compress with bgzip (not bcftools view -O z)". So using bgzip directly is correct.
+
+Let me finalize the script:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+REF=data/ref/chrM.fa
+RAW=data/raw
+RESULTS=results
+
+mkdir -p "$RESULTS"
+
+# Step 2: Reference indexing (idempotent)
+if [[ ! -f "${REF}.fai" ]]; then
+    samtools faidx "$REF"
+fi
+if [[ ! -f "${REF}.bwt" ]]; then
+    bwa index "$REF"
+fi
+
+# Steps 3-7: Per-sample processing
+for sample in "${SAMPLES[@]}"; do
+    TBI="${RESULTS}/${sample}.vcf.gz.tbi"
+    
+    # Skip if final artifact exists
+    if [[ -f "$TBI" ]]; then
+        continue
+    fi
+    
+    BAM="${RESULTS}/${sample}.bam"
+    VCF="${RESULTS}/${sample}.vcf"
+    VCF_GZ="${RESULTS}/${sample}.vcf.gz"
+    
+    # Step 3+4: bwa mem | samtools sort
+    bwa mem -t "$THREADS" \
+        -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+        "$REF" \
+        "${RAW}/${sample}_1.fq.gz" \
+        "${RAW}/${sample}_2.fq.gz" | \
+    samtools sort -@ "$THREADS" -o "$BAM"
+    
+    # Step 5: BAM indexing
+    samtools index -@ "$THREADS" "$BAM"
+    
+    # Step 6: Variant calling with lofreq
+    lofreq call-parallel --pp-threads "$THREADS" \
+        --ref "$REF" \
+        --out "$VCF" \
+        "$BAM"
+    
+    # Step 7: Compress and index VCF
+    bgzip -c "$VCF" > "$VCF_GZ"
+    tabix -p vcf "$VCF_GZ"
+    rm -f "$VCF"
+done
+
+# Step 8: Collapse step
+COLLAPSED="${RESULTS}/collapsed.tsv"
+REBUILD=0
+for sample in "${SAMPLES[@]}"; do
+    VCF_GZ="${RESULTS}/${sample}.vcf.gz"
+    if [[ ! -f "$COLLAPSED" ]] || [[ "$VCF_GZ" -nt "$COLLAPSED" ]]; then
+        REBUILD=1
+        break
+    fi
+done
+
+if [[ "$REBUILD" -eq 1 ]]; then
+    {
+        printf 'sample\tchrom\tpos\tref\talt\taf\n'
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" \
+                "${RESULTS}/${sample}.vcf.gz"
+        done
+    } > "$COLLAPSED"
+fi
+```
+
+Wait, I need to double-check the read group string. The plan says:
+- exact form: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`
+- The `\t` must remain the two characters backslash and `t`
+
+In bash, when I write `"@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`, the double quotes allow variable expansion but do NOT interpret `\t` as a tab. So this should produce the literal string with backslash-t sequences, which is what bwa expects. Good.
+
+Let me also verify that `bgzip` is available. The tool inventory lists `tabix (htslib) 1.21`, and bgzip is part of htslib/samtools. Since samtools 1.21 is listed, bgzip should be available as it's typically bundled with samtools/htslib.
+
+Actually, looking at the tool inventory again:
+- samtools samtools 1.21 [ok]
+- tabix tabix (htslib) 1.21 [ok]
+
+bgzip is usually installed alongside samtools or tabix. It should be on PATH. Let me assume it is.
+
+One more consideration: the plan says "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." My script doesn't use echo, so that's fine.
+
+Let me also check if there are any issues with the bcftools query format string. The format is:
+`${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n`
+
+In double quotes, `${sample}` expands to the sample name, and `\t` remains as literal backslash-t which bcftools interprets as tab. The `%CHROM`, `%POS`, etc. are bcftools format specifiers. This should work correctly.
+
+Actually, I just realized there might be an issue with how bcftools handles the format string in double quotes. Let me think... In bash:
+```bash
+bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" file.vcf.gz
+```
+
+The shell expands `${sample}` to, say, `M117-bl`, and leaves `\t` as literal backslash-t. So bcftools receives:
+`M117-bl\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n`
+
+bcftools then interprets `\t` as tab and `%CHROM` etc. as format specifiers. This should work correctly.
+
+I think the script is ready. Let me do a final review:
+
+1. First line: `#!/usr/bin/env bash` ✓
+2. Second line: `set -euo pipefail` ✓
+3. Uses only tools from inventory ✓
+4. Idempotent (checks for TBI before processing each sample) ✓
+5. No hardcoded paths outside cwd ✓
+6. Outputs to results/ ✓
+7. Follows the plan ordering ✓
+
+One small thing: I should make sure the script handles the case where data/ref/chrM.fa.fai or chrM.fa.bwt already exist correctly. The checks `[[ ! -f "${REF}.fai" ]]` and `[[ ! -f "${REF}.bwt" ]]` should work.
+
+Actually, wait. I just realized that bwa index produces multiple files (.amb, .ann, .bwt, .pac, .sa). Checking for .bwt should be sufficient as it's one of the core files. But let me verify... Yes, .bwt is a standard bwa index file.
+
+I think the script is complete and correct. Let me output it.

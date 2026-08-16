@@ -1,0 +1,143 @@
+We need to produce a bash script that follows constraints.
+
+Key points:
+
+- Use set -euo pipefail.
+- Idempotent: skip steps if outputs exist and newer than inputs? They say "skip if results/{sample}.vcf.gz.tbi already exists". But for other steps, we can check existence of final output. For each sample, we need to produce .bam, .bai, .vcf.gz, .tbi.
+
+- Reference indexing: skip if index files exist. We need to check presence of chrM.fa.fai and bwa index files (.amb etc). We'll just check for .amb maybe; but better check all? Simpler: if any of the bwa index files missing, run index. For faidx, check .fai.
+
+- For each sample: if results/{sample}.bam.bai exists and is newer than raw fastq? But we can simply check existence of .bam and .bai; but to be safe, we might skip if both exist. The requirement says "skip if the output already exists". So just check for final outputs.
+
+- For variant calling: need to produce .vcf.gz.tbi. We can skip if that file exists.
+
+- Collapse step: only rebuild if any input VCF is newer than collapsed.tsv. We'll compare timestamps.
+
+- Use only tools in inventory: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. We don't need others.
+
+- Use bgzip? Not listed but part of htslib; but they didn't list bgzip explicitly. But we can use bcftools view -O z or bgzip from samtools? Actually bgzip is part of tabix/htslib. It's not in inventory list but maybe available as 'bgzip'? They didn't list it, but it's usually installed with htslib. The plan says "Compress with bgzip". But we can use bcftools view -O z to compress; that's allowed.
+
+- Use bcftools query for collapse.
+
+- We need to ensure no echo of user prose. So only tool outputs.
+
+- Use threads=4.
+
+- Ensure script is idempotent: if results/ exists and all files exist, exit 0 without doing anything. But we still might run reference indexing? If index already present, skip. So overall script will just check each step.
+
+Implementation plan:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+# create results dir if not exist
+mkdir -p results
+
+# reference indexing
+REF="data/ref/chrM.fa"
+if [ ! -f "${REF}.fai" ]; then
+    samtools faidx "$REF"
+fi
+# bwa index: check for .amb file
+if [ ! -f "${REF}.amb" ]; then
+    bwa index "$REF"
+fi
+
+# per-sample processing loop
+for sample in "${SAMPLES[@]}"; do
+    BAM="results/${sample}.bam"
+    BAI="results/${sample}.bam.bai"
+    VCF_GZ="results/${sample}.vcf.gz"
+    TBI="results/${sample}.vcf.gz.tbi"
+
+    # if all outputs exist, skip sample
+    if [ -f "$BAM" ] && [ -f "$BAI" ] && [ -f "$VCF_GZ" ] && [ -f "$TBI" ]; then
+        continue
+    fi
+
+    # alignment and sort
+    if [ ! -f "$BAM" ]; then
+        bwa mem -t "$THREADS" \
+            -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+            data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz |
+            samtools sort -@ "$THREADS" -o "$BAM"
+    fi
+
+    # index bam
+    if [ ! -f "$BAI" ]; then
+        samtools index -@ "$THREADS" "$BAM"
+    fi
+
+    # variant calling
+    VCF="results/${sample}.vcf"
+    if [ ! -f "$VCF_GZ" ] || [ ! -f "$TBI" ]; then
+        lofreq call-parallel --pp-threads "$THREADS" --verbose \
+            --ref "$REF" --out "$VCF" \
+            --sig --bonf \
+            "$BAM"
+        # compress and index
+        bcftools view -O z -o "$VCF_GZ" "$VCF"
+        tabix -p vcf "$VCF_GZ"
+        rm -f "$VCF"
+    fi
+
+done
+
+# collapse step
+COLLAPSED="results/collapsed.tsv"
+REBUILD=0
+for sample in "${SAMPLES[@]}"; do
+    VCF_GZ="results/${sample}.vcf.gz"
+    if [ ! -f "$COLLAPSED" ] || [ "$(stat -c %Y "$VCF_GZ")" -gt "$(stat -c %Y "$COLLAPSED")" ]; then
+        REBUILD=1
+        break
+    fi
+done
+
+if [ "$REBUILD" -eq 1 ]; then
+    # generate header
+    printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$COLLAPSED"
+    for sample in "${SAMPLES[@]}"; do
+        VCF_GZ="results/${sample}.vcf.gz"
+        bcftools query -f "${sample}\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\n" "$VCF_GZ" >> "$COLLAPSED"
+    done
+fi
+
+exit 0
+
+Check constraints:
+
+- No echo. We used printf for header; that's okay? It's not user prose, just generating file content. But they said "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." Using printf is fine as it writes to file.
+
+- Use only listed tools: bwa, samtools, bcftools, tabix, lofreq. We used bcftools view and query, tabix, etc. All good.
+
+- bgzip not used; we used bcftools view -O z which compresses with bgzip internally.
+
+- We didn't use SnpSift or snpEff.
+
+- The read group string: we need to ensure the backslash-t remains literal. In bash, when writing a double-quoted string, \t is interpreted as tab unless escaped? Actually in double quotes, \t is not special; it's just backslash t. Wait: In Bash, within double quotes, backslash can escape certain characters: $, `, ", \, newline. But \t remains two chars. So "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" will produce @RG\tID:... etc. Good.
+
+- We used printf for header; that's fine.
+
+- Idempotent: For each sample, we check if all outputs exist; but what about partial? If BAM exists but BAI missing, we still run index. That's okay.
+
+- For variant calling, we check if VCF_GZ or TBI missing; but if one missing maybe due to earlier failure. We call lofreq again. Good.
+
+- Collapse step: we compare timestamps of each VCF_GZ vs collapsed.tsv. If any newer, rebuild. That ensures idempotent.
+
+Edge cases: stat -c %Y may not exist on all systems? In POSIX, use `stat -c %Y`. On Linux it's fine. They didn't restrict to portable. We can also use `touch` etc. But okay.
+
+We used bcftools query format string with backslashes; we need to escape properly: "${sample}\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\n". In double quotes, \n will be newline? Actually within double quotes, \n is not special; it's just backslash n. But bcftools expects literal \n to indicate newline in format string. So we need to provide that. Using single quotes would preserve backslashes but then variable expansion fails. We used double quotes with escaped backslashes: \\t and \\n produce literal \t and \n. Good.
+
+But we also have ${sample} inside; that's fine.
+
+We used printf for header: 'sample\tchrom\tpos\tref\talt\taf\n' - this will output newline at end. That's fine.
+
+Check that bcftools query format string uses %INFO/AF; but AF may be missing? But okay.
+
+All good.
+
+Let's produce final script.

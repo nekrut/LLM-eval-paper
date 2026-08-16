@@ -1,0 +1,108 @@
+*   Task: Per-sample variant calling on 4 paired-end MiSeq amplicon samples mapped to human mitochondrial reference (chrM).
+    *   Inputs: `data/raw/{sample}_1.fq.gz`, `data/raw/{sample}_2.fq.gz`, `data/ref/chrM.fa`.
+    *   Outputs: `results/{sample}.bam`, `results/{sample}.bam.bai`, `results/{sample}.vcf.gz`, `results/{sample}.vcf.gz.tbi`, `results/collapsed.tsv`.
+    *   Tools: `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`.
+    *   Constraints: Idempotent, no absolute paths, specific read group format for BWA, no duplicate removal, total time < 600s at THREADS=4.
+
+    *   `THREADS=4`
+    *   Samples: `M117-bl`, `M117-ch`, `M117C1-bl`, `M117C1-ch`.
+    *   Reference: `data/ref/chrM.fa`.
+
+    *   Check if `data/ref/chrM.fa.fai` exists. If not, run `samtools faidx`.
+    *   Check if `data/ref/chrM.fa.bwt` (or other BWA index files) exist. If not, run `bwa index`.
+
+    *   Loop through samples:
+        *   BAM creation:
+            *   If `results/{sample}.bam` exists, skip.
+            *   Command: `bwa mem -t 4 -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ 4 -o results/${sample}.bam`
+        *   BAM indexing:
+            *   If `results/{sample}.bam.bai` exists, skip.
+            *   Command: `samtools index -@ 4 results/${sample}.bam`
+        *   Variant calling (LoFreq):
+            *   If `results/{sample}.vcf.gz.tbi` exists, skip.
+            *   Command: `lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam`
+        *   VCF compression and indexing:
+            *   If `results/{sample}.vcf.gz.tbi` exists, skip (already checked above).
+            *   Command: `bgzip -f results/${sample}.vcf` -> `results/${sample}.vcf.gz`.
+            *   Command: `tabix -p vcf results/${sample}.vcf.gz`.
+
+    *   Check if `results/collapsed.tsv` exists and is newer than all `.vcf.gz` files.
+    *   Header: `echo -e "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv` (Wait, the prompt says no `echo -e` for user-facing prose, but this is data output. However, I should be careful with `echo`. Maybe use `printf`).
+    *   Loop through samples:
+        *   Command: `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> results/collapsed.tsv`
+
+    *   The prompt says "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose."
+    *   Writing the header of a TSV is data, not prose. I will use `printf`.
+
+    *   BWA RG: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`. The prompt explicitly says "The \t must remain the two characters backslash and t".
+    *   Idempotency: Check for existence of final files.
+
+    *   `bgzip` is part of `htslib`/`tabix` usually, but it's not listed in TOOL_INVENTORY? Wait, `tabix (htslib) 1.21` is there. Usually `bgzip` comes with htslib. Let me check the tool list again.
+    *   TOOL_INVENTORY: `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`, `SnpSift`, `snpEff`, `fastqc`, `seqkit`, `snakemake`, `shellcheck`, `java`.
+    *   Wait, `bgzip` is NOT explicitly listed. But `tabix` is. Usually they are together. If `bgzip` isn't available, I can use `bcftools view -O z`. However, the prompt says "Compress with bgzip (not bcftools view -O z)". This implies `bgzip` IS available as part of the htslib suite associated with tabix/samtools.
+
+    *   Wait, looking at step 7: "Compress with bgzip (not bcftools view -O z) producing results/{sample}.vcf.gz". I will use `bgzip`.
+
+    *   `results/collapsed.tsv` should be rebuilt if any input VCF is newer than the TSV.
+    *   I'll check for existence first, then maybe a simple timestamp check or just overwrite it once at the end of the loop logic? No, "Rebuild only if any input VCF is newer than the TSV."
+
+    ```bash
+    # Reference indexing
+    if [[ ! -f data/ref/chrM.fa.fai ]]; then
+        samtools faidx data/ref/chrM.fa
+    fi
+    if [[ ! -f data/ref/chrM.fa.bwt ]]; then
+        bwa index data/ref/chrM.fa
+    fi
+
+    # Per sample
+    for sample in $SAMPLES; do
+        # BAM
+        if [[ ! -f results/${sample}.bam ]]; then
+            bwa mem -t 4 -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ 4 -o results/${sample}.bam
+        fi
+        # BAI
+        if [[ ! -f results/${sample}.bam.bai ]]; then
+            samtools index -@ 4 results/${sample}.bam
+        fi
+        # VCF (LoFreq)
+        if [[ ! -f results/${sample}.vcf.gz.tbi ]]; then
+            lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+            bgzip -f results/${sample}.vcf
+            tabix -p vcf results/${sample}.vcf.gz
+        fi
+    done
+
+    # Collapsed TSV
+    # Check if any .vcf.gz is newer than collapsed.tsv
+    REBUILD=0
+    if [[ ! -f results/collapsed.tsv ]]; then
+        REBUILD=1
+    else
+        for sample in $SAMPLES; do
+            if [[ results/${sample}.vcf.gz -nt results/collapsed.tsv ]]; then
+                REBUILD=1
+                break
+            fi
+        done
+    fi
+
+    if [[ $REBUILD -eq 1 ]]; then
+        printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+        for sample in $SAMPLES; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> results/collapsed.tsv
+        done
+    fi
+    ```
+
+    *   `set -euo pipefail`? Yes.
+    *   `#!/usr/bin/env bash`? Yes.
+    *   No absolute paths? Yes.
+    *   Idempotent? Yes.
+    *   BWA RG format correct? `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`. (Backslash-t).
+    *   `results/` directory created? `mkdir -p results`.
+    *   No prose/commentary? Yes.
+
+    Wait, the prompt says "The \t must remain the two characters backslash and t — bwa parses them itself." In a double-quoted string in bash, `\t` is just `\t` unless it's an ANSI-C quoted string (`$'\t'`) or passed to `echo -e`. So `"@RG\tID:..."` will pass the literal characters `\` and `t` to BWA. This matches the requirement.
+
+    One detail on LoFreq: "lofreq emits plain VCF". The command provided is `lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam`. Correct.

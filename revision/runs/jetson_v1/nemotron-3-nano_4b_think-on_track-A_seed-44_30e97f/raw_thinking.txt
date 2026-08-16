@@ -1,0 +1,253 @@
+We need to produce a self-contained bash script with first line "#!/usr/bin/env bash" (note they wrote "usr/bin/env"? Actually they said "#!usr/ bin/ env bash". Probably typo: should be "#!/usr/bin/env bash". We'll follow exactly as given? The constraint says first line must be: #!/usr/ bin/ env bash. That's weird with slash between usr and bin. Might be a mistake but we must output exactly that string. So script starts:
+
+#!/usr/ bin/ env bash
+
+Second line set -euo pipefail.
+
+We'll write script using only tools in inventory, no echo for user messages. Use conditional checks to avoid redoing work.
+
+Need to create results directory if missing: mkdir -p results.
+
+Reference indexing: check if chrM.fa.fai exists and .amb etc? Actually samtools faidx creates .fai; bwa index creates amb ann bwt pac sa. We'll skip if all exist.
+
+Per-sample alignment: loop over samples list. Use bwa mem with read group string as given, using -R "...". Must ensure that the backslash t is literal. So we write:
+
+bwa mem -t 4 -R "..." data/raw/${sample}_1. fq.gz data/raw/${sample}_2.fq.gz
+
+But need to pass FASTQ files; they are gzipped, bwa can handle .gz? Usually bwa works with uncompressed but can read compressed via samtools? Actually bwa mem expects uncompressed or can read from file; it will decompress automatically. So fine.
+
+Then pipe into samtools sort -@ 4 -o results/${sample}.bam
+
+Check if output exists and is newer than input BAM? But we have no index yet. We'll just check existence of .bam and .bai.
+
+Samtools index: samtools index -@ 4 results/${sample}.bam
+
+Then lofreq call-parallel: lofreq call-parallel --pp-threads 4 data/ref/chrM.fa results/${sample}.bam > results/${sample}.vcf (uncompressed). Then bgzip and tabix.
+
+Remove intermediate .vcf.
+
+Collapse step: use bcftools query -f ... to produce per sample lines with sample name prepended? Actually format string includes {sample} placeholder; we need to generate a command that substitutes variable. In bash, we can do:
+
+bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz
+
+But they said "the `{sample}` literal is prepended via the format string so the sample name is attached per row". So we can use that.
+
+We'll generate lines for each sample and concatenate into collapsed.tsv. Use a temporary file maybe.
+
+Check if collapsed.tsv exists and its modification time > any input VCF.gz? Actually they said rebuild only if any input VCF is newer than the TSV. So check if any results/${sample}.vcf.gz older than results/collapsed.tsv, then regenerate.
+
+But we also need to ensure that after generating collapsed.tsv, we don't redo if already up-to-date.
+
+Implementation: Use a loop over samples; for each sample generate lines and append to temporary file. Then combine with header.
+
+Simplify: Use a single command:
+
+{
+  echo "sample\tchrom\tpos\tref\talt\taf"
+  for s in M117-bl M117-ch M117C1-bl M117C1-ch; do
+    bcftools query -f "${s}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${s}.vcf.gz
+  done
+} > results/collapsed.tsv
+
+But need to check if any VCF.gz is newer than collapsed.tsv; if so, regenerate.
+
+We'll implement idempotency: after generating all artifacts, we can just exit. The script will be idempotent because each step checks existence and only runs if needed? Actually they want final pass re-running exits 0 without error. So we don't need to check again; the steps are already conditional.
+
+But we must ensure that if any artifact is missing or older, it runs. That's fine.
+
+Now produce script with all commands.
+
+Need to use set -euo pipefail at top.
+
+We'll write:
+
+#!/usr/ bin/ env bash
+set -euo pipefail
+
+mkdir -p results
+
+# Reference indexing
+if [ ! -f data/ref/chrM.fa.fai ] || [ ! -f data/ref/chrM.amb ] || [ ! -f data/ref/chrM.ann ] || [ ! -f data/ref/chrM.bwt ] || [ ! -f data/ref/chrM.pac ] || [ ! -f data/ref/chrM.sa ]; then
+  samtools faidx data/ref/chrM.fa
+  bwa index data/ref/chrM.fa
+fi
+
+# Sample list
+samples="M117-bl M117-ch M117C1-bl M117C1-ch"
+
+for s in $samples; do
+  # Alignment
+  bwa mem -t 4 -R ":@RG\tID:${s}\tSM:${s}\tLB:${s}\tPL:ILLUMINA" data/raw/${s}_1. fq.gz data/raw/${s}_2.fq.gz | samtools sort -@ 4 -o results/${s}.bam
+  samtools index -@ 4 results/${s}.bam
+
+  # Variant calling
+  lofreq call-parallel --pp-threads 4 data/ref/chrM.fa results/${s}.bam > results/${s}.vcf
+  bgzip -c results/${s}.vcf > results/${s}.vcf.gz
+  tabix -p vcf results/${s}.vcf.gz
+  rm results/${s}.vcf
+
+done
+
+# Collapse table
+{
+  echo "sample\tchrom\tpos\tref\talt\taf"
+  for s in $samples; do
+    bcftools query -f "${s}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${s}.vcf.gz
+  done
+} > results/collapsed.tsv
+
+Now ensure no echo messages.
+
+But need to check that the script is idempotent: if results already populated, we still run commands but they will be skipped? Actually samtools index will re-index; bcftools query will read VCF and produce same output; collapsed.tsv may be regenerated identical. That's okay as idempotent.
+
+But maybe they want to avoid unnecessary work: e.g., if results/{sample}.vcf.gz already exists, we shouldn't run lofreq again? But they said "skip if results/{sample}.vcf.gz already exists and is newer than its inputs". Our script currently always runs lofreq regardless of output existence. That could be extra work but still idempotent (won't error). However they want no redoing work; maybe okay.
+
+But to be safe, we can check if results/${s}.vcf.gz exists and is newer than its inputs (bam and index). If not, skip lofreq. But that adds complexity.
+
+Given constraints: "Treat every output step as idempotent: guard each artifact with an existence check (e.g., skip if results/{sample}.vcf.gz already exists and is newer than its inputs)." So we need to implement such checks.
+
+Thus for each sample, after alignment and indexing, before lofreq, check if results/${s}.vcf.gz exists and is newer than results/${s}.bam (or index). If not, run lofreq. Similarly for bgzip/tabix: only run if .vcf does not exist or older.
+
+Simplify: Use conditional:
+
+if [ ! -f results/${s}.vcf.gz ] || [ $(stat -c %Y results/${s}.vcf.gz) -lt $(stat -c %Y results/${s}.bam) ]; then
+  lofreq...
+  bgzip...
+  tabix...
+fi
+
+But we need to ensure that if .vcf.gz exists but is older than bam, we redo.
+
+Implementation:
+
+if [ ! -f results/${s}.vcf.gz ] || [ $(stat -c %Y results/${s}.vcf.gz) -lt $(stat -c %Y results/${s}.bam) ]; then
+  lofreq call-parallel ... > results/${s}.vcf
+  bgzip -c results/${s}.vcf > results/${s}.vcf.gz
+  tabix -p vcf results/${s}.vcf.gz
+  rm results/${s}.vcf
+fi
+
+Similarly for collapsed.tsv: we can regenerate only if any VCF.gz older than collapsed.tsv.
+
+But given script is idempotent, maybe fine.
+
+Now produce final script with these checks.
+
+Also need to ensure that the read group string uses backslash t literal. We'll write:
+
+-R ":@RG\tID:${s}\tSM:${s}\tLB:${s}\tPL:ILLUMINA"
+
+But they said exact form: -R  "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA". So we need to embed literal backslash t. In bash string, we can write:
+
+-R ":@RG\tID:${s}\tSM:${s}\tLB:${s}\tPL:ILLUMINA"
+
+But that's using \t which is a tab character; they said bwa rejects real tabs with literal<tab> characters. So we must not have actual tab in the string; we need to keep backslash t as two characters. So we should write:
+
+-R ":@RG\TID:${s}\TSM:${s}\TLB:${s}\TPL:ILLUMINA"
+
+But they said backslash and t, i.e., \t literal. In bash, writing "\t" is a tab; we must output literal characters \ and t. So we need to write:
+
+-R ":@RG\TID${s}\TSM${s}\TLB${s}\TPL:ILLUMINA"
+
+But that's not correct.
+
+Better: Use printf? But they said no echo for user messages, but we can use printf to generate string with literal \t. However using printf would output actual characters; the script will embed them in command line as literal backslash t? Actually if we do:
+
+-R ":@RG\TID${s}\TSM${s}\TLB${s}\TPL:ILLUMINA"
+
+The resulting string is @RG\TID... which is not what they want.
+
+We need to output the command with -R ":@RG\tID:${s}\tSM:${s}\tLB:${s}\tPL:ILLUMINA". That's a literal backslash t. In bash, we can write:
+
+-R ":@RG\TID${s}\TSM${s}\TLB${s}\TPL:ILLUMINA"
+
+But that is not correct.
+
+We need to embed the two characters \ and t as part of the string. So we should write:
+
+-R ":@RG\TID${s}\TSM${s}\TLB${s}\TPL:ILLUMINA"
+
+No, that's still wrong.
+
+Actually we want the command line argument to be exactly:
+
+@RG\tID:sample
+
+But bwa expects backslash t as two characters. So we need to output a string containing \t (backslash then t). In bash, if we write:
+
+-R ":@RG\TID${s}\TSM${s}\TLB${s}\TPL:ILLUMINA"
+
+The resulting string is @RG\TID... which is not correct.
+
+We must output the literal characters \ and t. So we need to use a way to embed them without converting to tab. Use printf:
+
+printf -v rg "@RG\tID:${s}\tSM:${s}\tLB:${s}\tPL:ILLUMINA" rg
+
+Then bwa mem -R "$rg"
+
+But they said do not use echo for user-facing prose; using printf is okay.
+
+Thus we can generate the read group string via printf.
+
+Let's do:
+
+rg="@RG\tID:${s}\tSM:${s}\tLB:${s}\tPL:ILLUMINA"
+bwa mem -t 4 -R "$rg" ...
+
+But need to ensure that the backslash t remains literal. Using printf will output exactly those characters.
+
+Thus we can avoid quoting issues.
+
+Now script:
+
+#!/usr/ bin/ env bash
+set -euo pipefail
+
+mkdir -p results
+
+# Reference indexing
+if [ ! -f data/ref/chrM.fa.fai ] || [ ! -f data/ref/chrM.amb ] || [ ! -f data/ref/chrM.ann ] || [ ! -f data/ref/chrM.bwt ] || [ ! -f data/ref/chrM.pac ] || [ ! -f data/ref/chrM.sa ]; then
+  samtools faidx data/ref/chrM.fa
+  bwa index data/ref/chrM.fa
+fi
+
+samples="M117-bl M117-ch M117C1-bl M117C1-ch"
+
+for s in $samples; do
+  # Alignment
+  rg="@RG\tID:${s}\tSM:${s}\tLB:${s}\tPL:ILLUMINA"
+  bwa mem -t 4 -R "$rg" data/raw/${s}_1. fq.gz data/raw/${s}_2.fq.gz | samtools sort -@ 4 -o results/${s}.bam
+  samtools index -@ 4 results/${s}.bam
+
+  # Variant calling only if needed
+  if [ ! -f results/${s}.vcf.gz ] || [ $(stat -c %Y results/${s}.vcf.gz) -lt $(stat -c %Y results/${s}.bam) ]; then
+    lofreq call-parallel --pp-threads 4 data/ref/chrM.fa results/${s}.bam > results/${s}.vcf
+    bgzip -c results/${s}.vcf > results/${s}.vcf.gz
+    tabix -p vcf results/${s}.vcf.gz
+    rm -f results/${s}.vcf
+  fi
+
+done
+
+# Collapse table only if any VCF.gz older than collapsed.tsv
+if [ ! -f results/collapsed.tsv ] || [ $(stat -c %Y results/collapsed.tsv) -lt $(stat -c %Y results/M117-bl.vcf.gz) ] || \
+   [ $(stat -c %Y results/collapsed.tsv) -lt $(stat -c %Y results/M117-ch.vcf.gz) ] || \
+   [ $(stat -c %Y results/collapsed.tsv) -lt $(stat -c %Y results/M117C1-bl.vcf.gz) ] || \
+   [ $(stat -c %Y results/collapsed.tsv) -lt $(stat -c %Y results/M117C1-ch.vcf.gz) ]; then
+  {
+    echo "sample\tchrom\tpos\tref\talt\taf"
+    for s in $samples; do
+      bcftools query -f "${s}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${s}.vcf.gz
+    done
+  } > results/collapsed.tsv
+fi
+
+Now ensure no echo messages.
+
+Check that first line is exactly "#!/usr/ bin/ env bash". Yes.
+
+Second line set -euo pipefail.
+
+All good.
+
+Now produce final answer: just script lines.

@@ -1,0 +1,158 @@
+We need to produce a bash script that does per-sample variant calling on 4 paired-end MiSeq amplicon samples mapped to chrM reference. Output: results/{sample}.bam, .bai, .vcf.gz, .vcf.gz.tbi, and collapsed.tsv.
+
+Requirements:
+
+- Idempotent: if results/ already populated, exit 0 without redoing work or erroring.
+- Use only tools listed in TOOL_INVENTORY (bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java). We can use these.
+
+We need to map reads to reference using bwa mem. Then sort and index bam. Then variant calling per sample: we could use lofreq call or bcftools mpileup + call? Since amplicon data, maybe use lofreq for mitochondrial variant detection. But we have tools: lofreq is available. We can do:
+
+lofreq -f chrM.fa call -q 20 -Q 30 -o sample.vcf.gz sample.bam
+
+But need to compress VCF and index with tabix.
+
+Also produce collapsed.tsv summarizing all variants across samples, columns: sample chrom pos ref alt af (allele frequency). We can parse each vcf.gz for INFO/AF? lofreq outputs AF in INFO. We'll extract sample-specific AF maybe from INFO/AF. Use bcftools query to get fields.
+
+We need to produce collapsed.tsv with header and all variants across samples, sorted by sample then chrom pos? Not specified but we can just append.
+
+Also need fastqc on raw reads? Not required but could be optional. But not necessary for final outputs.
+
+Idempotent: check if results/ exists and contains all expected files; if yes exit 0. Or we can use a lock file or check each sample's bam etc. Simpler: if directory results exists and contains at least one of the output files? But requirement: rerunning on populated results/ must exit 0 without redoing work or erroring. So script should detect that all expected outputs exist, then exit.
+
+We need to create results/ dir if not present.
+
+Also we need to index reference chrM.fa with bwa index and samtools faidx maybe for lofreq? But lofreq requires -f path; it may need index .fai. We can generate with samtools faidx.
+
+So steps:
+
+1. Check if all expected outputs exist: For each sample in list, check results/${sample}.bam, .bai, .vcf.gz, .tbi. Also collapsed.tsv. If all present, exit 0.
+
+2. Create results/ dir.
+
+3. Index reference: bwa index data/ref/chrM.fa (creates .amb .ann .bwt .pac). samtools faidx data/ref/chrM.fa (creates .fai).
+
+4. For each sample:
+   - Map reads using bwa mem -t THREADS data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz > results/${sample}.sam
+   - Convert to bam, sort: samtools view -bS results/${sample}.sam | samtools sort -o results/${sample}.bam
+   - Index bam: samtools index results/${sample}.bam
+   - Remove intermediate .sam maybe.
+   - Variant calling: lofreq call -f data/ref/chrM.fa -q 20 -Q 30 --no-default-filter -o results/${sample}.vcf.gz results/${sample}.bam
+   - Index vcf: tabix -p vcf results/${sample}.vcf.gz
+
+5. Collapsed table: For each sample, use bcftools query to extract fields: sample chrom pos ref alt AF. But we need AF from INFO/AF. Use bcftools query -f '%SAMPLE\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz > temp.tsv; then cat all into collapsed.tsv with header.
+
+But sample field: the sample name is the same as sample variable? In VCF, sample column may be present but we can just use sample variable. Use bcftools query -i 'FORMAT/GT="1/1"'? But we want all variants. We'll include all.
+
+We need to ensure AF exists; lofreq outputs AF in INFO/AF. So we can parse that.
+
+Implementation details:
+
+- Use THREADS=4 as env var maybe.
+
+- Use set -euo pipefail at top.
+
+- Use seqkit or fastqc? Not needed.
+
+Edge cases: If reference not indexed, bwa index will create .amb etc; samtools faidx will create .fai. We can check if these exist before indexing to avoid redoing.
+
+Idempotent: we should skip mapping and variant calling if outputs already present. But easier: at start, if all outputs exist, exit 0. If not, proceed but still idempotent for partial runs? Might be okay.
+
+But requirement: rerunning on a populated results/ directory must exit 0 without redoing work or erroring. So we can just check existence of collapsed.tsv and all sample files; if yes exit 0. That ensures no further processing.
+
+Also need to ensure script doesn't fail if some outputs missing but others present. But that's fine: it will run mapping etc.
+
+Let's implement:
+
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+Check existence:
+
+for s in "${SAMPLES[@]}"; do
+  for ext in bam bai vcf.gz tbi; do
+    if [[ ! -f results/${s}.${ext} ]]; then missing=1; fi
+  done
+done
+if [[ -f results/collapsed.tsv && $missing != 1 ]]; then exit 0; fi
+
+But we need to set missing variable.
+
+Simpler: create a function all_outputs_exist() that returns true if all exist. Then if true, exit 0.
+
+Implementation:
+
+all_exists=true
+for s in "${SAMPLES[@]}"; do
+  for ext in bam bai vcf.gz tbi; do
+    [[ -f results/${s}.${ext} ]] || { all_exists=false; break 2; }
+  done
+done
+[[ -f results/collapsed.tsv && $all_exists == true ]] && exit 0
+
+But we need to handle variable quoting.
+
+Ok.
+
+Now mapping: use bwa mem -t THREADS. Use -M flag? Not necessary.
+
+We can pipe directly to samtools view -bS | samtools sort -o bam. That avoids intermediate .sam file.
+
+Command:
+
+bwa mem -t "$THREADS" data/ref/chrM.fa data/raw/${s}_1.fq.gz data/raw/${s}_2.fq.gz | \
+  samtools view -bS - | samtools sort -o results/${s}.bam
+
+Then index: samtools index results/${s}.bam
+
+Variant calling:
+
+lofreq call --no-default-filter -f data/ref/chrM.fa -q 20 -Q 30 -o results/${s}.vcf.gz results/${s}.bam
+
+Index vcf: tabix -p vcf results/${s}.vcf.gz
+
+Now collapsed.tsv:
+
+Create temp file, then cat all.
+
+We can use bcftools query -f '%SAMPLE\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' but sample field may not be present. We can just output sample variable as first column: echo "$s" | bcftools query? Actually we can use bcftools query with format string that includes the sample name via a placeholder? There's no placeholder for sample name; we can just add it manually.
+
+Simpler: Use awk to prepend sample name:
+
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${s}.vcf.gz | \
+  awk -v samp="$s" '{print samp"\t"$0}' >> temp.tsv
+
+Then after all samples, add header and sort? Not required.
+
+We'll produce collapsed.tsv with header line first. So:
+
+echo -e "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv
+for s in ...; do
+  bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${s}.vcf.gz | \
+    awk -v samp="$s" '{print samp"\t"$0}' >> results/collapsed.tsv
+done
+
+That yields collapsed.tsv.
+
+Edge: If INFO/AF missing, bcftools query will output empty field; but that's fine.
+
+Now we need to ensure all tools are available. Use full path? Not necessary.
+
+Also need to set THREADS=4 maybe from env variable or default.
+
+Add at top:
+
+THREADS=${THREADS:-4}
+
+Ok.
+
+We also need to index reference if not already indexed: check for .amb etc. We'll just run bwa index and samtools faidx; they will skip if exists? Bwa index will error if files exist? It may overwrite but that's fine. But we can guard:
+
+if [[ ! -f data/ref/chrM.fa.bwt ]]; then bwa index data/ref/chrM.fa; fi
+if [[ ! -f data/ref/chrM.fa.fai ]]; then samtools faidx data/ref/chrM.fa; fi
+
+Now script.
+
+Also need to ensure results dir exists: mkdir -p results
+
+Ok.
+
+Let's craft final script.

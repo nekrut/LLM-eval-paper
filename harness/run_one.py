@@ -86,10 +86,21 @@ def call_claude(model: str, system_text: str, user_text: str) -> dict:
         d = json.loads(p.stdout)
     except json.JSONDecodeError:
         raise RuntimeError(f"claude returned non-JSON:\n{p.stdout[:2000]}")
+    # Current Claude models can decline a request: the CLI exits 0 and returns a
+    # normal payload carrying a refusal rather than a script. Left undetected
+    # that scores as a total capability failure, when it is a policy outcome.
+    # The exact payload shape isn't contractually stable, so keep every
+    # non-result field for post-hoc inspection and flag the obvious cases.
+    envelope = {k: v for k, v in d.items() if k != "result"}
+    refused = bool(d.get("is_error")) or "refus" in str(d.get("subtype", "")).lower()
     return {
         "provider": "anthropic",
         "model": model,
         "script": strip_fences(d.get("result", "")),
+        "thinking": "",          # not exposed by `claude -p --output-format json`
+        "done_reason": d.get("subtype"),
+        "refused": refused,
+        "envelope": envelope,
         "usage": d.get("usage", {}),
         "cost_usd": d.get("total_cost_usd", d.get("cost_usd")),
         "duration_ms": d.get("duration_ms"),
@@ -98,7 +109,16 @@ def call_claude(model: str, system_text: str, user_text: str) -> dict:
     }
 
 
-def call_ollama(model: str, think: bool, system_text: str, user_text: str, seed: int, gen_timeout: int = 900) -> dict:
+def call_ollama(model: str, think: bool, system_text: str, user_text: str, seed: int,
+                gen_timeout: int = 900, num_predict: int = 16384, num_ctx: int = 16384) -> dict:
+    # num_predict/num_ctx default to 16384 because that is the budget every
+    # published and revision cell ran under -- changing the default would
+    # silently invalidate comparisons against them. Override only for a
+    # deliberate budget ablation, and keep those runs in their own log.
+    #
+    # Note the two interact: the prompt is charged against num_ctx, so with
+    # both at 16384 the usable thinking budget is ~14k tokens, not 16k.
+    # Raising num_predict alone does nothing once num_ctx is the binding limit.
     # /no_think is a Qwen-family control token; other model families use the
     # `think` payload field instead and treat the prefix as literal user text.
     if not think and model.lower().startswith("qwen"):
@@ -114,8 +134,8 @@ def call_ollama(model: str, think: bool, system_text: str, user_text: str, seed:
         "options": {
             "temperature": 0.2,
             "seed": seed,
-            "num_predict": 16384,
-            "num_ctx": 16384,
+            "num_predict": num_predict,
+            "num_ctx": num_ctx,
         },
     }
     req = urllib.request.Request(
@@ -124,15 +144,48 @@ def call_ollama(model: str, think: bool, system_text: str, user_text: str, seed:
         headers={"Content-Type": "application/json"},
     )
     t0 = time.time()
-    with urllib.request.urlopen(req, timeout=gen_timeout) as r:
-        d = json.loads(r.read())
+    # The provider can fail mid-request (e.g. a CUDA fault surfaces as HTTP 500).
+    # Letting that propagate kills the process before the run dir exists, which
+    # leaves the caller with no artifacts and no way to tell an infrastructure
+    # fault from a model failure. Capture it as a first-class outcome instead.
+    try:
+        with urllib.request.urlopen(req, timeout=gen_timeout) as r:
+            d = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:2000]
+        return {
+            "provider": "ollama", "model": model, "think": think,
+            "script": "", "thinking": "", "done_reason": None,
+            "provider_error": f"HTTP {e.code}: {body}",
+            "usage": {}, "cost_usd": 0.0,
+            "duration_ms": int((time.time() - t0) * 1000),
+            "wall_seconds": time.time() - t0, "raw_response_preview": "",
+        }
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return {
+            "provider": "ollama", "model": model, "think": think,
+            "script": "", "thinking": "", "done_reason": None,
+            "provider_error": f"{type(e).__name__}: {e}",
+            "usage": {}, "cost_usd": 0.0,
+            "duration_ms": int((time.time() - t0) * 1000),
+            "wall_seconds": time.time() - t0, "raw_response_preview": "",
+        }
     elapsed = time.time() - t0
-    content = d.get("message", {}).get("content", "")
+    msg = d.get("message", {})
+    content = msg.get("content", "")
+    # ollama >= 0.32 splits reasoning output into its own field. Reading only
+    # `content` makes a model that spent its num_predict budget thinking look
+    # like it returned nothing at all, which scores as a total failure even
+    # though the model may have been reasoning correctly. Capture both, plus
+    # done_reason, so the two cases can be told apart downstream.
+    thinking = msg.get("thinking") or ""
     return {
         "provider": "ollama",
         "model": model,
         "think": think,
         "script": strip_fences(content),
+        "thinking": thinking,
+        "done_reason": d.get("done_reason"),
         "usage": {
             "prompt_eval_count": d.get("prompt_eval_count"),
             "eval_count": d.get("eval_count"),
@@ -236,6 +289,13 @@ def main() -> int:
                     help="Path to PLAN.md (defaults to plan/PLAN.md)")
     ap.add_argument("--runs-dir", default=str(RUNS),
                     help="Directory to write run output (default runs/)")
+    ap.add_argument("--num-predict", type=int, default=16384,
+                    help="max tokens to generate (default 16384 = every published "
+                         "and revision cell; change only for a budget ablation)")
+    ap.add_argument("--num-ctx", type=int, default=16384,
+                    help="context window (default 16384). The prompt is charged "
+                         "against this, so it, not --num-predict, is usually the "
+                         "binding limit on thinking length.")
     ap.add_argument("--gen-timeout", type=int, default=900,
                     help="Ollama HTTP timeout in seconds (default 900)")
     ap.add_argument("--track-template", default=None,
@@ -267,11 +327,34 @@ def main() -> int:
 
     print(f"[run_one] generating script via {args.model} (track {args.track}, seed {args.seed})", file=sys.stderr)
     if is_ollama:
-        gen = call_ollama(args.model, args.think == "on", system_text, user_text, args.seed, gen_timeout=args.gen_timeout)
+        gen = call_ollama(args.model, args.think == "on", system_text, user_text, args.seed,
+                          gen_timeout=args.gen_timeout,
+                          num_predict=args.num_predict, num_ctx=args.num_ctx)
     else:
         gen = call_claude(args.model, system_text, user_text)
 
     setup_sandbox(run_dir)
+
+    # Distinguish "the model produced no script" from "the model never got to
+    # the script because it used its whole token budget reasoning". Both look
+    # like an empty script, but only the first is a model failure; the second
+    # is a generation-budget artifact and must not be scored as a capability
+    # result. See call_ollama() on the ollama >= 0.32 thinking/content split.
+    if gen.get("provider_error"):
+        # Infrastructure fault, not a capability result. Must never be scored
+        # as a model failure — see the CUDA illegal-memory-access faults that
+        # long generations trigger on this JetPack 5 build.
+        generation_status = "provider_error"
+    elif gen.get("refused"):
+        generation_status = "refusal"
+    elif gen["script"]:
+        generation_status = "ok"
+    elif gen.get("thinking") and gen.get("done_reason") == "length":
+        generation_status = "truncated_in_thinking"
+    elif gen.get("done_reason") == "length":
+        generation_status = "truncated"
+    else:
+        generation_status = "empty_content"
 
     meta = {
         "run_id": run_id,
@@ -280,6 +363,15 @@ def main() -> int:
         "seed": args.seed,
         "think": args.think if is_ollama else None,
         "provider": gen["provider"],
+        "generation_status": generation_status,
+        "done_reason": gen.get("done_reason"),
+        "provider_error": gen.get("provider_error"),
+        "thinking_chars": len(gen.get("thinking") or ""),
+        # Recorded so a run is self-describing: a budget-ablation run is
+        # otherwise indistinguishable from a default one after the fact, and
+        # `truncated_in_thinking` means nothing without the budget it hit.
+        "num_predict": args.num_predict if is_ollama else None,
+        "num_ctx": args.num_ctx if is_ollama else None,
         "wall_seconds_generation": gen["wall_seconds"],
         "duration_ms_generation": gen["duration_ms"],
         "plan_path": str(plan_path),
@@ -293,11 +385,24 @@ def main() -> int:
         "cost_usd": gen["cost_usd"],
     }, indent=2))
     (run_dir / "raw_response.txt").write_text(gen["raw_response_preview"])
+    if gen.get("thinking"):
+        (run_dir / "raw_thinking.txt").write_text(gen["thinking"])
+    if gen.get("envelope"):
+        (run_dir / "provider_envelope.json").write_text(
+            json.dumps(gen["envelope"], indent=2, default=str))
 
     if not gen["script"]:
-        print("[run_one] EMPTY script returned; aborting before exec", file=sys.stderr)
+        print(f"[run_one] EMPTY script returned ({generation_status}, "
+              f"done_reason={gen.get('done_reason')}, "
+              f"thinking={len(gen.get('thinking') or '')} chars); aborting before exec",
+              file=sys.stderr)
+        if generation_status == "truncated_in_thinking":
+            print("[run_one] NOTE: model was still reasoning when it hit num_predict. "
+                  "This is a generation-budget artifact, not a model capability result.",
+                  file=sys.stderr)
         (run_dir / "exec.json").write_text(json.dumps(
-            {"exit_code": None, "skipped": "empty_script"}, indent=2))
+            {"exit_code": None, "skipped": "empty_script",
+             "generation_status": generation_status}, indent=2))
         return 2
 
     inject_env = None

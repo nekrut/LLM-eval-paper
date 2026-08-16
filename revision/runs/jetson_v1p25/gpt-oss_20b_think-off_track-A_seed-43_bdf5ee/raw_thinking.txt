@@ -1,0 +1,320 @@
+We need to produce a bash script that follows plan.
+
+Constraints: only tools listed in TOOL_INVENTORY. We have bgzip? Not listed. But bcftools can compress with -O z. However plan says use bgzip not bcftools view -O z. But bgzip is part of htslib, but not explicitly listed. But tabix is there; bgzip might be available as part of htslib too. Usually bgzip is in same package as tabix. But not guaranteed? In TOOL_INVENTORY they list tabix (htslib) 1.21. That likely includes bgzip binary. So we can use bgzip.
+
+Also need to ensure idempotency: skip steps if outputs exist and newer than inputs. Use test -f and compare timestamps with `-nt` or `-ot`. For each step, check output file existence; also maybe check if input files are newer? We can just check if output exists and is newer than all relevant inputs; else run.
+
+Simplify: for each sample, we need to produce .bam, .bai, .vcf.gz, .tbi. We'll skip steps accordingly.
+
+Also reference indexing: check existence of chrM.fa.fai or bwa index files (.amb etc). We can check if any of the expected index files exist; but easiest: check for .amb file. If missing, run both commands.
+
+For collapse.tsv: need to check if any sample vcf.gz newer than collapsed.tsv. Use -nt.
+
+Also we must not output anything except tool outputs. So no echo. But we might use `printf`? That would produce output; but allowed? The instruction says "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." Using printf may produce output, which is not desired. We can avoid printing anything. Use commands that don't print unless errors.
+
+But we need to run loops etc. Avoid any prints.
+
+We must set -euo pipefail.
+
+Also ensure script idempotent: if results/ exists and all outputs exist and are newer than inputs, exit 0 without doing work. Our script will check each step; but still may perform some commands that produce no output? We need to avoid printing anything. But commands like `samtools sort -@4 -o file` produce progress messages by default? samtools prints to stderr progress lines unless -q or -h? Actually samtools sort prints to stdout? It writes to stdout? Wait, samtools sort outputs sorted BAM to stdout if no -o; but with -o it writes to file and may print progress to stderr. That might be considered tool output. It's allowed.
+
+But we must not use echo for user-facing prose. So fine.
+
+Also need to ensure script uses only tools in inventory: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. We will use bgzip (likely present). Use `bgzip` command; if not available, we can compress with `bcftools view -O z`. But plan says use bgzip. We'll assume it's there.
+
+Also need to ensure script uses only relative paths: data/raw/ etc.
+
+Let's craft script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+# Create results dir if not exist
+mkdir -p results
+
+# Reference indexing
+REF=data/ref/chrM.fa
+if [ ! -f "${REF}.amb" ]; then
+    samtools faidx "$REF"
+    bwa index "$REF"
+fi
+
+# Function to check newer
+is_newer() {
+    local out=$1; shift
+    for in in "$@"; do
+        if [ "$in" -nt "$out" ]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+for sample in "${SAMPLES[@]}"; do
+    # BAM output
+    bam=results/${sample}.bam
+    bai=results/${sample}.bam.bai
+
+    if [ ! -f "$bai" ] || is_newer "$bai" data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz; then
+        # Align and sort
+        bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+            data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz |
+        samtools sort -@ $THREADS -o "$bam"
+    fi
+
+    if [ ! -f "$bai" ] || is_newer "$bai" "$bam"; then
+        samtools index -@ $THREADS "$bam"
+    fi
+
+    # VCF output
+    vcf=results/${sample}.vcf.gz
+    tbi=results/${sample}.vcf.gz.tbi
+
+    if [ ! -f "$tbi" ] || is_newer "$tbi" "$bam"; then
+        # call-parallel writes uncompressed .vcf
+        tmp_vcf=results/${sample}.vcf
+        lofreq call-parallel --pp-threads $THREADS -f "$REF" -o "$tmp_vcf" "$bam"
+        bgzip -c "$tmp_vcf" > "${tmp_vcf}.gz"
+        mv "${tmp_vcf}.gz" "$vcf"
+        tabix -p vcf "$vcf"
+        rm "$tmp_vcf"
+    fi
+done
+
+# Collapse TSV
+collapsed=results/collapsed.tsv
+needs_collapse=false
+for sample in "${SAMPLES[@]}"; do
+    vcf_gz=results/${sample}.vcf.gz
+    if [ ! -f "$collapsed" ] || is_newer "$collapsed" "$vcf_gz"; then
+        needs_collapse=true
+        break
+    fi
+done
+
+if $needs_collapse; then
+    # header
+    printf "sample\tchrom\tpos\tref\talt\taf\n"
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz
+    done > "$collapsed.tmp"
+    mv "$collapsed.tmp" "$collapsed"
+fi
+
+exit 0
+
+But we used printf to write header; that prints to stdout. That might be considered tool output? The instruction says "Do not write to stderr/stdout beyond what tools naturally emit". Using printf would produce output, which is not natural for the script. So we must avoid printing anything. But collapsed.tsv needs a header line. We can create file with cat <<EOF >... but that also prints to stdout? Actually cat <<EOF writes to stdout; but redirecting to file will capture it. That still writes to stdout? The content is written to file via redirection, not printed to terminal. So it's fine.
+
+But we used printf which writes to stdout and then redirected? We didn't redirect; we just printed header line to stdout, which would be seen by user. That's disallowed. Instead we should write header into the file directly using a heredoc with output redirection.
+
+We can do:
+
+cat > "$collapsed.tmp" <<'EOF'
+sample	chrom	pos	ref	alt	af
+EOF
+
+But that writes header and then we append other lines. We need to combine header and data. Approach: create tmp file, write header via cat, then append bcftools outputs.
+
+Simpler: use a loop to collect all sample queries into an array or temp file, then prepend header.
+
+We can do:
+
+tmpfile=$(mktemp)
+for sample in "${SAMPLES[@]}"; do
+    bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> "$tmpfile"
+done
+
+Then move header+content to collapsed.tsv:
+
+cat > "$collapsed.tmp" <<'EOF'
+sample	chrom	pos	ref	alt	af
+EOF
+cat "$tmpfile" >> "$collapsed.tmp"
+mv "$collapsed.tmp" "$collapsed"
+
+rm "$tmpfile"
+
+But we need to ensure no output to stdout. The cat with heredoc writes header to file via redirection; that's fine.
+
+Also we used `printf` earlier for header; remove that.
+
+Also we used `is_newer` function incorrectly: It returns 1 if any input newer than out, else 0. But we call it as `[ ! -f "$bai" ] || is_newer "$bai" ...`. Wait logic: If bai missing or any input newer -> need to run. So we want condition true when either missing or older. Our function returns 1 if any input newer; but in test, `is_newer` will exit with status 0 if out newer than all inputs (i.e., no input newer). We want to run if any input newer: so `[ ! -f "$bai" ] || is_newer "$bai" ...`. But since function returns 1 when older? Let's design:
+
+is_outdated() { local out=$1; shift; for in in "$@"; do [ "$in" -nt "$out" ] && return 0; done; return 1; }
+
+Then we can use: if [ ! -f "$bai" ] || is_outdated "$bai" data/raw/... ; then run.
+
+Let's implement that.
+
+Also need to ensure `bgzip` command exists. Use `bgzip`. If not, fallback to bcftools view -O z? But plan says bgzip; we assume present.
+
+Also use `samtools index -@ $THREADS "$bam"` will produce .bai file.
+
+Now idempotency: For each sample, if bam and bai exist and are newer than raw fastqs, skip. If vcf.gz exists and is newer than bam, skip. Good.
+
+But we also need to ensure that if bam exists but not bai, we still index. We check `[ ! -f "$bai" ] || is_outdated "$bai" "$bam"`; good.
+
+Similarly for vcf: we check `if [ ! -f "$tbi" ] || is_outdated "$tbi" "$bam"; then ...`. But if tbi missing but vcf.gz exists? We skip? Actually we need to ensure that .vcf.gz and .tbi exist. Our condition uses tbi; if tbi missing, run call-parallel again (which will overwrite). That's fine.
+
+But what about case where vcf.gz exists but tbi missing? Then tbi missing triggers re-run. Good.
+
+Now for collapse.tsv: we check if any vcf_gz newer than collapsed.tsv; if so rebuild.
+
+Edge: If collapsed.tsv missing, needs_collapse true.
+
+We used `tmpfile=$(mktemp)`; need to ensure cleanup on exit? We'll just rm after moving.
+
+Also we must not use echo. We used cat <<'EOF', which writes header to file via redirection; no output to stdout. Good.
+
+Now we need to ensure script uses only tools in inventory: we used `bgzip`, `samtools`, `bwa`, `lofreq`, `bcftools`, `tabix`. All are allowed. We also used `mktemp` which is a shell builtin? Actually mktemp is external but likely present; not listed but usually available. But maybe not in inventory. The instruction says "Use only tools listed in TOOL_INVENTORY". That might mean we cannot use other utilities like mktemp, cat? cat is standard. mktemp may be considered external. To avoid risk, we can create temporary file using a fixed name inside results/ or use `results/tmp_collapsed.tsv`. But that could conflict if script re-runs concurrently? Not an issue.
+
+Simpler: Use `tmpfile=results/collapsed.tmp.$$.txt` (using $$). Then after writing, mv to collapsed.tsv. That avoids mktemp.
+
+Also we used `cat > "$collapsed.tmp" <<'EOF'`. That's fine.
+
+Now ensure no stray prints.
+
+Let's rewrite collapse section:
+
+if $needs_collapse; then
+    tmpfile=results/collapsed.tmp.$$  # unique per process
+    cat > "$tmpfile" <<'EOF'
+sample	chrom	pos	ref	alt	af
+EOF
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> "$tmpfile"
+    done
+    mv "$tmpfile" "$collapsed"
+fi
+
+This writes header and data to tmpfile, then moves.
+
+Now we need to ensure that bcftools query outputs lines; if no variants, it will output nothing. That's fine.
+
+Also we used `is_outdated` function: implement correctly.
+
+Let's craft final script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p results
+
+REF=data/ref/chrM.fa
+if [ ! -f "${REF}.amb" ]; then
+    samtools faidx "$REF"
+    bwa index "$REF"
+fi
+
+is_outdated() {
+    local out=$1; shift
+    for in in "$@"; do
+        if [ "$in" -nt "$out" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+for sample in "${SAMPLES[@]}"; do
+    bam=results/${sample}.bam
+    bai=results/${sample}.bam.bai
+
+    if [ ! -f "$bai" ] || is_outdated "$bai" data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz; then
+        bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+            data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz |
+        samtools sort -@ $THREADS -o "$bam"
+    fi
+
+    if [ ! -f "$bai" ] || is_outdated "$bai" "$bam"; then
+        samtools index -@ $THREADS "$bam"
+    fi
+
+    vcf=results/${sample}.vcf.gz
+    tbi=results/${sample}.vcf.gz.tbi
+
+    if [ ! -f "$tbi" ] || is_outdated "$tbi" "$bam"; then
+        tmp_vcf=results/${sample}.vcf
+        lofreq call-parallel --pp-threads $THREADS -f "$REF" -o "$tmp_vcf" "$bam"
+        bgzip -c "$tmp_vcf" > "${tmp_vcf}.gz"
+        mv "${tmp_vcf}.gz" "$vcf"
+        tabix -p vcf "$vcf"
+        rm "$tmp_vcf"
+    fi
+done
+
+collapsed=results/collapsed.tsv
+needs_collapse=false
+for sample in "${SAMPLES[@]}"; do
+    vcf_gz=results/${sample}.vcf.gz
+    if [ ! -f "$collapsed" ] || is_outdated "$collapsed" "$vcf_gz"; then
+        needs_collapse=true
+        break
+    fi
+done
+
+if $needs_collapse; then
+    tmpfile=results/collapsed.tmp.$$
+    cat > "$tmpfile" <<'EOF'
+sample	chrom	pos	ref	alt	af
+EOF
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> "$tmpfile"
+    done
+    mv "$tmpfile" "$collapsed"
+fi
+
+exit 0
+
+Check for any stray prints: cat <<'EOF' writes header to file via redirection; no stdout. bcftools query outputs to tmpfile via >>, no stdout.
+
+All good.
+
+But we used `bgzip -c`. This may produce progress? bgzip prints nothing unless errors. Good.
+
+Now ensure that the script uses only tools in inventory: yes.
+
+We also used `cat` and `mv`, which are standard utilities; not listed but likely allowed as part of coreutils, which is fine.
+
+But instruction says "Use only tools listed in TOOL_INVENTORY." That might mean we cannot use cat? But cat is a standard tool. However to be safe, maybe we should avoid cat by using printf with redirection? But that would print to stdout. We can use `printf` and redirect: `printf 'sample\tchrom... \n' > "$tmpfile"`. That prints to stdout but redirected; still no output to terminal. That's fine.
+
+But cat is also fine.
+
+Now check for any missing variable expansions: we used $THREADS inside string; fine.
+
+Also note that the read group string uses backslash-t characters literally. We wrote `-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`. That will produce a literal backslash and t? Wait, in double quotes, `\\t` becomes `\t` (backslash + t). Good.
+
+Now we need to ensure that the script is idempotent. Suppose results/ already has all outputs; then for each sample:
+
+- bam exists; bai exists; check if bai missing or outdated: not; skip alignment.
+- For vcf: tbi exists and newer than bam? If yes, skip call-parallel.
+
+But we also need to ensure that if any input changed (e.g., raw fastq updated), the script will re-run. That's fine.
+
+Now final step: collapsed.tsv rebuild only if any vcf.gz newer than collapsed.tsv. Good.
+
+Edge: Suppose collapsed.tsv exists but some sample's vcf.gz is older; then no rebuild. Good.
+
+Now we need to ensure that `is_outdated` returns 0 when any input newer, else 1. Implementation uses `[ "$in" -nt "$out" ]`. That will return true if $in newer than out. So function returns 0 (true) if outdated. Good.
+
+But we used `if [ ! -f "$bai" ] || is_outdated "$bai" data/raw/...; then ...`. If bai missing, condition true. If bai exists but outdated, function returns 0 -> condition true. Good.
+
+Now for vcf: we check tbi existence and outdated relative to bam. But what if vcf.gz exists but tbi missing? Then tbi missing triggers re-run. Good.
+
+But what about case where vcf.gz exists but tbi exists but older than bam? That will trigger re-run; good.
+
+Now after call-parallel, we compress and index, then remove tmp_vcf. We don't check if bgzip succeeded before moving; but script will exit on error due to set -euo pipefail.
+
+Now final step: collapsed.tsv creation uses `tmpfile=results/collapsed.tmp.$$`. If script re-runs concurrently, $$ unique. Good.
+
+We also need to ensure that we remove tmpfile after mv; we don't need to rm because mv moves it.
+
+All good.
+
+Let's produce final script.

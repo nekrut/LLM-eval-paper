@@ -1,0 +1,296 @@
+Okay, let's tackle this problem step by step. The user wants a bash script that performs variant calling on four MiSeq amplicon samples mapped to the human mitochondrial reference. Let me go through each part of the plan and make sure I understand what needs to be done.
+
+First, the script must start with #!/usr/bin/env bash and set -euo pipefail. Then define THREADS=4 and list the samples. The results directory should be created if it doesn't exist. Each step needs to check for existing outputs to ensure idempotency.
+
+Next, reference indexing: samtools faidx and bwa index on chrM.fa. Need to check if those index files already exist before running these commands again.
+
+For each sample, alignment with bwa mem. The tricky part here is the read group line. The user specified that the -R argument must have literal \t between fields. So I need to make sure not to expand them into actual tabs. Using a string like "-R \"@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA\"" should work because the backslashes escape the t, so bwa will parse them correctly.
+
+Then pipe the SAM output to samtools sort. No markdup here since it's amplicon data and duplicates are expected. Then index the BAM with samtools index.
+
+Variant calling using lofreq call-parallel with --pp-threads 4. The output is a VCF, which needs to be compressed with bgzip (not bcftools view) and indexed with tabix. Remove the intermediate .vcf after compression.
+
+For collapsing the results into collapsed.tsv: use bcftools query for each sample's VCF, prepend the header line, then concatenate all samples' outputs. Need to check if any of the input VCFs are newer than the TSV before regenerating it.
+
+Idempotency checks everywhere. For example, when creating the reference indexes, only run if they don't exist. Same with BAM files and their indices. The collapsed.tsv should be regenerated only if any of its dependencies (the VCF.gz files) have changed.
+
+Wait, in step 8, the bcftools query command uses {sample} as a literal? Let me check the plan again. Oh right, the format string is '{sample}\t%CHROM\t...'. So the sample name is added via that placeholder. That's important because each line in the TSV should have the sample name first.
+
+Also, when building the collapsed.tsv, I need to loop through all samples and run bcftools query for each, then combine them with a header. The order of samples must be correct as per the list: M117-bl, M117-ch, M117C1-bl, M117C1-ch.
+
+Let me think about possible issues. For example, if the results directory already exists but is empty, the script should proceed normally. If some files are present but others aren't, it needs to handle partial states correctly. The idempotency checks must ensure that each step only runs when necessary.
+
+Another thing: using set -euo pipefail means any command failure will exit immediately. So I need to make sure all commands are properly guarded with existence checks where needed. For example, before running bwa index, check if the index files exist (like chrM.fa.bwt). If they do, skip that step.
+
+Testing for file existence can be done with [ -f filename ] or similar constructs. Also, checking timestamps: maybe using a function to compare the TSV against all VCFs and their indices. For example, collapsed.tsv should be newer than any of its dependencies (the vcf.gz files) before considering it up-to-date.
+
+Wait, in step 8's plan, it says "rebuild only if any input VCF is newer than the TSV". So for each sample's vcf.gz and tbi, check their mtime against collapsed.tsv. If any of them are newer, then regenerate the TSV.
+
+Putting all this together into a script structure:
+
+- Define variables (THREADS=4, samples list)
+- Create results directory if needed
+- Check for reference indexes; create if missing
+- For each sample in order:
+   - Check if BAM exists and is newer than inputs? Or just check existence of the final outputs. Since it's idempotent, maybe just check if all outputs (bam, bai, vcf.gz, tbi) exist. If any are missing or older than their dependencies, proceed with alignment etc.
+
+Wait, but for each step in a sample's processing:
+
+1. Check if BAM exists and is newer than the FASTQs? Or maybe just check existence of all outputs (bam, bai, vcf.gz, tbi). Because if any are missing, need to redo that sample's steps. But how to handle partial completion? For example, if BAM exists but VCF doesn't.
+
+Hmm, perhaps for each step in the per-sample processing:
+
+- Check if results/{sample}.bam and .bai exist. If not, run alignment (bwa mem -> sort)
+- Then check if vcf.gz and tbi exist. If not, run lofreq call-parallel, bgzip, tabix
+- Only after all steps for the sample are done, proceed to next step
+
+Alternatively, process each sample's entire pipeline only if any of its outputs are missing or outdated. But that might be more complex. The plan says "guard each artifact with an existence check (e.g. skip if results/{sample}.vcf.gz.tbi already exists and is newer than its inputs)". So for each output file, check if it's up to date.
+
+But maybe a simpler approach: For each sample, run the entire pipeline only if any of the outputs are missing or outdated compared to their dependencies. But how to track that?
+
+Alternatively, process each step in order and check at each stage whether the next steps can be skipped. For example:
+
+For alignment (step 3-5):
+
+Check if results/{sample}.bam exists and is newer than the FASTQs. If not, run bwa mem -> samtools sort. Then index it with samtools index.
+
+Then for variant calling (steps 6-7), check if vcf.gz and tbi exist and are up to date compared to BAM. If not, proceed.
+
+This way each step is only done when necessary. But implementing this requires checking timestamps between the input files and output files. That could get complicated with multiple dependencies.
+
+Alternatively, since all steps for a sample must be run in sequence, perhaps check if any of the final outputs (bam, bai, vcf.gz, tbi) are missing or older than their inputs. If so, redo everything from alignment onwards. But that might not be efficient but ensures correctness.
+
+But given the problem's requirement to be idempotent and avoid redoing work when possible, perhaps better to check each step individually.
+
+Alternatively, for simplicity, process each sample only if any of its outputs are missing or outdated compared to their inputs. Let me think: For a sample, if results/{sample}.bam doesn't exist, then run alignment. If it exists but the FASTQs have changed (unlikely here since they're static), but in this case, the data is fixed once provided. So maybe just check existence of all outputs for each step.
+
+Wait, perhaps the simplest way to handle idempotency is: For each sample's processing steps, only proceed if any of the required output files are missing or older than their inputs. But given that the input files (FASTQs) don't change during runtime, once the outputs exist, they can be considered up-to-date unless the script is modified.
+
+But according to the plan, "rerunning on a fully populated results/ must exit 0 without redoing work". So if all outputs are present and correct, the script should do nothing. Therefore, for each step in the workflow, check whether the output files exist and are newer than their inputs. If so, skip that step.
+
+But implementing this requires checking timestamps between input and output files. For example:
+
+For alignment (step 3-5):
+
+Check if results/{sample}.bam exists AND is newer than both FASTQ files. Also check if the BAM's index (.bai) exists. If any of these are missing or outdated, run the alignment steps again.
+
+But this could get complex with multiple dependencies. Maybe a better approach is to use a helper function that checks if an output file needs to be regenerated based on its input(s). For example:
+
+needs_run() {
+    local output="$1"
+    shift
+    for input in "$@"; do
+        if [ ! -f "$output" ] || [ "$input" -nt "$output" ]; then
+            return 0 # needs to run
+        fi
+    done
+    return 1 # no need to run
+}
+
+Then, before running a step, check with this function. But in bash, handling multiple inputs can be tricky. Alternatively, for each output file, compare against all its dependencies. For example:
+
+For the BAM file (step3-5):
+
+Dependencies are the two FASTQ files and the reference index files. So if either FASTQ is newer than the BAM, or any of the reference indexes are missing/newer, then run alignment again. But this might be overcomplicating.
+
+Alternatively, since all steps for a sample must be done in order, perhaps just check whether the final outputs (bam, bai, vcf.gz, tbi) exist and are up to date with their inputs. If any of them is missing or outdated, redo the entire pipeline for that sample. But this might not be efficient but ensures correctness.
+
+Wait, maybe the problem expects a simpler approach where each step checks if its output exists. For example:
+
+For reference indexing (step2):
+
+Check if chrM.fa.fai and bwa index files exist. If any is missing, run samtools faidx and bwa index.
+
+Then for alignment (steps3-5):
+
+Check if results/{sample}.bam exists. If not, proceed with bwa mem -> sort. Then check if the BAM's .bai exists; if not, run samtools index.
+
+For variant calling (steps6-7):
+
+Check if vcf.gz and tbi exist. If either is missing or older than the BAM, then redo lofreq call-parallel, bgzip, tabix.
+
+This way each step only runs when necessary, based on existence of outputs. But this might not account for changes in inputs (like FASTQs), but since those are static once provided, it's okay.
+
+Now, let's structure the script:
+
+Start with shebang and set -euo pipefail.
+
+THREADS=4
+samples=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p results
+
+# Reference indexing
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+bwa_index_files=(data/ref/chrM.fa.amb data/ref/chrM.fa.ann data/ref/chrM.fa.bwt data/ref/chrM.fa.pac data/ref/chrM.fa.sa)
+for file in "${bwa_index_files[@]}"; do
+    if [ ! -f "$file" ]; then
+        bwa index data/ref/chrM.fa
+        break
+    fi
+done
+
+Wait, but checking all the files might be tedious. Alternatively, check for one of them (like .amb) to see if any exist. If not, run bwa index.
+
+Alternatively:
+
+if [ ! -f data/ref/chrM.fa.bwt ]; then
+    bwa index data/ref/chrM.fa
+fi
+
+That's simpler. Because if the BWT file exists, others should too.
+
+Then for each sample in "${samples[@]}":
+
+for sample in "${samples[@]}"; do
+    # Check if BAM and BAI exist
+    bam_file="results/${sample}.bam"
+    bai_file="${bam_file}.bai"
+    vcf_gz="results/${sample}.vcf.gz"
+    tbi_vcf="${vcf_gz}.tbi"
+
+    # Alignment step: check if BAM exists and is newer than FASTQs?
+    fq1="data/raw/${sample}_1.fq.gz"
+    fq2="data/raw/${sample}_2.fq.gz"
+
+    need_align=0
+    if [ ! -f "$bam_file" ] || [ "$fq1" -nt "$bam_file" ] || [ "$fq2" -nt "$bam_file" ]; then
+        need_align=1
+    fi
+
+    if [ $need_align -eq 1 ]; then
+        # Run bwa mem and sort
+        bwa mem -t 4 -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa \
+            <(zcat "$fq1") <(zcat "$fq2") | samtools sort -@ 4 -o "$bam_file"
+        # Index BAM
+        samtools index -@ 4 "$bam_file"
+    fi
+
+    # Variant calling step: check if vcf.gz and tbi exist and are newer than BAM
+    need_vcf=0
+    if [ ! -f "$vcf_gz" ] || [ ! -f "$tbi_vcf" ]; then
+        need_vcf=1
+    elif [ "$bam_file" -nt "$vcf_gz" ]; then
+        need_vcf=1
+    fi
+
+    if [ $need_vcf -eq 1 ]; then
+        # Run lofreq call-parallel
+        tmp_vcf="results/${sample}.vcf"
+        lofq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o "$tmp_vcf" "$bam_file"
+        bgzip -c "$tmp_vcf" > "$vcf_gz"
+        tabix -p vcf "$vcf_gz"
+        rm -f "$tmp_vcf"
+    fi
+done
+
+Wait, but lofreq call-parallel's syntax? Let me check the plan again. The command is:
+
+lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam
+
+Yes. Then compress with bgzip and index with tabix.
+
+Then, after all samples are processed, create collapsed.tsv.
+
+collapsed_tsv="results/collapsed.tsv"
+need_collapse=0
+
+# Check if any vcf.gz is newer than the TSV or TSV doesn't exist
+if [ ! -f "$collapsed_tsv" ]; then
+    need_collapse=1
+else
+    for sample in "${samples[@]}"; do
+        vcf_gz="results/${sample}.vcf.gz"
+        if [ "$vcf_gz" -nt "$collapsed_tsv" ]; then
+            need_collapse=1
+            break
+        fi
+    done
+fi
+
+if [ $need_collapse -eq 1 ]; then
+    # Generate header and concatenate all samples' data
+    echo -e "sample\tchrom\tpos\tref\talt\taf" > "$collapsed_tsv"
+    for sample in "${samples[@]}"; do
+        bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' \
+            "results/${sample}.vcf.gz" >> "$collapsed_tsv"
+    done
+fi
+
+Wait, but the plan says to use {sample} as a literal in the format string. Let me check:
+
+The bcftools query command should be:
+
+bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' ... 
+
+Yes, so that's correct. The sample name is added via the placeholder in the format string.
+
+But wait, when using bcftools query with a VCF file, does it automatically know which sample to use? Because each VCF has one sample (since we're processing per-sample). So the {sample} in the format string refers to the sample name from the VCF header. Since each VCF is for a single sample, that should work.
+
+Testing this part: if the VCF contains only one sample, then %SAMPLE would be redundant? Or does bcftools handle it correctly? Well according to the plan's instruction, using {sample} in the format string will prepend the sample name per row. So that's correct.
+
+Now putting all together into a script. Let me make sure I didn't miss any steps.
+
+Wait, in the alignment step, when running bwa mem, we need to read from the FASTQ files. Since they're gzipped, using zcat is necessary. But in bash, process substitution with <(zcat ...) might not work if the shell doesn't support it (like dash), but since the shebang is bash and assuming that's okay.
+
+Alternatively, use pipes:
+
+bwa mem ... data/ref/chrM.fa \
+    <(zcat "$fq1") <(zcat "$fq2") | samtools sort ... 
+
+Yes. But in some cases, process substitution might not be available, but given the problem states to use bash and assuming it's okay.
+
+Another thing: when using bcftools query with a VCF.gz file, does it automatically decompress? Yes, because tabix is already done on the vcf.gz, so bcftools can read it directly.
+
+Now checking for idempotency in each step:
+
+- Reference indexes are only created once.
+- For alignment steps, if BAM exists and is newer than FASTQs (but since FASTQs don't change), just check existence of BAM and BAI. Wait no, the script above checks if either FASTQ is newer than the BAM. But since the FASTQs are static, once BAM exists, it's okay. So maybe the need_align can be simplified to checking if BAM exists.
+
+Wait in the current code for alignment:
+
+need_align=0
+if [ ! -f "$bam_file" ] || [ "$fq1" -nt "$bam_file" ] || [ "$fq2" -nt "$bam_file" ]; then
+    need_align=1
+fi
+
+But since the FASTQs are in data/raw/ and presumably not modified, once BAM exists, it's okay. So maybe just checking existence of BAM is sufficient for alignment step? Because if BAM exists but BAI doesn't, that would be handled by the next steps (like when checking need_vcf). Wait no:
+
+Wait after alignment, we also run samtools index to create the .bai. So in the code above, after running bwa mem and sort, it runs samtools index. But if BAM exists but BAI doesn't, then need_align would be 0 (since BAM exists), so the script wouldn't re-run alignment. That's a problem.
+
+Ah right! Because the .bai is part of the outputs for that step. So in the code above, after checking whether to run alignment, it also needs to check if the BAI exists and is up to date with the BAM. But how?
+
+Hmm, perhaps I need to adjust the logic here. Let me think again:
+
+The alignment steps produce both the BAM and its index (bai). So for the alignment step, we should check whether either the BAM or BAI are missing or outdated compared to their dependencies (FASTQs and reference indexes). But this complicates things.
+
+Alternatively, after running bwa mem and sort, the script also runs samtools index. Therefore, if the BAM exists but the BAI doesn't, then need_align would still be 0 (since BAM exists), leading to skipping alignment again. That's a bug.
+
+So perhaps the check for alignment should consider both BAM and BAI existence. Let me adjust:
+
+need_align=0
+if [ ! -f "$bam_file" ] || [ ! -f "$bai_file" ]; then
+    need_align=1
+fi
+
+But that's not considering timestamps. Alternatively, if either file is missing or older than the FASTQs. But since the FASTQs are static, once BAM and BAI exist, no need to redo alignment. So checking existence of both files would suffice for idempotency here.
+
+So in code:
+
+need_align=0
+if [ ! -f "$bam_file" ] || [ ! -f "$bai_file" ]; then
+    need_align=1
+fi
+
+Then proceed with alignment steps only if needed. That way, even if BAM exists but BAI is missing, it will run the entire pipeline again (including creating the index). But that's not efficient. Wait no: because in the code above, after running bwa mem and sort, then samtools index is called. So if BAM exists but BAI doesn't, need_align would be 1, so alignment steps are rerun. Which creates both files.
+
+Yes, this way it works correctly. Because if either file is missing, we redo the entire step (alignment + indexing).
+
+Similarly for variant calling: check existence of vcf.gz and tbi. If any is missing or outdated compared to BAM, then run lofreq steps again.
+
+So adjusting the code accordingly.
+
+Now putting all together into a script with these corrections.

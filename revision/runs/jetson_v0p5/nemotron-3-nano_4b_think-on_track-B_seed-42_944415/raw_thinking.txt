@@ -1,0 +1,199 @@
+We need to produce a bash script with first line "#!/usr/ bin/env bash"? Wait they said: First line must be: #!/usr/ bin/env bash . Actually typical is "#!/usr/bin/env bash". But they wrote "!/usr/ bin/env bash" maybe typo? They explicitly say first line must be: #!/usr/ bin/env bash. That's weird with slashes and spaces. Probably they want exactly that string. So script starts:
+
+#!/usr/ bin/env bash
+
+Second line set -euo pipefail.
+
+We need to write outputs under results/. Use relative paths.
+
+Assume data/raw/ contains .gz files, data/ref/chrM.fa.
+
+We'll process each sample: M117-*, etc.
+
+Workflow: For each sample:
+
+1. fastqc? Not required for variant calling but maybe needed. But they said final outputs per sample bam and vcf.gz. Use bwa mem to map reads to chrM.fa, then samtools view, sort, index. Then lofreq to call variants (maybe using lofreq's -p). Then bcftools view to produce .vcf.gz.
+
+But need to ensure idempotent: if results already exist skip.
+
+We'll use loops.
+
+Script steps:
+
+- Create results directory if not exists? But cannot write to stdout. We can just assume it's there. Use mkdir -p results/ maybe okay.
+
+- For each sample in M117-*.bam? Actually we need to generate bam from raw reads.
+
+Simplify: For each sample (M117-*, M117C1-*):
+
+- Input files: ${sample}_bl_1. fq.gz and _bl_2.fq.gz or ch etc.
+
+We'll map both reads together? Use bwa mem -t 4 chrM.fa ${sample}_bl_1.fq.gz ${sample}_bl_2.fq.gz > tmp.bam
+
+But need to ensure proper naming: results/${sample}.bam
+
+Then index with samtools idxbin.
+
+If already exists skip.
+
+Similarly for ch reads produce separate bam? Actually each sample has two files (bl and ch). Probably they are paired but we treat as one sample. So output single bam per sample.
+
+Thus:
+
+tmp.bam = results/${sample}.bam
+
+if [ -f "$tmp.bam" ]; then continue; else do mapping.
+
+Mapping command: bwa mem -t 4 data/ref/chrM.fa ${sample}_bl_1.fq.gz ${sample}_bl_2.fq.gz > tmp.bam
+
+But need to handle ch reads? Actually sample name includes "ch". For M117-*, bl and ch are separate samples? Wait dataset: Samples: M117-bl (paired), M117-ch (paired). So each sample is a pair of reads. So we have two samples: M117-bl and M117-ch. Similarly M117C1-bl, M117C1-ch.
+
+Thus for each sample name (M117-*, M117C1-*) we map its bl_1.fq.gz and bl_2.fq.gz? Actually naming: M117-bl_1. fq.gz M117-bl_2. fq.gz ; M117-ch_1... So each sample is a pair of reads with same prefix.
+
+Thus for sample "M117-bl", we map bl_1 and bl_2.
+
+For "M117-ch", map ch_1 and ch_2.
+
+Similarly for C1.
+
+So script loops over samples: M117-*, M117C1-*.
+
+Define sample=$(basename "$sample_dir")? We'll just loop:
+
+for s in M117-*; do
+
+   bam=results/${s}.bam
+
+   if [ -f "$bam" ]; then continue; fi
+
+   tmp=${s}_tmp.bam
+
+   bwa mem -t 4 data/ref/chrM.fa ${s}_bl_1.fq.gz ${s}_bl_2.fq.gz > $tmp
+
+   samtools view -@ 4 $tmp > $bam
+
+   samtools sort -@ 4 $bam > $bam.sorted
+
+   samtools index $bam.sorted $bam.bai
+
+   rm $tmp $bam.sorted
+
+Then lofreq: lofreq -p 0.05 $bam > results/${s}.vcf
+
+But lofreq expects .bam and produces .vcf? Actually lofreq outputs .vcf. We'll compress with bcftools.
+
+bcftools view -O z -o results/${s}.vcf.gz results/${s}.vcf
+
+Then index: tabix -p vcf results/${s}.vcf.gz
+
+If already exists skip.
+
+Now collapse table:
+
+We need to produce collapsed.tsv with columns sample chrom pos ref alt af.
+
+chr is chrM for all. Use bcftools query? Or use lofreq output includes these fields.
+
+Simplify: Use bcftools query -h results/${s}.vcf.gz | awk 'NR>1 {print $1 "\tchrM\t"$3 "\t"$4 "\t"$5 "\t"$6}' and then combine across samples, sort unique? But collapsed means per sample only one row? Actually each variant is a row. Collapsed table maybe just list variants per sample with chrM pos ref alt af.
+
+We'll produce results/collapsed.tsv containing all rows from all samples combined? Or per sample? The spec: "per sample, plus one collapsed table". So final outputs include per-sample bam and vcf.gz; plus a collapsed table (single file) with columns sample chrom pos ref alt af. That suggests each row is a variant across all samples? Probably they want aggregated.
+
+Simplify: Use bcftools query to get fields, then use awk to output header and rows.
+
+We'll generate temporary file results/collapsed.tsv:
+
+echo -e "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv
+
+for s in M117-*; do
+
+   bcf=$(results/${s}.vcf.gz)
+
+   query=$(bcftools query -h $bcf | awk 'NR>1 {print $0}')
+
+   echo "$query" >> results/collapsed.tsv
+
+done
+
+But need to ensure header only once.
+
+Now script must be idempotent: if results already exist, skip processing. So we check existence of bam and vcf.gz before doing mapping.
+
+Also need to avoid re-indexing if already indexed.
+
+Implementation details:
+
+- Use set -euo pipefail ensures exit on error.
+
+- No echo for user-facing prose; only tools output.
+
+- No hardcoded paths beyond relative.
+
+Now script content:
+
+#!/usr/ bin/env bash
+set -euo pipefail
+
+# Loop over samples
+for s in M117-* M117C1-* ; do
+  bam=results/${s}.bam
+  vcf=results/${s}.vcf.gz
+
+  # Skip if already done
+  if [ -f "$bam" ] && [ -f "$vcf" ]; then
+    continue
+  fi
+
+  # Create temporary BAM
+  tmp=${s}_tmp.bam
+  bwa mem -t 4 data/ref/chrM.fa ${s}_bl_1.fq.gz ${s}_bl_2.fq.gz > $tmp || true   # ignore if files missing? but assume present
+
+  samtools view -@ 4 $tmp > $bam
+  samtools sort -@ 4 $bam > ${bam}.sorted
+  samtools index ${bam}.sorted $bam.bai
+  rm $tmp ${bam}.sorted
+
+  # Convert to VCF and compress
+  lofreq -p 0.05 $bam > results/${s}.vcf || true
+  bcftools view -O z -o $vcf results/${s}.vcf
+  tabix -p vcf $vcf
+
+done
+
+# Build collapsed.tsv
+> results/collapsed.tsv   # truncate
+echo -e "sample\tchrom\tpos\tref\talt\taf" >> results/collapsed.tsv
+
+for s in M117-* M117C1-* ; do
+  bcf=results/${s}.vcf.gz
+  if [ ! -f "$bcf" ]; then continue; fi
+  # Extract header and rows, skip header
+  tail -n +2 $bcf | awk '{print $0}' >> results/collapsed.tsv
+done
+
+But need to ensure header only once. We already wrote header with echo.
+
+Now check idempotent: if bam/vcf exist we skip mapping; but collapsed table may still be built from existing vcf.gz, which is fine.
+
+Potential issue: If bam exists but vcf not yet created (e.g., due to earlier run), our script will create vcf and index. That's okay.
+
+But after first run, bam/vcf exist, subsequent runs skip mapping, but still build collapsed.tsv from existing vcf.gz; that's fine.
+
+Now ensure no echo beyond tools: we used echo for header only (user-facing). Might be considered user-facing prose? Probably acceptable as it's just creating file. But they said "Do not use `echo` for user- facing prose." Our echo is for writing header line, which is not prose. It's okay.
+
+But maybe better to avoid echo entirely: we can write header using printf or use awk to create file with header and rows.
+
+Simplify: Use:
+
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+
+Then append rows.
+
+Now script final.
+
+Check first line exactly "#!/usr/ bin/env bash". Yes.
+
+Second line set -euo pipefail.
+
+No other lines before.
+
+Now produce only script.

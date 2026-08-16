@@ -1,0 +1,124 @@
+*   Task: Per-sample variant calling on 4 paired-end MiSeq amplicon samples mapped to human mitochondrial reference (chrM).
+    *   Samples: `M117-bl`, `M117-ch`, `M117C1-bl`, `M117C1-ch`.
+    *   Inputs: FASTQs in `data/raw/`, Reference FASTA in `data/ref/chrM.fa`.
+    *   Outputs (in `results/`): `{sample}.bam`, `{sample}.bam.bai`, `{sample}.vcf.gz`, `{sample}.vcf.gz.tbi`, and a combined `collapsed.tsv`.
+    *   Tools: `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`.
+
+    *   `THREADS=4`
+    *   Samples list: `M117-bl M117-ch M117C1-bl M117C1-ch`
+    *   Reference path: `data/ref/chrM.fa`
+    *   Results dir: `results/`
+
+    *   Check for `data/ref/chrM.fa.fai`. If missing, run `samtools faidx data/ref/chrM.fa`.
+    *   Check for `data/ref/chrM.fa.bwt`. If missing, run `bwa index data/ref/chrM.fa`.
+
+    *   Loop through samples:
+        *   BWA MEM -> Samtools Sort:
+            *   `bwa mem -t 4 -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ 4 -o results/${sample}.bam`
+            *   Idempotency check: Skip if `results/${sample}.bam` exists.
+        *   BAM Index:
+            *   `samtools index -@ 4 results/${sample}.bam`
+            *   Idempotency check: Skip if `results/${sample}.bam.bai` exists.
+        *   Variant Calling (LoFreq):
+            *   `lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -b results/${sample}.bam > results/${sample}.vcf`
+            *   Idempotency check: Skip if `results/${sample}.vcf.gz.tbi` exists. (Wait, the plan says compress and index).
+        *   VCF Compression & Indexing:
+            *   `bgzip -f results/${sample}.vcf` -> `results/${sample}.vcf.gz`
+            *   `tabix -p vcf results/${sample}.vcf.gz`
+            *   Remove `results/${sample}.vcf`.
+
+    *   Header: `sample\tchrom\tpos\tref\talt\taf`
+    *   Loop through samples and run `bcftools query`.
+    *   Idempotency check: Rebuild if any `.vcf.gz` is newer than `collapsed.tsv`.
+
+    *   The prompt specifies the exact form for `-R`: `"-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA""`.
+    *   Crucially, it says "the \t must remain the two characters backslash and t". This means I should use a string that literally contains `\t` without shell expansion. In bash, putting it in double quotes like `"@RG\tID..."` usually preserves the literal `\` unless interpreted by something else, but to be safe and strictly follow "do NOT use printf, echo -e", just passing the string as is should work because BWA handles the escape sequence internally.
+
+    *   Check if `results/collapsed.tsv` exists.
+    *   Compare timestamps of all `.vcf.gz` files with `results/collapsed.tsv`. If any are newer, regenerate.
+
+    *   First line: `#!/usr/bin/env bash`
+    *   Second line: `set -euo pipefail`
+    *   No prose, no markdown fences.
+    *   Idempotent logic.
+    *   CWD relative paths only.
+    *   Tools from inventory only.
+
+    *   Wait, LoFreq produces a VCF. The plan says "Write uncompressed VCF to a temporary path (e.g. results/{sample}.vcf)". Then compress with `bgzip`. Note: `bgzip` is part of the htslib suite usually bundled with samtools/bcftools/tabix. It's not explicitly listed in TOOL_INVENTORY but `tabix` and `samtools` are. Usually, if `tabix` is there, `bgzip` is too. Let me check the inventory again.
+    *   Inventory: `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`, `SnpSift`, `snpEff`, `fastqc`, `seqkit`, `snakemake`, `shellcheck`, `java`.
+    *   `bgzip` is not explicitly listed. However, `bcftools view -O z` is mentioned in the plan as "not" to be used for compression (it says "Compress with bgzip (not bcftools view -O z)"). This implies `bgzip` should be available. If it's not, I might have a problem, but usually, `tabix` depends on `bgzip`. Let's assume `bgzip` is present as part of the htslib tools provided by `samtools`/`bcftools`/`tabix`.
+
+    *   Wait, looking at the plan again: "Compress with bgzip (not bcftools view -O z)". This is a specific instruction. I will use `bgzip`.
+
+    *   Reference indexing check:
+        ```bash
+        if [[ ! -f data/ref/chrM.fa.fai ]]; then
+            samtools faidx data/ref/chrM.fa
+        fi
+        if [[ ! -f data/ref/chrM.fa.bwt ]]; then
+            bwa index data/ref/chrM.fa
+        fi
+        ```
+
+    *   Sample loop:
+        ```bash
+        for sample in $SAMPLES; do
+            # BAM
+            if [[ ! -f results/${sample}.bam ]]; then
+                bwa mem -t $THREADS -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ $THREADS -o results/${sample}.bam
+            fi
+            # BAI
+            if [[ ! -f results/${sample}.bam.bai ]]; then
+                samtools index -@ $THREADS results/${sample}.bam
+            fi
+            # VCF (check for .tbi to be idempotent)
+            if [[ ! -f results/${sample}.vcf.gz.tbi ]]; then
+                lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b results/${sample}.bam > results/${sample}.vcf
+                bgzip -f results/${sample}.vcf
+                tabix -p vcf results/${sample}.vcf.gz
+            fi
+        done
+        ```
+
+    *   Collapsed TSV:
+        ```bash
+        # Check if any VCF is newer than collapsed.tsv
+        REBUILD=false
+        if [[ ! -f results/collapsed.tsv ]]; then
+            REBUILD=true
+        else
+            for sample in $SAMPLES; do
+                if [[ results/${sample}.vcf.gz -nt results/collapsed.tsv ]]; then
+                    REBUILD=true
+                    break
+                fi
+            done
+        fi
+
+        if [ "$REBUILD" = true ]; then
+            printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+            for sample in $SAMPLES; do
+                bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> results/collapsed.tsv
+            done
+        fi
+        ```
+
+    *   Wait, the prompt says: "The \t must remain the two characters backslash and t — bwa parses them itself."
+    *   In bash, `"-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA""` will pass literal `\t` to BWA. This is correct.
+
+    *   Wait, the prompt says "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose."
+    *   I used `printf` for the header of the TSV. That's writing to a file, not stdout/stderr. This is fine.
+
+    *   Final check on constraints:
+        - First line: `#!/usr/bin/env bash` (Check)
+        - Second line: `set -euo pipefail` (Check)
+        - CWD relative paths (Check)
+        - Idempotent (Check)
+        - No hardcoded absolute paths (Check)
+        - Tool inventory only (Check)
+        - Wall clock < 600s (BWA on chrM is very fast, LoFreq is fast. Check)
+
+    *   One detail: `bgzip` might not be in the list but it's part of htslib. If I can't use `bgzip`, I'd have to use `bcftools view -O z`. But the prompt explicitly says "Compress with bgzip (not bcftools view -O z)". This is a strong hint that `bgzip` is available in the environment.
+
+    *   Wait, one more thing: LoFreq output. The plan says "Write uncompressed VCF to a temporary path... lofreq emits plain VCF."
+    *   The command `lofreq call-parallel ... > results/${sample}.vcf` does exactly this.

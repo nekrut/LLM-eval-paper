@@ -1,0 +1,339 @@
+The user wants a single bash script that performs per-sample variant calling on 4 paired-end MiSeq amplicon samples mapped to the human mitochondrial reference (chrM).
+The script must follow the provided plan exactly.
+Let's break down the requirements:
+- First line: `#!/usr/bin/env bash`
+- Second line: `set -euo pipefail`
+- Constants: `THREADS=4`, `SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")`
+- Create output dir: `mkdir -p results`
+- Reference indexing with bwa and samtools, with idempotency guards.
+- Per-sample alignment + sort with bwa mem and samtools sort, with RG string using literal `\t`.
+- BAM index with samtools index.
+- Variant calling with lofreq call-parallel.
+- VCF compression + tabix index with bgzip and tabix.
+- Collapsed TSV generation (unconditional).
+- All outputs under `results/`.
+- No absolute paths outside cwd.
+- Only use tools in TOOL_INVENTORY.
+- Idempotent for steps 1-6, step 7 always runs.
+- Output ONLY the script.
+
+Let's draft the script carefully following the plan.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Step 1: Reference indexing — BWA
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+
+# Step 2: Reference indexing — samtools faidx
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+for sample in "${SAMPLES[@]}"; do
+    # Step 3: Per-sample alignment + sort
+    [[ -f results/${sample}.bam ]] || {
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+        samtools sort -@ ${THREADS} -o results/${sample}.bam -
+    }
+
+    # Step 4: BAM index
+    [[ -f results/${sample}.bam.bai ]] || samtools index -@ ${THREADS} results/${sample}.bam
+
+    # Step 5: Variant calling — LoFreq
+    [[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] || \
+        lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+
+    # Step 6: VCF compression + tabix index
+    [[ -f results/${sample}.vcf.gz.tbi ]] || {
+        bgzip -f results/${sample}.vcf
+        tabix -p vcf results/${sample}.vcf.gz
+    }
+done
+
+# Step 7: Collapsed TSV (rebuild every run)
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+
+for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | \
+        awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+```
+
+Check constraints:
+- First line shebang? Yes.
+- Second line set -euo pipefail? Yes.
+- Constants THREADS=4 and SAMPLES array? Yes.
+- mkdir -p results? Yes.
+- Reference indexing guards? Yes.
+- Alignment pipeline with literal `\t` in double quotes? Yes. `bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz`
+- samtools sort with `-@ ${THREADS}` and trailing `-`? Yes.
+- BAM index guard? Yes.
+- LoFreq call-parallel with `--pp-threads ${THREADS}`? Yes.
+- bgzip + tabix guard? Yes.
+- Collapsed TSV unconditional? Yes.
+- bcftools query format string uses `%INFO/AF`? Yes.
+- awk OFS="\t"? Yes.
+- No absolute paths? Yes.
+- Idempotent? Yes, steps 1-6 guarded, step 7 always runs but is cheap.
+- Output only script? Yes.
+
+One minor point: `bwa mem -t ${THREADS}` vs `-t 4`. The plan says `-t 4`, but using `${THREADS}` is fine. I'll stick to `${THREADS}` or just `4` as in the plan. The plan says `THREADS=4`, so I'll use `${THREADS}`.
+Wait, the plan says: `bwa mem -t 4 -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/{sample}_1.fq.gz data/raw/{sample}_2.fq.gz | samtools sort -@ 4 -o results/{sample}.bam -`
+I will use `${THREADS}` for consistency.
+
+Check RG string: `bwa` expands `\t` itself when passed in double quotes? Actually, `bwa mem` expects the `-R` argument to contain literal backslash-t if you want tabs in the SAM header, or it might interpret them. The plan explicitly says: "Use the **literal two characters** `\t` (backslash + t) inside the double-quoted string. Do NOT use `printf`, `echo -e`, `$'\t'`, or a real tab. `bwa` expands `\t` itself; a real tab corrupts the SAM header."
+So `"-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA""` is correct.
+
+Check lofreq command: `lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam`
+Matches plan.
+
+Check bcftools query: `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`
+Matches plan.
+
+Check awk: `awk -v s={sample} 'BEGIN{OFS="\t"}{print s,$0}'`
+Matches plan.
+
+One detail: `[[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] || lofreq ...`
+This is correct per plan.
+
+Another detail: `bgzip -f results/${sample}.vcf` deletes the .vcf and creates .vcf.gz. The guard checks for `.tbi`. This matches plan.
+
+Check idempotency: "rerunning on a populated results/ directory must exit 0 without redoing work or erroring."
+The guards ensure steps 1-6 skip if files exist. Step 7 overwrites `collapsed.tsv` but that's fine. It will exit 0.
+
+Check constraints: "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." -> I won't use echo.
+"Total wall-clock must be under 600 seconds at THREADS=4." -> chrM is tiny (16kb), so it will be very fast.
+"Do not hardcode any path outside the current working directory." -> All paths are relative.
+
+One thing: `bwa index` might complain if `.amb` etc. already exist? The guard `[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa` prevents running it again, so it's fine.
+Same for `samtools faidx`.
+
+Let's verify the exact syntax for the RG string in bash:
+`bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz`
+In bash, double quotes allow variable expansion but preserve backslashes before `$`, `` ` ``, `\`, and `"`. So `\t` remains literal `\t`. This matches the requirement.
+
+Wait, `bwa mem` documentation says: `-R @RG\tID:...` expects literal backslash-t. Yes.
+
+One minor point: `samtools sort -@ ${THREADS} -o results/${sample}.bam -`
+The plan says `samtools sort -@ 4 -o results/{sample}.bam -`. I'll use `${THREADS}`.
+
+Let's assemble the script carefully.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Step 1: Reference indexing — BWA
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+
+# Step 2: Reference indexing — samtools faidx
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+for sample in "${SAMPLES[@]}"; do
+    # Step 3: Per-sample alignment + sort
+    [[ -f results/${sample}.bam ]] || {
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+        samtools sort -@ ${THREADS} -o results/${sample}.bam -
+    }
+
+    # Step 4: BAM index
+    [[ -f results/${sample}.bam.bai ]] || samtools index -@ ${THREADS} results/${sample}.bam
+
+    # Step 5: Variant calling — LoFreq
+    [[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] || \
+        lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+
+    # Step 6: VCF compression + tabix index
+    [[ -f results/${sample}.vcf.gz.tbi ]] || {
+        bgzip -f results/${sample}.vcf
+        tabix -p vcf results/${sample}.vcf.gz
+    }
+done
+
+# Step 7: Collapsed TSV (rebuild every run)
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+
+for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | \
+        awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+```
+
+Check constraints again:
+- "First line must be: #!/usr/bin/env bash" -> Yes.
+- "Second line must be: set -euo pipefail" -> Yes.
+- "Assume the current working directory contains data/raw/ ... and data/ref/ ..." -> Yes.
+- "Write all outputs under results/" -> Yes.
+- "Be idempotent..." -> Yes.
+- "Do not hardcode any path outside the current working directory." -> Yes.
+- "Use only tools listed in TOOL_INVENTORY." -> bwa, samtools, bcftools, tabix, lofreq, bgzip (part of htslib/tabix), awk (standard). All good.
+- "Total wall-clock must be under 600 seconds at THREADS=4." -> chrM is tiny, will finish in seconds.
+- "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." -> I used `printf` for the header as specified in the plan. That's fine.
+
+One detail: `bgzip` is part of htslib, usually installed with tabix/bcftools. The plan lists `tabix (htslib) 1.21`, and `bgzip` is standard alongside it. I'll assume it's available. The plan explicitly says `bgzip -f results/{sample}.vcf`.
+
+Wait, the plan says:
+```
+bgzip -f results/{sample}.vcf
+```
+and
+```
+tabix -p vcf results/{sample}.vcf.gz
+```
+I will keep them exactly as requested.
+
+Check `bcftools query` format string: `'%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`
+The plan says: `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz | awk -v s={sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv`
+Matches.
+
+One thing: `awk -v s=${sample}` might cause issues if sample names contain special characters, but they are alphanumeric with hyphens, so it's fine. The plan uses `{sample}` directly in the awk command without quotes around `${sample}`, which is standard for simple names. I'll stick to `${sample}`.
+
+Let's verify the `bwa mem` RG string again. The plan says:
+`bwa mem -t 4 -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/{sample}_1.fq.gz data/raw/{sample}_2.fq.gz | samtools sort -@ 4 -o results/{sample}.bam -`
+In bash, double quotes allow variable expansion. So `"-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA""` works. I'll write it exactly as:
+`bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ ${THREADS} -o results/${sample}.bam -`
+
+All good.
+
+One minor point: `samtools index -@ 4 results/{sample}.bam` in the plan uses `-@ 4`. I'll use `${THREADS}` for consistency, or just `4`. The plan says `-@ 4`, but I'll stick to `${THREADS}` as defined. It doesn't matter much.
+
+Check idempotency of step 7: "Do NOT guard this step — always overwrite, since per-sample VCFs may have changed." -> Handled.
+
+Check `printf` vs `echo`: The plan says `printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv`. I'll use that.
+
+Everything looks solid. I will produce the script exactly as drafted.
+One thing: `bgzip` might not be in PATH if only `tabix` is listed, but `bgzip` is standard with htslib. The plan explicitly uses `bgzip`, so it's fine.
+I will ensure no extra whitespace or comments that could violate constraints. The prompt says "Output ONLY the script — no prose, no markdown fences, no commentary before or after."
+
+Final check of the script text:
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+for sample in "${SAMPLES[@]}"; do
+    [[ -f results/${sample}.bam ]] || {
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+        samtools sort -@ ${THREADS} -o results/${sample}.bam -
+    }
+
+    [[ -f results/${sample}.bam.bai ]] || samtools index -@ ${THREADS} results/${sample}.bam
+
+    [[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] || \
+        lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+
+    [[ -f results/${sample}.vcf.gz.tbi ]] || {
+        bgzip -f results/${sample}.vcf
+        tabix -p vcf results/${sample}.vcf.gz
+    }
+done
+
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+
+for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | \
+        awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+```
+
+Looks perfect. Matches all constraints and plan exactly. I will output this.
+One detail: `bwa mem` might require `-R` to be a single argument. In bash, `"-R "@RG\tID:${sample}..."` works because the shell concatenates adjacent strings, but it's safer to pass it as one string: `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`. I'll keep it as one double-quoted string.
+The plan shows: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`
+I will use exactly that format.
+
+All set. Output matches request.
+Proceeds. 
+Self-Correction/Verification during thought:
+- `bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz` -> This is correct.
+- `samtools sort -@ ${THREADS} -o results/${sample}.bam -` -> Correct.
+- `lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam` -> Correct.
+- `bgzip -f results/${sample}.vcf` -> Correct.
+- `tabix -p vcf results/${sample}.vcf.gz` -> Correct.
+- `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv` -> Correct.
+- Idempotency guards are exactly as specified.
+- No extra outputs.
+- Ready. 
+Output matches the draft.✅
+Proceeds. 
+[Output Generation] -> *produces script*
+(Note: I will make sure there are absolutely no markdown fences or extra text, as requested.) 
+All constraints met. 
+Done. 
+`#!/usr/bin/env bash`
+`set -euo pipefail`
+... etc.
+Matches exactly. 
+Proceeds. 
+[Output Generation] (simulated)
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+for sample in "${SAMPLES[@]}"; do
+    [[ -f results/${sample}.bam ]] || {
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+        samtools sort -@ ${THREADS} -o results/${sample}.bam -
+    }
+
+    [[ -f results/${sample}.bam.bai ]] || samtools index -@ ${THREADS} results/${sample}.bam
+
+    [[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] || \
+        lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+
+    [[ -f results/${sample}.vcf.gz.tbi ]] || {
+        bgzip -f results/${sample}.vcf
+        tabix -p vcf results/${sample}.vcf.gz
+    }
+done
+
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+
+for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | \
+        awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+```
+Looks good. Output matches exactly. No extra text. Proceeds. 
+(Self-Correction/Refinement during thought: I should verify that `bgzip` is indeed available. The plan says `tabix (htslib) 1.21`, and `bgzip` is standard in htslib. It's fine. The prompt explicitly lists `bgzip` in step 6, so it's expected to be on PATH.)
+All good.
+Output matches request.✅
+Proceeds. 
+[Final Check of the Prompt]
+"First line must be: #!/usr/bin/env bash"
+"Second line must be: set -euo pipefail"
+"Assume the current working directory contains data/raw/ ... and data/ref/ ..."
+"Write all outputs under results/"
+"Be idempotent..."
+"Do not hardcode any path outside the current working directory."
+"Use only tools listed in TOOL_INVENTORY."
+"Total wall-clock must be under 600 seconds at THREADS=4."
+"Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose."
+All constraints satisfied.
+Output generation. 
+[Done] 
+*(Proceeds to output)*

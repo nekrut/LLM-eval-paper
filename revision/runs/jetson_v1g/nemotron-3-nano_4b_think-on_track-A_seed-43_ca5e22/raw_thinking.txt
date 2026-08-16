@@ -1,0 +1,183 @@
+We need to produce a self-contained bash script with first line "#!usr/... wait correct: "#!/usr/ bin/env bash"? The constraint says first line must be: #!/usr/ bin/env bash? Actually they wrote: "First line must be: #!/usr/ bin/env bash". That seems weird. Probably they meant "#!/usr/bin/env bash". But they explicitly say first line must be: #!/usr/ bin/env bash (with slash after usr?). Might be a typo but we follow exactly: "#!/usr/ bin/env bash". Let's output that.
+
+Second line set -euo pipefail
+
+Then script.
+
+We need to use only tools in inventory. Use samtools faidx, bwa index, samtools sort, samtools index, lofreq call-parallel, bgzip, tabix, bcftools query.
+
+Need idempotency: check existence and timestamps.
+
+We'll create results directory if missing.
+
+Define THREADS=4
+
+Sample list array.
+
+Reference indexing step: only run if not exists or older than .fa? Actually index files are .amb etc. We'll check if any of those exist; skip if all exist.
+
+But we need to ensure idempotent: if they exist, skip.
+
+Implementation:
+
+mkdir -p results
+
+for sample in M117-bl M117-ch M117C1-bl M117C1-ch; do
+
+# alignment
+bwa mem -t $THREADS data/raw/${sample}_1. fq.gz data/raw/${sample}_2.fq.gz > tmp_aln && rm tmp_aln? Actually we need to pipe into samtools sort.
+
+Better: bwa mem ... | samtools sort -@ $THREADS -o results/${sample}.bam
+
+But need read group string with literal backslash t. Use echo -e? But cannot use printf. We'll construct via variable:
+
+RG="-R \"@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA\""
+
+Then bwa mem ... $RG
+
+But need to ensure quoting.
+
+We can do:
+
+bwa mem -t $THREADS data/raw/${sample}_1. fq.gz data/raw/${sample}_2.fq.gz $RG | samtools sort -@ $THREADS -o results/${sample}.bam
+
+But bwa expects read group as last argument? Actually bwa mem takes reads and reference; read group is passed via -R flag, not as separate arg. So we can do:
+
+bwa mem -t $THREADS data/raw/${sample}_1. fq.gz data/raw/${sample}_2.fq.gz -R "$RG" | samtools sort ...
+
+But bwa mem's -R takes read group string; okay.
+
+Now sorting output to results/${sample}.bam
+
+Then index:
+
+samtools index -@ $THREADS results/${sample}.bam
+
+Check if .bai exists and newer than .bam? If exists, skip.
+
+Similarly for reference indexing: check if any of .amb .ann .bwt .pac .sa exist; if yes skip.
+
+Now lofreq call-parallel:
+
+lofreq call-parallel --pp-threads $THREADS --verbose \
+--ref data/ref/chrM.fa \
+--out results/${sample}.vcf \
+--sig \
+--bonf \
+results/${sample}.bam
+
+But need to ensure output .vcf not exist or older than bam.
+
+After that compress:
+
+bgzip -@ $THREADS results/${sample}.vcf > results/${sample}.vcf.gz && rm results/${sample}.vcf
+
+Then index:
+
+tabix -p vcf -@ $THREADS results/${sample}.vcf.gz
+
+Now collapse step: need to check if any input VCF.gz is newer than collapsed. If not, skip.
+
+We'll generate per-sample output using bcftools query format string with literal {sample} placeholder? Actually we can use:
+
+bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz
+
+But need to ensure sample name is attached per row. That's fine.
+
+Then concatenate all four outputs into collapsed.tsv with header.
+
+We'll create temporary file and append.
+
+Implementation:
+
+> tmp_collapsed; echo "sample\tchrom\tpos\tref\talt\taf" >> $tmp_collapsed
+
+for sample in ...; do
+   bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz >> $tmp_collapsed
+done
+
+mv $tmp_collapsed results/collapsed.tsv
+
+Now idempotency: if collapsed already exists and newer than any input VCF.gz, skip.
+
+We'll check timestamps.
+
+At end exit 0.
+
+Need to ensure no echo messages beyond tool output. So avoid echo for user messages.
+
+But we may need to create directory; mkdir -p is fine.
+
+Now produce script with proper quoting.
+
+Potential issues: using > tmp_aln and rm later? We used pipe directly, okay.
+
+Let's craft final script:
+
+#!/usr/ bin/env bash
+set -euo pipefail
+
+THREADS=4
+samples=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p results
+
+# Reference indexing (once)
+if [ ! -f data/ref/chrM.fa.amb ] || [ ! -f data/ref/chrM.ffa ] || [ ! -f data/ref/chrM.an ] || [ ! -f data/ref/chrM.bwt ] || [ ! -f data/ref/chrM.pac ] || [ ! -f data/ref/chrM.sa ]; then
+  bwa index -t $THREADS data/ref/chrM.fa
+fi
+
+# Per-sample processing
+for sample in "${samples[@]}"; do
+  # Alignment and sorting
+  RG="-R \"@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA\""
+  bwa mem -t $THREADS data/raw/${sample}_1. fq.gz data/raw/${sample}_2.fq.gz $RG | samtools sort -@ $THREADS -o results/${sample}.bam
+
+  # Index BAM
+  if [ ! -f results/${sample}.bam.bai ] || [ results/${sample}.bam.bai -nt results/${sample}.bam ]; then
+    samtools index -@ $THREADS results/${sample}.bam
+  fi
+
+  # Variant calling with lofreq call-parallel
+  if [ ! -f results/${sample}.vcf ] || [ results/${sample}.vcf -nt results/${sample}.bam ]; then
+    lofreq call-parallel --pp-threads $THREADS --verbose \
+      --ref data/ref/chrM.fa \
+      --out results/${sample}.vcf \
+      --sig \
+      --bonf \
+      results/${sample}.bam
+  fi
+
+  # Compress VCF and index
+  if [ ! -f results/${sample}.vcf.gz ] || [ results/${sample}.vcf.gz -nt results/${sample}.vcf ]; then
+    bgzip -@ $THREADS results/${sample}.vcf > results/${sample}.vcf.gz && rm results/${sample}.vcf
+  fi
+
+  if [ ! -f results/${sample}.vcf.gz.tbi ] || [ results/${sample}.vcf.gz.tbi -nt results/${sample}.vcf.gz ]; then
+    tabix -p vcf -@ $THREADS results/${sample}.vcf.gz
+  fi
+done
+
+# Collapse step
+tmp_collapsed=$(mktemp)
+echo "sample\tchrom\tpos\tref\talt\taf" > "$tmp_collapsed"
+for sample in "${samples[@]}"; do
+  if [ -f results/${sample}.vcf.gz ]; then
+    bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz >> "$tmp_collapsed"
+  fi
+done
+mv "$tmp_collapsed" results/collapsed.tsv
+
+exit 0
+
+But need to ensure idempotency: if any output exists and newer than inputs, skip. Already done.
+
+Potential issue: using > results/${sample}.vcf.gz > results/${sample}.vcf.gz? Actually bgzip -@ $THREADS results/${sample}.vcf > results/${sample}.vcf.gz && rm results/${sample}.vcf
+
+That's fine.
+
+Now script first line must be exactly "#!/usr/ bin/env bash". That is weird: there is a space after usr/. Should we output as given? Yes.
+
+Second line set -euo pipefail
+
+Let's produce final answer.

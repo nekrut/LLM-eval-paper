@@ -1,0 +1,132 @@
+The user wants a self-contained bash script that performs a specific bioinformatics workflow: per-sample variant calling on 4 paired-end MiSeq amplicon samples mapped to the human mitochondrial reference.
+
+Let me carefully follow the constraints and plan:
+
+1. First line: `#!/usr/bin/env bash`
+2. Second line: `set -euo pipefail`
+3. Constants: `THREADS=4` and `SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")`
+4. Create output dir: `mkdir -p results`
+5. Reference indexing with BWA (idempotent guard)
+6. Reference indexing with samtools faidx (idempotent guard)
+7. Per-sample alignment + sort (idempotent guard)
+8. BAM index (idempotent guard)
+9. Variant calling with LoFreq (idempotent guard)
+10. VCF compression + tabix index (idempotent guard)
+11. Collapsed TSV (always rebuild)
+
+Let me carefully construct the script following all the gotchas mentioned:
+
+- RG string: Use `\t` literally inside double quotes, colons not equals
+- LoFreq: BAM is positional, `--pp-threads`, `-f` for reference
+- bgzip in-place with `-f`
+- bcftools query format string with `%INFO/AF`
+- awk OFS="\t"
+
+Let me write this out carefully.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Step 1: Reference indexing — BWA
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+
+# Step 2: Reference indexing — samtools faidx
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+# Steps 3-6: Per-sample processing
+for sample in "${SAMPLES[@]}"; do
+    # Step 3: Alignment + sort
+    [[ -f "results/${sample}.bam" ]] || {
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" | samtools sort -@ ${THREADS} -o "results/${sample}.bam" -
+    }
+
+    # Step 4: BAM index
+    [[ -f "results/${sample}.bam.bai" ]] || samtools index -@ ${THREADS} "results/${sample}.bam"
+
+    # Step 5: Variant calling — LoFreq
+    [[ -f "results/${sample}.vcf" || -f "results/${sample}.vcf.gz" ]] || lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o "results/${sample}.vcf" "results/${sample}.bam"
+
+    # Step 6: VCF compression + tabix index
+    [[ -f "results/${sample}.vcf.gz.tbi" ]] || {
+        bgzip -f "results/${sample}.vcf"
+        tabix -p vcf "results/${sample}.vcf.gz"
+    }
+done
+
+# Step 7: Collapsed TSV (always rebuild)
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" | awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+```
+
+Wait, I need to check the bgzip command. The plan says `bgzip -f results/{sample}.vcf`. But bgzip is part of htslib/samtools. Let me check if bgzip is available. The tool inventory lists `tabix (htslib) 1.21` and `samtools 1.21`. bgzip should be available as it's part of htslib. Actually, looking at the plan more carefully, it just says `bgzip -f results/{sample}.vcf`. I'll use that.
+
+Actually, wait - the plan explicitly shows:
+```
+bgzip -f results/{sample}.vcf
+```
+So bgzip is expected to be on PATH. It comes with htslib/samtools typically.
+
+Let me also double-check the LoFreq command. The plan says:
+```
+lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam
+```
+
+And the guard checks for both `.vcf` and `.vcf.gz`:
+```
+[[ -f results/{sample}.vcf || -f results/{sample}.vcf.gz ]] || lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam
+```
+
+This looks correct.
+
+One thing to note: the plan says "Use the literal two characters `\t` (backslash + t) inside the double-quoted string." So in bash, when I write `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`, the shell will pass the literal `\t` to bwa, which will expand it. This is correct.
+
+Let me verify the bcftools query format string. The plan says:
+```
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz | awk -v s={sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+```
+
+This looks correct. The `\t` and `\n` are bcftools format codes inside single quotes.
+
+Wait, I should double-check one thing: when the VCF already exists as `.vcf.gz` (from a previous run), step 5's guard will skip LoFreq. Then step 6's guard will check for `.vcf.gz.tbi`. If it exists, it skips. This is correct for idempotency.
+
+But what if `.vcf.gz` exists but `.vcf.gz.tbi` doesn't? Step 6 would try to run `bgzip -f results/${sample}.vcf`, but `.vcf` was deleted by bgzip in the previous run. This could be a problem. However, the plan explicitly says to use this guard structure, so I'll follow it. In practice, if `.vcf.gz.tbi` exists, we're good. If only `.vcf.gz` exists without `.tbi`, that's an edge case the plan doesn't address, but I should follow the plan exactly.
+
+Actually, looking more carefully at step 6 guard:
+```
+[[ -f results/{sample}.vcf.gz.tbi ]] || { bgzip -f results/{sample}.vcf && tabix -p vcf results/{sample}.vcf.gz ; }
+```
+
+If `.vcf.gz.tbi` doesn't exist but `.vcf.gz` does, it would try to bgzip `.vcf` which doesn't exist. But the plan says this is the guard, so I'll follow it. The assumption is that a complete run produces all files together.
+
+Let me also make sure I'm not using any absolute paths or writing to stderr/stdout beyond what tools emit. The script looks clean.
+
+One minor thing: `bgzip` might not be explicitly listed in the tool inventory, but it's part of htslib which comes with samtools/tabix. The plan uses it, so it should be available. Alternatively, I could use `samtools bgzip`, but the plan says `bgzip -f`. I'll stick with `bgzip`.
+
+Actually, looking at the tool inventory again:
+- tabix (htslib) 1.21
+- samtools 1.21
+
+bgzip is typically installed alongside these. The plan explicitly uses `bgzip`, so it's fine.
+
+Let me finalize the script. I'll make sure all paths are relative, no absolute paths, proper quoting, and follows the exact plan.
+
+One thing: the plan says `THREADS=4` as a constant. I should use `${THREADS}` where appropriate, or just hardcode 4 since it's a constant. The plan shows `-t 4` and `-@ 4` and `--pp-threads 4`, so I'll use the variable for consistency.
+
+Actually, looking at the plan again:
+```
+bwa mem -t 4 -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/{sample}_1.fq.gz data/raw/{sample}_2.fq.gz | samtools sort -@ 4 -o results/{sample}.bam -
+```
+
+It uses literal `4` in the commands. I'll use `${THREADS}` for consistency with the constant definition, or just use `4`. Either is fine. I'll use `${THREADS}` to be clean.
+
+Wait, I need to be careful about the `-R` string. In bash, inside double quotes, `\t` is just two characters: backslash and t. The shell doesn't interpret it as a tab unless using `$'...'` or `echo -e`. So `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"` will pass the literal `\t` to bwa, which is what we want.
+
+Let me write the final script.

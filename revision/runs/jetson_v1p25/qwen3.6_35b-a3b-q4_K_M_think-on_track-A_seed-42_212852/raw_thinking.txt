@@ -1,0 +1,431 @@
+The user wants a single bash script that performs a specific bioinformatics workflow for mitochondrial variant calling on 4 paired-end samples.
+Let's break down the requirements:
+
+1. **Shebang and set options**: `#!/usr/bin/env bash` and `set -euo pipefail`.
+2. **Globals**: `THREADS=4`, sample list `M117-bl M117-ch M117C1-bl M117C1-ch`.
+3. **Directory setup**: Create `results/` if missing.
+4. **Reference indexing**: Check for `data/ref/chrM.fa.fai` and `data/ref/chrM.fa.amb` (or similar bwa index files). If missing, run `samtools faidx` and `bwa index`.
+5. **Per-sample alignment**: Loop over samples. Use `bwa mem -t 4` with specific `-R` format. Pipe to `samtools sort`. Check for existing BAM to skip if idempotent.
+6. **BAM indexing**: `samtools index`. Check for `.bai`.
+7. **Variant calling**: `lofreq call-parallel`. Check for existing VCF or VCF.gz to skip.
+8. **VCF compression/indexing**: `bgzip` and `tabix`. Check for `.vcf.gz.tbi`.
+9. **Collapse step**: Use `bcftools query` on each sample's `.vcf.gz`, concatenate, prepend header, write to `results/collapsed.tsv`. Check if TSV exists and is newer than inputs.
+10. **Idempotency**: All steps should check for output existence before running. The prompt says "Re-runs on a fully populated results/ must exit 0 without redoing work or erroring."
+
+Let's carefully construct the script following the exact commands specified.
+
+**Reference indexing:**
+```bash
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+if [ ! -f data/ref/chrM.fa.amb ]; then
+    bwa index data/ref/chrM.fa
+fi
+```
+
+**Per-sample loop:**
+Samples: `M117-bl M117-ch M117C1-bl M117C1-ch`
+For each sample:
+- BAM exists? `results/${sample}.bam`
+- If not, run alignment:
+  `bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ ${THREADS} -o results/${sample}.bam`
+- BAI exists? `results/${sample}.bam.bai`
+- If not, run: `samtools index -@ ${THREADS} results/${sample}.bam`
+- VCF exists? `results/${sample}.vcf.gz.tbi` (or `.vcf.gz`)
+- If not, run lofreq: `lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam`
+- VCF.gz exists? `results/${sample}.vcf.gz.tbi`
+- If not, run bgzip/tabix: `bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz && tabix -p vcf results/${sample}.vcf.gz && rm results/${sample}.vcf`
+
+Wait, the prompt says: "Treat every output step as idempotent: guard each artifact with an existence check... Re-runs on a fully populated results/ must exit 0 without redoing work or erroring."
+I will use `if [ ! -f results/${sample}.bam ]; then ... fi` etc.
+
+**Collapse step:**
+```bash
+COLLAPSED="results/collapsed.tsv"
+# Check if collapsed.tsv exists and is newer than all input vcf.gz files
+REBUILD_COLLAPSED=true
+for sample in ${SAMPLES}; do
+    if [ ! -f results/${sample}.vcf.gz.tbi ]; then
+        REBUILD_COLLAPSED=false # Should not happen if we run sequentially, but safe to check
+    fi
+done
+
+if [ "$REBUILD_COLLAPSED" = true ] && [ -f "$COLLAPSED" ]; then
+    # Check timestamps: if any vcf.gz is newer than collapsed.tsv, rebuild
+    for sample in ${SAMPLES}; do
+        if [ results/${sample}.vcf.gz.tbi -nt "$COLLAPSED" ]; then
+            REBUILD_COLLAPSED=true
+            break
+        fi
+    done
+    if [ "$REBUILD_COLLAPSED" = false ]; then
+        # All inputs older or equal, skip
+        :
+    else
+        printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"
+        for sample in ${SAMPLES}; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> "$COLLAPSED"
+        done
+    fi
+else
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"
+    for sample in ${SAMPLES}; do
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> "$COLLAPSED"
+    done
+fi
+```
+Actually, a simpler idempotency check for the collapsed file: just check if it exists. The prompt says "Rebuild only if any input VCF is newer than the TSV." I'll stick to that.
+
+Wait, `bcftools query` format string in the prompt: `'{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`. Note that `{sample}` here is a literal placeholder for the sample name in the prompt's description, but in bcftools query, `%SAMPLE` or just prepending it manually is needed. The prompt says: "the `{sample}` literal is prepended via the format string so the sample name is attached per row". This implies I should literally put the sample name in the format string, e.g., `"M117-bl\t%CHROM..."`. I will construct the format string dynamically or just hardcode it inside the loop.
+
+Let's refine the collapse step:
+```bash
+if [ ! -f results/collapsed.tsv ]; then
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+    for sample in ${SAMPLES}; do
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> results/collapsed.tsv
+    done
+else
+    REBUILD=false
+    for sample in ${SAMPLES}; do
+        if [ results/${sample}.vcf.gz.tbi -nt results/collapsed.tsv ]; then
+            REBUILD=true
+            break
+        fi
+    done
+    if [ "$REBUILD" = true ]; then
+        printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+        for sample in ${SAMPLES}; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> results/collapsed.tsv
+        done
+    fi
+fi
+```
+
+Wait, `bcftools query` format string: `%INFO/AF` might not be standard for lofreq output. Lofreq usually outputs `AD`, `DP`, `QUAL`, etc. But the prompt explicitly says to use `%INFO/AF`. I will follow the prompt exactly. Actually, lofreq vcf has `AF` in INFO or FORMAT? The prompt says `%INFO/AF`. I'll stick to it.
+
+Let's check the exact command for bcftools query from the prompt:
+`bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`
+I will replace `{sample}` with the actual sample name in the script.
+
+One detail: `bwa mem` read group format. The prompt says:
+`-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`
+"The `\t` must remain the two characters backslash and `t` — bwa parses them itself."
+So in bash, I should write it exactly as: `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"` inside double quotes. Bash will not interpret `\t` inside double quotes unless using `$'...'` or `echo -e`, but standard double quotes preserve backslashes literally except for `$`, `` ` ``, `\`, `"`, and `!`. So `"\t"` is fine.
+
+Let's assemble the script carefully.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"
+
+mkdir -p results
+
+# 2. Reference indexing
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+if [ ! -f data/ref/chrM.fa.amb ]; then
+    bwa index data/ref/chrM.fa
+fi
+
+# 3-7. Per-sample processing
+for sample in ${SAMPLES}; do
+    # Alignment & BAM
+    if [ ! -f results/${sample}.bam ]; then
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+            samtools sort -@ ${THREADS} -o results/${sample}.bam
+    fi
+
+    # BAM indexing
+    if [ ! -f results/${sample}.bam.bai ]; then
+        samtools index -@ ${THREADS} results/${sample}.bam
+    fi
+
+    # Variant calling
+    if [ ! -f results/${sample}.vcf.gz.tbi ]; then
+        lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+    fi
+
+    # VCF compression & indexing
+    if [ ! -f results/${sample}.vcf.gz.tbi ]; then
+        bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz
+        tabix -p vcf results/${sample}.vcf.gz
+        rm results/${sample}.vcf
+    fi
+done
+
+# 8. Collapse step
+COLLAPSED="results/collapsed.tsv"
+REBUILD_COLLAPSED=false
+
+if [ ! -f "$COLLAPSED" ]; then
+    REBUILD_COLLAPSED=true
+else
+    for sample in ${SAMPLES}; do
+        if [ results/${sample}.vcf.gz.tbi -nt "$COLLAPSED" ]; then
+            REBUILD_COLLAPSED=true
+            break
+        fi
+    done
+fi
+
+if [ "$REBUILD_COLLAPSED" = true ]; then
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"
+    for sample in ${SAMPLES}; do
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> "$COLLAPSED"
+    done
+fi
+```
+
+Wait, `bcftools query` format string: `%INFO/AF` might not work if AF is in FORMAT. But I must follow the prompt exactly. The prompt says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`. I will use exactly that, substituting `{sample}` with `${sample}`.
+
+One minor point: `lofreq call-parallel` might produce a `.vcf` file. The prompt says output is `results/{sample}.vcf`. Then we compress it. That's fine.
+
+Check idempotency: The script checks for existence of each artifact before running commands. If all exist, it skips everything and exits 0. The timestamp check for collapsed.tsv ensures it rebuilds if needed. This satisfies idempotency.
+
+Check constraints:
+- First line: `#!/usr/bin/env bash`
+- Second line: `set -euo pipefail`
+- Assumes `data/raw/` and `data/ref/` exist.
+- Outputs under `results/`.
+- Idempotent.
+- No hardcoded paths outside cwd.
+- Uses only listed tools.
+- Wall-clock < 600s at THREADS=4 (mtDNA is tiny, so it will be very fast).
+- No echo for user-facing prose.
+
+One thing: `bwa index` produces `.amb .ann .bwt .pac .sa`. Checking for `.amb` is sufficient.
+`samtools faidx` produces `.fai`.
+The prompt says "Skip both if the index files already exist." I'll check for both or just one representative per tool. Checking `chrM.fa.fai` and `chrM.fa.amb` is fine.
+
+Wait, `bcftools query` format string in the prompt uses single quotes around `{sample}\t...`. In bash, if I use double quotes for the whole string, `${sample}` will expand. That's correct.
+`bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz`
+This is correct.
+
+Let's verify `lofreq call-parallel` command from prompt:
+`lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam`
+I will use exactly that.
+
+One detail: `bgzip` is part of htslib, usually available as `bgzip`. The prompt lists `tabix (htslib)`, so `bgzip` should be on PATH. I'll use `bgzip`.
+
+Check `samtools sort` command: `samtools sort -@ 4 -o results/{sample}.bam`
+I used `${THREADS}` which is 4. That's fine.
+
+Check `bwa mem` read group: `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`
+The prompt says: "exact form: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`"
+I will keep it exactly as requested.
+
+One potential issue: `bcftools query` might complain if `%INFO/AF` doesn't exist in the VCF. But I must follow instructions. Sometimes lofreq puts AF in INFO. I'll stick to the prompt.
+
+Another point: The prompt says "Rebuild only if any input VCF is newer than the TSV." My timestamp check does exactly that.
+
+Let's double check the `bcftools query` format string syntax. In bcftools, `%INFO/AF` is valid. The prompt explicitly gives it.
+
+Wait, `lofreq call-parallel` might output to stdout if `-o` is not specified, but here `-o results/${sample}.vcf` is used. That's fine.
+
+One minor thing: `samtools sort` might create a `.bam.bai` directly if indexed? No, `samtools index` creates `.bai`. I'll keep them separate as requested.
+
+Let's assemble the final script carefully.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"
+
+mkdir -p results
+
+# 2. Reference indexing (once)
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+if [ ! -f data/ref/chrM.fa.amb ]; then
+    bwa index data/ref/chrM.fa
+fi
+
+# 3-7. Per-sample processing
+for sample in ${SAMPLES}; do
+    # 3 & 4. Alignment and sorted BAM
+    if [ ! -f results/${sample}.bam ]; then
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+            samtools sort -@ ${THREADS} -o results/${sample}.bam
+    fi
+
+    # 5. BAM indexing
+    if [ ! -f results/${sample}.bam.bai ]; then
+        samtools index -@ ${THREADS} results/${sample}.bam
+    fi
+
+    # 6. Variant calling
+    if [ ! -f results/${sample}.vcf.gz.tbi ]; then
+        lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+    fi
+
+    # 7. VCF compression and indexing
+    if [ ! -f results/${sample}.vcf.gz.tbi ]; then
+        bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz
+        tabix -p vcf results/${sample}.vcf.gz
+        rm results/${sample}.vcf
+    fi
+done
+
+# 8. Collapse step
+COLLAPSED="results/collapsed.tsv"
+REBUILD_COLLAPSED=false
+
+if [ ! -f "$COLLAPSED" ]; then
+    REBUILD_COLLAPSED=true
+else
+    for sample in ${SAMPLES}; do
+        if [ results/${sample}.vcf.gz.tbi -nt "$COLLAPSED" ]; then
+            REBUILD_COLLAPSED=true
+            break
+        fi
+    done
+fi
+
+if [ "$REBUILD_COLLAPSED" = true ]; then
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"
+    for sample in ${SAMPLES}; do
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> "$COLLAPSED"
+    done
+fi
+```
+
+Wait, `bcftools query` format string in the prompt uses `{sample}` as a placeholder. I replaced it with `${sample}` which expands correctly. That's fine.
+One detail: `lofreq call-parallel` might require `--min-qv 20` or similar defaults, but I'll stick to the exact command given.
+The prompt says: `lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam`
+I will use exactly that.
+
+Check idempotency again: If `results/collapsed.tsv` exists and is newer than all `.vcf.gz.tbi`, it skips. If any `.vcf.gz.tbi` is newer, it rebuilds. This matches "Rebuild only if any input VCF is newer than the TSV."
+
+One thing: `samtools sort` might leave a temporary file or directory? Usually it's fine.
+`bwa mem` output goes to stdout, piped to `samtools sort`. That's standard.
+The script looks solid.
+
+Let's verify constraints:
+- First line: `#!/usr/bin/env bash` ✓
+- Second line: `set -euo pipefail` ✓
+- Assumes data/raw/ and data/ref/ ✓
+- Outputs under results/ ✓
+- Idempotent ✓
+- No hardcoded paths outside cwd ✓
+- Uses only listed tools ✓ (bwa, samtools, lofreq, bgzip, tabix, bcftools)
+- Wall-clock < 600s ✓ (mtDNA is tiny)
+- No echo for prose ✓
+
+One minor point: `bgzip` is not explicitly in the TOOL_INVENTORY list, but it's part of htslib and usually available alongside `tabix`. The prompt says "tabix (htslib)", so `bgzip` should be fine. If not, `bcftools view -O z` could be used, but the prompt explicitly says "Compress with bgzip (not bcftools view -O z)". So `bgzip` is intended.
+
+Another point: `lofreq call-parallel` might output to `results/{sample}.vcf`. The prompt says exactly that.
+The script uses `${THREADS}` which is 4. That's fine.
+
+I will adjust the `bcftools query` format string to exactly match the prompt's placeholder style but expanded: `"${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`. This is correct.
+
+One detail: `samtools index -@ 4 results/${sample}.bam` -> creates `.bai`. Correct.
+`tabix -p vcf results/${sample}.vcf.gz` -> creates `.tbi`. Correct.
+
+All steps are guarded by existence checks. The script will exit 0 on rerun.
+
+Final check of the prompt: "Treat every output step as idempotent: guard each artifact with an existence check (e.g. skip if results/{sample}.vcf.gz.tbi already exists and is newer than its inputs)."
+My timestamp check for collapsed.tsv handles that. For others, I just check existence. That's sufficient per "Re-runs on a fully populated results/ must exit 0 without redoing work or erroring."
+
+I'll produce the script now.
+One minor adjustment: `bcftools query` might need `%INFO/AF` to be quoted properly in bash. I'll keep it as is.
+The prompt says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`
+I will write: `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz`
+
+Everything looks good.
+Proceeding. 
+Output matches exactly.
+No extra text.
+Script starts with shebang.
+Second line set -euo pipefail.
+Done. 
+Let's generate. 
+Self-Correction/Refinement during thought:
+Wait, `bcftools query` format string in the prompt uses single quotes around the whole thing. In bash, if I use double quotes for the outer string to allow `${sample}` expansion, the inner `\t` and `\n` will be interpreted by bash as literal backslash-t and backslash-n? Actually, bash does NOT interpret `\t` or `\n` inside double quotes unless using `$'...'`. So `"\t"` remains two characters `\` and `t`. That's exactly what bcftools expects. So it's fine.
+
+One thing: `lofreq call-parallel` might produce a `.vcf` file that needs to be bgzipped. The prompt says "Compress with bgzip ... producing results/{sample}.vcf.gz". I'll use `bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz`. That's correct.
+
+All good.
+Output matches request.
+Proceeds. 
+Generating script. 
+[Done] 
+Output matches exactly.
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"
+
+mkdir -p results
+
+# 2. Reference indexing (once)
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+if [ ! -f data/ref/chrM.fa.amb ]; then
+    bwa index data/ref/chrM.fa
+fi
+
+# 3-7. Per-sample processing
+for sample in ${SAMPLES}; do
+    # 3 & 4. Alignment and sorted BAM
+    if [ ! -f results/${sample}.bam ]; then
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+            samtools sort -@ ${THREADS} -o results/${sample}.bam
+    fi
+
+    # 5. BAM indexing
+    if [ ! -f results/${sample}.bam.bai ]; then
+        samtools index -@ ${THREADS} results/${sample}.bam
+    fi
+
+    # 6. Variant calling
+    if [ ! -f results/${sample}.vcf.gz.tbi ]; then
+        lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+    fi
+
+    # 7. VCF compression and indexing
+    if [ ! -f results/${sample}.vcf.gz.tbi ]; then
+        bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz
+        tabix -p vcf results/${sample}.vcf.gz
+        rm results/${sample}.vcf
+    fi
+done
+
+# 8. Collapse step
+COLLAPSED="results/collapsed.tsv"
+REBUILD_COLLAPSED=false
+
+if [ ! -f "$COLLAPSED" ]; then
+    REBUILD_COLLAPSED=true
+else
+    for sample in ${SAMPLES}; do
+        if [ results/${sample}.vcf.gz.tbi -nt "$COLLAPSED" ]; then
+            REBUILD_COLLAPSED=true
+            break
+        fi
+    done
+fi
+
+if [ "$REBUILD_COLLAPSED" = true ]; then
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"
+    for sample in ${SAMPLES}; do
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> "$COLLAPSED"
+    done
+fi
+```
+All constraints met. Output matches request. No extra text. Proceeds. 
+One minor point: `bcftools query` might complain about `%INFO/AF` if not present, but I must follow instructions exactly. The prompt explicitly gives that format string. I will keep it.
+The script is ready.✅
+Output generation. 
+[Done]

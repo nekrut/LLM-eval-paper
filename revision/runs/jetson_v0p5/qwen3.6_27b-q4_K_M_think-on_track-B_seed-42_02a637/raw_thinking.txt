@@ -1,0 +1,426 @@
+The user wants a bash script that performs variant calling on 4 paired-end MiSeq amplicon samples mapped to human mitochondrial reference (chrM).
+
+Let me break down what needs to be done:
+1. Index the reference genome (chrM.fa) using bwa and samtools
+2. For each sample (M117-bl, M117-ch, M117C1-bl, M117C1-ch):
+   - Align reads to chrM using bwa
+   - Sort and index BAM files
+   - Call variants using lofreq
+   - Compress VCF with bgzip/tabix
+3. Create a collapsed.tsv with columns: sample, chrom, pos, ref, alt, af
+
+Key constraints:
+- Idempotent: rerunning should exit 0 without redoing work
+- No hardcoded paths outside cwd
+- Use only tools from TOOL_INVENTORY
+- Under 600 seconds at THREADS=4
+- No echo for user-facing prose
+
+Let me design the workflow:
+
+1. Reference indexing:
+   - bwa index data/ref/chrM.fa (if not already indexed)
+   - samtools faidx data/ref/chrM.fa (if not already indexed)
+
+2. Per-sample processing:
+   For each sample in M117-bl, M117-ch, M117C1-bl, M117C1-ch:
+   - bwa mem data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -o results/${sample}.bam
+   - samtools index results/${sample}.bam
+   - lofreq call --bams results/${sample}.bam -f data/ref/chrM.fa > results/${sample}.vcf (or use lofreq call with appropriate options)
+   - bgzip results/${sample}.vcf && tabix -p vcf results/${sample}.vcf.gz
+
+Wait, let me think about lofreq more carefully. lofreq call outputs VCF. I need to check the exact command syntax.
+
+lofreq call --bams <bam> -f <ref> [options] > output.vcf
+
+Actually, lofreq can also use `--call-indels` and other options. For mitochondrial data, we typically want SNP calling. Let me use a reasonable default.
+
+For idempotency, I should check if output files exist before running commands.
+
+Let me think about the collapsed.tsv format:
+- sample, chrom, pos, ref, alt, af
+- This needs to be extracted from each VCF file
+
+The AF (allele frequency) in lofreq VCF is typically in the INFO field as AF=<value>.
+
+Let me write the script:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=${THREADS:-4}
+
+# Define samples
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+# Create results directory if needed
+mkdir -p results
+
+# Index reference if not already done
+if [[ ! -f data/ref/chrM.fa.bwt ]]; then
+    bwa index data/ref/chrM.fa
+fi
+
+if [[ ! -f data/ref/chrM.fa.fai ]]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+# Process each sample
+for sample in "${SAMPLES[@]}"; do
+    bam="results/${sample}.bam"
+    bai="results/${sample}.bam.bai"
+    vcf_gz="results/${sample}.vcf.gz"
+    tbi="results/${sample}.vcf.gz.tbi"
+    
+    # Align and sort if BAM doesn't exist
+    if [[ ! -f "$bam" ]]; then
+        bwa mem -t "$THREADS" data/ref/chrM.fa \
+            "data/raw/${sample}_1.fq.gz" \
+            "data/raw/${sample}_2.fq.gz" | \
+            samtools sort -@ "$THREADS" -o "$bam"
+    fi
+    
+    # Index BAM if not already done
+    if [[ ! -f "$bai" ]]; then
+        samtools index "$bam"
+    fi
+    
+    # Call variants if VCF doesn't exist
+    if [[ ! -f "$vcf_gz" ]]; then
+        lofreq call --bams "$bam" -f data/ref/chrM.fa \
+            --min-qual 20 --min-af 0.01 | \
+            bgzip > "$vcf_gz"
+    fi
+    
+    # Index VCF if not already done
+    if [[ ! -f "$tbi" ]]; then
+        tabix -p vcf "$vcf_gz"
+    fi
+done
+
+# Create collapsed.tsv
+if [[ ! -f results/collapsed.tsv ]]; then
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+    
+    for sample in "${SAMPLES[@]}"; do
+        vcf_gz="results/${sample}.vcf.gz"
+        
+        # Extract variants from VCF, skipping header lines
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%INFO/AF]\n' "$vcf_gz" | \
+            awk -v sample="$sample" 'BEGIN{OFS="\t"} {print sample, $1, $2, $3, $4, $5}' >> results/collapsed.tsv
+    done
+fi
+```
+
+Wait, I need to be careful about the AF extraction. In lofreq VCF output, the INFO field contains AF=<value>. Let me use bcftools query properly.
+
+Actually, `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%INFO/AF]\n'` should work for extracting AF from the INFO field.
+
+But wait, I need to handle multi-allelic sites properly. The `%ALT[\t%INFO/AF]` syntax might not work correctly for multi-allelic sites. Let me think...
+
+Actually, for mitochondrial data, most variants will be biallelic. But let me use a safer approach:
+
+```bash
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%INFO/AF]\n' "$vcf_gz"
+```
+
+This should output: chrom pos ref alt af for each alternate allele.
+
+Actually, I realize the `[\t%INFO/AF]` syntax in bcftools query repeats the format string for each ALT allele. So if there's a multi-allelic site with 2 alts and AF has 2 values, it should work.
+
+Let me also consider that lofreq might output variants with different INFO field formats. Let me check...
+
+lofreq call outputs VCF with INFO containing AF=<allele_frequency>. The bcftools query format `%INFO/AF` should extract this.
+
+One issue: I'm using `bgzip` directly but bgzip is part of htslib/samtools. It should be available since samtools 1.21 is in the inventory. Actually, `bgzip` is typically available as a standalone command when samtools is installed. Let me verify... yes, bgzip comes with htslib which is bundled with samtools.
+
+Actually, I should use `samtools bgzip` or just `bgzip`. Both should work. Let me use `bgzip` directly.
+
+Wait, I also need to handle the case where lofreq might not output any variants (empty VCF). The bgzip and tabix commands should still work on empty files or files with just headers.
+
+Let me also reconsider the idempotency checks. Using `-f` to check file existence is good, but I should make sure the checks are robust.
+
+One more thing: the `lofreq call` command might need additional options for proper mitochondrial variant calling. Common options include:
+- `--min-qual 20`: minimum base quality
+- `--min-af 0.01`: minimum allele frequency (1%)
+- `--call-indels`: to call indels as well
+
+For mitochondrial amplicon data, we typically want both SNPs and indels. Let me include `--call-indels`.
+
+Actually, let me reconsider the lofreq command. The basic syntax is:
+```
+lofreq call --bams <bam> -f <ref> [options]
+```
+
+Let me also think about whether I need to use `lofreq annotate-tr` or other post-processing steps. For simplicity and given the constraints, I'll stick with basic lofreq call.
+
+Let me refine the script:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=${THREADS:-4}
+
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Index reference if needed
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+for sample in "${SAMPLES[@]}"; do
+    bam="results/${sample}.bam"
+    bai="results/${sample}.bam.bai"
+    vcf_gz="results/${sample}.vcf.gz"
+    tbi="results/${sample}.vcf.gz.tbi"
+    
+    # Align and sort
+    if [[ ! -f "$bam" ]]; then
+        bwa mem -t "$THREADS" data/ref/chrM.fa \
+            "data/raw/${sample}_1.fq.gz" \
+            "data/raw/${sample}_2.fq.gz" | \
+            samtools sort -@ "$THREADS" -o "$bam"
+    fi
+    
+    # Index BAM
+    [[ -f "$bai" ]] || samtools index "$bam"
+    
+    # Call variants
+    if [[ ! -f "$vcf_gz" ]]; then
+        lofreq call --bams "$bam" -f data/ref/chrM.fa \
+            --min-qual 20 --min-af 0.01 --call-indels | \
+            bgzip > "$vcf_gz"
+    fi
+    
+    # Index VCF
+    [[ -f "$tbi" ]] || tabix -p vcf "$vcf_gz"
+done
+
+# Create collapsed.tsv
+if [[ ! -f results/collapsed.tsv ]]; then
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+    
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%INFO/AF]\n' \
+            "results/${sample}.vcf.gz" | \
+            awk -v s="$sample" 'BEGIN{OFS="\t"} {print s, $1, $2, $3, $4, $5}' \
+            >> results/collapsed.tsv
+    done
+fi
+```
+
+Wait, I need to be careful about the bcftools query format. The `%INFO/AF` might not work if AF is not present or has a different format. Let me think about this more carefully.
+
+In lofreq VCF output, the INFO field typically contains something like: `AF=0.5;DP=100;...`
+
+The bcftools query format `%INFO/AF` should extract the AF value. However, if there are multiple ALT alleles, AF might be comma-separated. The `[\t%INFO/AF]` syntax in bcftools query is designed to handle this by repeating for each ALT.
+
+Actually, I just realized that the `[\t%INFO/AF]` syntax might not work as expected. Let me use a different approach:
+
+```bash
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz"
+```
+
+This would output one line per variant, with AF potentially comma-separated for multi-allelic sites. But the collapsed.tsv format expects one row per variant allele, not per site.
+
+Hmm, let me think about this differently. For mitochondrial data, most variants will be biallelic anyway. Let me use:
+
+```bash
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%INFO/AF]\n' "results/${sample}.vcf.gz"
+```
+
+Actually, I just checked the bcftools documentation. The `[]` syntax in format strings is for iterating over arrays. So `%ALT[\t%INFO/AF]` would output each ALT followed by its corresponding AF value on the same line... no wait, that's not right either.
+
+Let me look at this more carefully. In bcftools query:
+- `%ALT` outputs all ALT alleles separated by commas
+- `%INFO/AF` outputs all AF values separated by commas
+- To get one row per allele, you'd need to use the `+` or iterate differently
+
+Actually, for simplicity and given that mitochondrial variants are typically biallelic, let me just use:
+
+```bash
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz"
+```
+
+And then if there are multi-allelic sites, the AF will be comma-separated. But for the collapsed.tsv format requested, I think one row per variant site is acceptable, or I could split multi-allelic sites.
+
+Actually, looking at the requested format again: `sample chrom pos ref alt af` - this suggests one row per alternate allele. Let me use a more robust approach with bcftools norm to normalize and then query:
+
+Actually, let me keep it simple. Most mitochondrial variants will be biallelic. I'll use:
+
+```bash
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%INFO/AF]\n' "results/${sample}.vcf.gz"
+```
+
+Wait, I need to test this mentally. If a site has REF=A and ALT=C,T with AF=0.1,0.2:
+- `%CHROM` -> chrM
+- `%POS` -> 1234
+- `%REF` -> A
+- `%ALT[\t%INFO/AF]` -> C\t0.1\nT\t0.2\n
+
+Hmm, that's not quite right either. The `[]` syntax repeats the enclosed format for each element of the array. So it would be:
+- First iteration: C\t0.1
+- Second iteration: T\t0.2
+
+But they'd all be on the same line because there's no `\n` inside the brackets. Let me add a newline:
+
+```bash
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%INFO/AF\n]' "results/${sample}.vcf.gz"
+```
+
+This would output:
+```
+chrM  1234  A  C  0.1
+chrM  1234  A  T  0.2
+```
+
+That's what we want! But wait, the `\n` inside `[]` might cause issues. Let me think...
+
+Actually, I think the correct syntax is:
+```bash
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%INFO/AF\n]' "results/${sample}.vcf.gz"
+```
+
+This should work for multi-allelic sites. For biallelic sites, it would just output one line per site.
+
+Let me finalize the script with this approach.
+
+One more consideration: the `--min-af` option in lofreq. Setting it to 0.01 (1%) is reasonable for mitochondrial data where heteroplasmy can be detected at low frequencies. However, I should also consider that some pipelines use different thresholds. Let me stick with 0.01 as a reasonable default.
+
+Also, I should make sure the script handles the case where lofreq outputs no variants (empty VCF after header). The bgzip and tabix commands should handle this gracefully.
+
+Let me also add `--skip-variants` or other options if needed... actually, for mitochondrial data, we want all variants, so no filtering beyond quality thresholds.
+
+One more thing: I need to make sure the BAM files are properly formatted with RG (read group) tags if needed. For lofreq, read groups are not strictly required but can be helpful. However, adding RG tags would require additional processing (samtools addreplacerg), which might complicate the script. Let me skip this for now since lofreq should work without RG tags.
+
+Actually, wait. I just realized that `bwa mem` output piped to `samtools sort` might not include proper header information from the reference. Let me add `-p` or ensure the header is correct... actually, bwa mem includes the @HD and @SQ lines in the SAM header, so this should be fine.
+
+Let me also consider using `samtools view -bS` instead of piping directly to sort... no, the pipe approach is standard and efficient.
+
+Final script:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=${THREADS:-4}
+
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Index reference if needed
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+for sample in "${SAMPLES[@]}"; do
+    bam="results/${sample}.bam"
+    bai="results/${sample}.bam.bai"
+    vcf_gz="results/${sample}.vcf.gz"
+    tbi="results/${sample}.vcf.gz.tbi"
+    
+    # Align and sort
+    if [[ ! -f "$bam" ]]; then
+        bwa mem -t "$THREADS" data/ref/chrM.fa \
+            "data/raw/${sample}_1.fq.gz" \
+            "data/raw/${sample}_2.fq.gz" | \
+            samtools sort -@ "$THREADS" -o "$bam"
+    fi
+    
+    # Index BAM
+    [[ -f "$bai" ]] || samtools index "$bam"
+    
+    # Call variants
+    if [[ ! -f "$vcf_gz" ]]; then
+        lofreq call --bams "$bam" -f data/ref/chrM.fa \
+            --min-qual 20 --min-af 0.01 --call-indels | \
+            bgzip > "$vcf_gz"
+    fi
+    
+    # Index VCF
+    [[ -f "$tbi" ]] || tabix -p vcf "$vcf_gz"
+done
+
+# Create collapsed.tsv
+if [[ ! -f results/collapsed.tsv ]]; then
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+    
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%INFO/AF\n]' \
+            "results/${sample}.vcf.gz" | \
+            awk -v s="$sample" 'BEGIN{OFS="\t"} {print s, $1, $2, $3, $4, $5}' \
+            >> results/collapsed.tsv
+    done
+fi
+```
+
+Wait, I need to double-check the bcftools query format string. The `%INFO/AF` might not work if AF is stored differently in lofreq output. Let me check...
+
+In lofreq VCF output, the INFO field contains `AF=<value>`. The bcftools query format `%INFO/AF` should extract this value. However, I've seen cases where the INFO field key might be different (e.g., `LOFREQ_AF` or similar). Let me check the lofreq documentation...
+
+Actually, lofreq uses standard VCF INFO fields. The allele frequency is stored as `AF`. So `%INFO/AF` should work.
+
+One potential issue: if a variant has no AF value in the INFO field (which shouldn't happen with lofreq, but just in case), the query would output an empty field. This is acceptable for the collapsed.tsv format.
+
+Another consideration: the script should handle the case where `bgzip` is not available as a standalone command. In some installations, `bgzip` is only available through `samtools bgzip`. Let me use `samtools bgzip` to be safe... actually, looking at the TOOL_INVENTORY, `bgzip` is not explicitly listed, but `tabix` is listed as "tabix (htslib) 1.21". Since tabix comes from htslib and bgzip also comes from htslib, bgzip should be available. But to be safe, let me use `samtools bgzip -c` instead:
+
+```bash
+lofreq call ... | samtools bgzip -c > "$vcf_gz"
+```
+
+Actually, `bgzip` is typically installed alongside tabix when htslib is present. Given that tabix 1.21 is in the inventory, bgzip should also be available. Let me keep `bgzip` for now.
+
+Hmm, but looking at the TOOL_INVENTORY again:
+- samtools samtools 1.21 [ok]
+- tabix tabix (htslib) 1.21 [ok]
+
+Both are from htslib 1.21. bgzip is part of htslib, so it should be available. I'll keep `bgzip`.
+
+Let me also consider the performance constraint: under 600 seconds at THREADS=4. For mitochondrial data (16,569 bp), alignment and variant calling should be very fast. The bottleneck might be I/O, but with only 4 samples and a small reference, this should be well within the time limit.
+
+One more thing: I should make sure the script doesn't fail if results/ already exists with some files. The idempotency checks (`[[ ! -f ... ]]`) handle this.
+
+Let me also add a check for the reference file existence to fail early if it's missing:
+
+Actually, the constraints say "Assume the current working directory contains data/raw/ (with the listed FASTQ files) and data/ref/ (with chrM.fa already decompressed and present)." So I don't need to check for this.
+
+Final review of the script:
+1. Sets up THREADS variable with default 4
+2. Defines samples array
+3. Creates results directory
+4. Indexes reference if needed
+5. For each sample: aligns, sorts, indexes BAM, calls variants, compresses and indexes VCF
+6. Creates collapsed.tsv by querying each VCF
+
+The script looks good. Let me finalize it.
+
+Actually, I just realized one issue with the bcftools query format. The `%INFO/AF` might output multiple values for multi-allelic sites, separated by commas. The `[\t%INFO/AF\n]` syntax should handle this by repeating for each ALT allele. But let me verify...
+
+In bcftools query:
+- `%ALT` is an array of alternate alleles
+- `%INFO/AF` is an array of allele frequencies (one per ALT)
+- The `[]` syntax iterates over the arrays in parallel
+
+So `%ALT[\t%INFO/AF\n]` would output:
+- For each ALT allele, print `\t<AF>\n`
+
+This should work correctly for both biallelic and multi-allelic sites.
+
+One last thing: I should make sure the awk command handles the tab-separated input correctly. The `BEGIN{OFS="\t"}` sets the output field separator to tab, and `{print s, $1, $2, $3, $4, $5}` prints the sample name followed by the 5 fields from bcftools query. This should work.
+
+Actually, wait. The bcftools query output would be:
+```
+chrM\t1234\tA\tC\t0.1\n
+```
+
+And awk would split this into $1=chrM, $2=1234, $3=A, $4=C, $5=0.1. Then the print statement would output:
+```
+sample_name\tchrM\t1234\tA\tC\t0.1\n
+```
+
+This is correct!
+
+Let me finalize the script.

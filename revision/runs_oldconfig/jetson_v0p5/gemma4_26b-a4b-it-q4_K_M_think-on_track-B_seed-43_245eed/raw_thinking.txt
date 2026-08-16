@@ -1,0 +1,233 @@
+*   Goal: Per-sample variant calling on 4 paired-end MiSeq amplicon samples (chrM).
+    *   Inputs: `data/raw/*.fq.gz`, `data/ref/chrM.fa`.
+    *   Outputs: `.bam`, `.bam.bai`, `.vcf.gz`, `.vcf.gz.tbi` for each sample, and a `collapsed.tsv`.
+    *   Tools available: `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`, `SnpSift`, `snpEff`, `fastqc`, `seqkit`, `snakemake`, `shellcheck`, `java`.
+    *   Constraints: Idempotent, no hardcoded paths outside CWD, under 600s (4 threads), single script.
+
+    *   Samples: `M117-bl`, `M117-ch`, `M117C1-bl`, `M117C1-ch`.
+    *   Reference: `data/ref/chrM.fa`.
+    *   Workflow per sample:
+        1.  Index reference if not indexed (`bwa index`).
+        2.  Align reads (`bwa mem`) -> `samtools view` (BAM) -> `samtools sort` -> `samtools index`.
+        3.  Variant calling (`lofreq`). Note: Lofreq is good for low-frequency variants in mitochondrial DNA.
+        4.  Filter/Process VCF if needed (though lofreq outputs a VCF).
+    *   Final step: Aggregate all VCFs into `results/collapsed.tsv`.
+
+    *   `bwa index data/ref/chrM.fa` (only if `.bwt` exists).
+    *   Loop through samples:
+        *   Check if `results/{sample}.bam` exists.
+        *   `bwa mem -t 4 data/ref/chrM.fa data/raw/{sample}_1.fq.gz data/raw/{sample}_2.fq.gz | samtools view -uB - | samtools sort -o results/{sample}.bam -`
+        *   `samtools index results/{sample}.bam`
+        *   `lofreq call -f data/ref/chrM.fa -o results/{sample}.vcf.gz results/{sample}.bam` (Note: lofreq might need `.vcf` or `.vcf.gz`. Let's check standard usage). Actually, `lofreq call` produces a VCF.
+        *   Wait, `lofreq call` usually outputs uncompressed VCF. I should compress it with `bgzip` (part of `samtools`) and index with `tabix`.
+
+    *   Columns: `sample`, `chrom`, `pos`, `ref`, `alt`, `af`.
+    *   Extract from each `.vcf.gz`:
+        *   Use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[%AF]\n'`.
+        *   Wait, `lofreq` puts AF in the INFO field or FORMAT field? Usually, it's in the INFO field as `AF`. Let's assume standard VCF format.
+    *   Combine all using a loop and `awk`.
+
+    *   `M117-bl`, `M117-ch`, `M117C1-bl`, `M117C1-ch`.
+    *   Pattern: `data/raw/{sample}_1.fq.gz`.
+
+    *   `lofreq call -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam`
+    *   Then `bgzip results/{sample}.vcf` and `tabix -p vcf results/{sample}.vcf.gz`.
+
+    *   `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[%AF]\n' results/{sample}.vcf.gz`
+    *   Wait, the column `af` is requested. If `lofreq` doesn't provide it in a simple way, I might need to parse the INFO field. In lofreq, AF is often in the INFO field as `AF=...`.
+
+    *   `bwa index data/ref/chrM.fa`
+    *   For each sample:
+        *   If `.bam` exists, skip.
+        *   Align, sort, index.
+        *   Call variants with lofreq.
+        *   Compress and index VCF.
+    *   After loop:
+        *   Create `collapsed.tsv`.
+        *   Loop through samples, extract info, append to file.
+
+    *   `lofreq call -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam`
+    *   The output is a VCF. Let's check if `bcftools query` can get the AF from the INFO field.
+    *   `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[%AF]\n'` works if AF is in the FORMAT field. If it's in the INFO field, use `%INFO/AF`.
+
+    *   `lofreq call` output: `results/{sample}.vcf`.
+    *   Convert to `.gz`: `bgzip results/{sample}.vcf`.
+    *   Index: `tabix -p vcf results/{sample}.vcf.gz`.
+
+    *   `M117-bl`, `M117-ch`, `M117C1-bl`, `M117C1-ch`.
+    *   The script should find these by looking at the files in `data/raw/`.
+
+    *   `results/collapsed.tsv` header: `sample chrom pos ref alt af`.
+    *   Loop through samples, use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`. (Lofreq puts AF in INFO).
+
+    *   Use `set -euo pipefail`.
+    *   `mkdir -p results`.
+    *   Check for index files.
+    *   Handle the 4 samples explicitly or via globbing.
+
+    *   `bwa mem -t 4 data/ref/chrM.fa ... | samtools sort -@ 4 -o results/{sample}.bam -`
+    *   This is efficient.
+
+    *   The task asks for `results/{sample}.vcf.gz`.
+    *   Lofreq output: `results/{sample}.vcf`.
+    *   I will use `bgzip` (from samtools) to compress it.
+
+    *   `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`
+    *   Wait, if there are multiple alleles in ALT (e.g., `A,G`), `%ALT` will be `A,G`. The task asks for `alt` column. Usually, this implies one allele per line or just the string. Let's stick to the string.
+
+    *   The script must handle 4 samples: `M117-bl`, `M117-ch`, `M117C1-bl`, `M117C1-ch`.
+    *   I can extract them from `data/raw/*_1.fq.gz` by stripping `_1.fq.gz`.
+
+    *   `lofreq call -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam`
+    *   This might be slow. But with 4 threads and small chrM (16kb), it should be very fast.
+
+    *   `results/collapsed.tsv` header: `sample chrom pos ref alt af`.
+    *   Loop through samples, for each sample:
+        `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${s}.vcf.gz | awk -v s="$s" '{print s"\t"$0}' >> results/collapsed.tsv`.
+
+    *   `bwa index data/ref/chrM.fa`
+    *   `samtools sort -@ 4 ...`
+    *   `lofreq call ...`
+    *   All within 600s for 16kb genome and 4 samples is very realistic.
+
+    *   `bwa index data/ref/chrM.fa` (if `.bwt` doesn't exist).
+    *   Loop through `data/raw/*_1.fq.gz`.
+    *   Extract sample name.
+    *   Check if `results/${sample}.bam` exists.
+    *   Run pipeline.
+    *   Final aggregation.
+
+    Wait, the user wants `results/{sample}.vcf.gz`. I must ensure it's compressed and indexed.
+
+    One detail: `lofreq call` might produce a VCF with multiple lines per position if there are multiple variants. The `collapsed.tsv` should represent each variant.
+
+    Let's refine the extraction logic for `collapsed.tsv`:
+    ```bash
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+    for sample in "${samples[@]}"; do
+        if [[ -f "results/${sample}.vcf.gz" ]]; then
+            bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" | \
+            awk -v s="$sample" '{print s"\t"$0}' >> results/collapsed.tsv
+        fi
+    done
+    ```
+
+    Wait, `lofreq` output format: The AF is often in the INFO field as `AF=0.123`. `bcftools query %INFO/AF` will return `0.123`. This is perfect.
+
+    *   `bwa index data/ref/chrM.fa`
+    *   `samtools sort -@ 4 ...`
+    *   `lofreq call -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam`
+    *   `bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz`
+    *   `tabix -p vcf results/${sample}.vcf.gz`
+
+    Wait, `lofreq call` might not be the most efficient for 4 samples if I run them sequentially. But with 4 threads and a tiny genome, it's fine.
+
+    One more thing: `bwa index` creates multiple files (`.amb`, `.ann`, `.bwt`, `.pac`, `.sa`). I should check for the existence of `.bwt`.
+
+    *   `M117-bl_1.fq.gz` -> `M1117-bl`
+    *   Using `basename $f _1.fq.gz`.
+
+    Let's double check the tool list: `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`, `SnpSift`, `snpEff`, `fastqc`, `seqkit`, `snakemake`, `shellcheck`, `java`.
+    `bgzip` is part of `htslib`/`samtools`. It's available.
+
+    *   `results/{sample}.bam`
+    *   `results/{sample}.bam.bai`
+    *   `results/{sample}.vcf.gz`
+    *   `results/{sample}.vcf.gz.tbi`
+    *   `results/collapsed.tsv`
+
+    All covered.
+
+    Wait, `lofreq call` can be slow even on small genomes if it's doing a lot of work. But 16kb is tiny. The bottleneck will likely be the alignment and sorting.
+
+    One detail: `lofreq call` output filename. If I use `-o results/${sample}.vcf`, then compress it, that works.
+
+    Final check on `collapsed.tsv`:
+    The columns are `sample chrom pos ref alt af`.
+    My `awk` command: `awk -v s="$sample" '{print s"\t"$0}'` where `$0` is the output of `bcftools query`.
+    `bcftools query -f '%CHROM\t%annot_pos\t%REF\t%ALT\t%INFO/AF\n'`... wait, I need to make sure the columns match.
+    `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'` gives `chrom pos ref alt af`.
+    Adding `s` at the front: `sample chrom pos ref alt af`. Correct.
+
+    Wait, if `lofreq` doesn't have an AF value for a specific site (e.g., it only reports high-confidence), `bcftools query` might fail or return empty. But `lofreq` is designed to report variants with their frequencies.
+
+    One potential issue: `lofreq call` output format. Sometimes it produces a VCF that isn't quite standard if not careful. Let's ensure we use the `-f` (reference) flag correctly.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    mkdir -p results
+
+    # Index reference if not present
+    if [[ ! -f "data/ref/chrM.fa.bwt" ]]; then
+        bwa index data/ref/chrM.fa
+    fi
+
+    # Identify samples from the raw data directory
+    samples=()
+    for f in data/raw/*_1.fq.gz; do
+        sample=$(basename "$f" _1.fq.gz)
+        samples+=("$sample")
+    done
+
+    # Process each sample
+    for s in "${samples[@]}"; do
+        BAM="results/${s}.bam"
+        VCF_GZ="results/${s}.vcf.gz"
+
+        if [[ ! -f "$BAM" ]]; then
+            bwa mem -t 4 data/ref/chrM.fa "data/raw/${s}_1.fq.gz" "data/raw/${s}_2.fq.gz" | \
+            samtools view -uB - | \
+            samtools sort -@ 4 -o "$BAM" -
+            samtools index "$BAM"
+        fi
+
+        if [[ ! -f "$VCF_GZ" ]]; then
+            # lofreq call output is uncompressed VCF by default
+            VCF_TMP="results/${s}_tmp.vcf"
+            lofreq call -f data/ref/chrM.fa -o "$VCF_TMP" "$BAM"
+            bgzip -c "$VCF_TMP" > "$VCF_GZ"
+            rm "$VCF_TMP"
+            tabix -p vcf "$VCF_GZ"
+        fi
+    done
+
+    # Create collapsed table
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+    for s in "${samples[@]}"; do
+        VCF_GZ="results/${s}.vcf.gz"
+        if [[ -f "$VCF_GZ" ]]; then
+            bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$VCF_GZ" | \
+            awk -v sample="$s" '{print sample "\t" $0}' >> results/collapsed.tsv
+        fi
+    done
+    ```
+
+    Wait, `lofreq call` might produce a VCF where the AF is in the INFO field but formatted as `AF=0.1`. `bcftools query %INFO/AF` will extract just the value. This is good.
+
+    One edge case: if `lofreq` doesn't find any variants, `bcftools query` might produce nothing for that sample. The script handles this (it won't error, just add no lines).
+
+    Wait, I should check if `data/ref/chrM.fa` is actually there as specified. The prompt says it is.
+
+    Final verification of the requirements:
+    - `results/{sample}.bam` - Yes.
+    - `results/{sample}.bam.bai` - Yes.
+    - `results/{sample}.vcf.gz` - Yes.
+    - `results/{sample}.vcf.gz.tbi` - Yes.
+    - `results/collapsed.tsv` (tab-separated, header: sample chrom pos ref alt af) - Yes.
+    - Idempotent - Yes.
+    - No hardcoded paths outside CWD - Yes.
+    - Under 600s - Yes.
+
+    One small detail: `lofreq call` might be sensitive to the input BAM being sorted and indexed. I have `samtools sort` and `samtools index`.
+
+    Wait, `lofreq call` output file extension. The `-o` flag in `lofreq call` specifies the output file. If I provide `results/${s}.vcf`, it will create that file.
+
+    Let's refine the `bcftools query` part to be safer:
+    `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`
+    If `AF` is not present in a record, it might skip it or error. But for variants called by `lofreq`, `AF` should be there.
+
+    One more check: `bwa index data/ref/chrM.fa`. The files created are `.amb`, `.ann`, `.bwt`, `.pac`, `.sa`. Checking for `.bwt` is a standard way to see if it's indexed.
+
+    Final script structure looks solid.

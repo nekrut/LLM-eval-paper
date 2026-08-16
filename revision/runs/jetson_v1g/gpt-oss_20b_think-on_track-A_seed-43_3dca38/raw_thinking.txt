@@ -1,0 +1,217 @@
+We need to produce a bash script following constraints.
+
+Key points:
+
+- Use set -euo pipefail.
+- Idempotent: check existence and timestamps. We can use if [ ! -f ... ] or maybe use newer test: if file is older than inputs, re-run. Simpler: skip step if output exists. But for collapse we need to rebuild if any input VCF newer than TSV. So we need to check that.
+
+- For reference indexing: check if .amb etc exist; but easiest: check if chrM.fa.bwt exists? Actually bwa index creates multiple files: .amb, .ann, .bwt, .pac, .sa. We can test for one of them. Also samtools faidx produces .fai.
+
+- For each sample: produce bam and bai. Use existence checks.
+
+- For variant calling: check if vcf.gz exists; but we need to compress from vcf. So skip if vcf.gz.tbi exists? But we also need to ensure that the intermediate vcf is removed. We can just check if .vcf.gz.tbi exists, then assume done. But if .vcf.gz exists but not tbi? That shouldn't happen. We'll just check for .vcf.gz.tbi.
+
+- For collapse: check if collapsed.tsv exists and newer than all sample.vcf.gz files. Use `if [ ! -f results/collapsed.tsv ] || [ $(find results/*.vcf.gz -newer results/collapsed.tsv | wc -l) -gt 0 ]; then ...` But we can use `touch`? We'll implement logic.
+
+- Use only tools listed: bwa, samtools, bcftools, tabix, lofreq, etc. bgzip is part of htslib; but not in inventory list. Wait bgzip is part of htslib and usually available as 'bgzip' command. But not listed explicitly. However we can use `bcftools view -O z` to compress. The plan says use bgzip, but it's not in TOOL_INVENTORY. We must only use tools listed. So we cannot call bgzip unless it's part of bcftools? Actually bgzip is separate binary from htslib; but not listed. But maybe bcftools includes a `bgzip` command? No, bcftools has 'bcftools view -O z', which uses bgzip internally. We can use that.
+
+But the plan says "Compress with bgzip (not bcftools view -O z)". However we can't call bgzip. But maybe bgzip is available because it's part of htslib and might be on PATH? Not listed though. The instruction: Use only tools listed in TOOL_INVENTORY. So cannot rely on bgzip. We can use `bcftools view -Oz` to compress, then tabix index.
+
+But we need to remove intermediate .vcf. So we can do:
+
+```
+if [ ! -f results/${sample}.vcf.gz.tbi ]; then
+  lofreq call-parallel ... > results/${sample}.vcf
+  bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf
+  tabix -p vcf results/${sample}.vcf.gz
+  rm results/${sample}.vcf
+fi
+```
+
+But we need to skip if .vcf.gz.tbi exists. Good.
+
+- For collapse: use bcftools query with format string. The sample name is literal, not variable? They want to prepend sample via format string. We can do:
+
+`bcftools query -f '%SAMPLE\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz`
+
+But they want the sample name as a literal column, not from VCF header. So we need to use `-f '{sample}\t%CHROM...'` but bcftools query doesn't support braces? Actually bcftools query format string uses `%SAMPLE`, etc. But we can just output sample name via echo before each call and pipe? Simpler: For each sample, run:
+
+```
+echo -e "${sample}\t$(bcftools query ... )"
+```
+
+But that would produce multiple lines incorrectly.
+
+Better: Use `bcftools query` with format string that includes the literal sample name. bcftools query supports `%SAMPLE`, but we can use `-f '${sample}\t%CHROM...'`? I think bcftools query uses `%SAMPLE` placeholder; but to insert a literal string, we just put it directly: e.g., `-f 'M117-bl\t%CHROM\t...`. That will output the literal string. So we can use that.
+
+Thus for each sample:
+
+```
+bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz
+```
+
+Concatenate outputs into a temp file, then add header and write to collapsed.tsv.
+
+- Idempotency: For collapse, we need to check if any sample.vcf.gz newer than collapsed.tsv. Use `if [ ! -f results/collapsed.tsv ] || [ $(find results/*.vcf.gz -newer results/collapsed.tsv | wc -l) -gt 0 ]; then ...`.
+
+- Ensure no extraneous output: don't use echo for user-facing prose.
+
+- Avoid using any absolute paths. Use relative.
+
+- Use THREADS=4.
+
+- Use `samtools sort` with -@ 4 and -o results/${sample}.bam. But we need to pipe from bwa mem. So:
+
+```
+bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+    data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz |
+samtools sort -@ $THREADS -o results/${sample}.bam
+```
+
+But we need to ensure that the read group string contains literal backslash-t. In bash, if we use single quotes around the whole argument, we can include \t literally: `-R '@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA'`. But variable expansion inside single quotes doesn't happen. So we need double quotes but escape backslashes? Actually we want literal backslash-t characters; so we need to write `\\t` in the string, because bash will interpret \t as t? Wait: In double-quoted strings, backslash escapes certain characters: \n, \r, \t, etc. So if we write `"@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`, the `\t` will be replaced by a tab character before passing to bwa. That is not allowed. We need literal backslash-t characters. To achieve that, we can escape the backslashes: `"@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`. In double quotes, `\\` becomes a single backslash; then `\t` remains as two characters? Actually after escaping, we get `\t` literal. Let's test mentally: `"@RG\\tID"` -> the string passed to program is `@RG\tID`. Good.
+
+So use that.
+
+- For reference indexing: check if data/ref/chrM.fa.bwt exists; but also need .amb etc. We'll just check for .bwt file.
+
+- For samtools faidx: check if chrM.fa.fai exists.
+
+- Use `mkdir -p results`.
+
+- Ensure script exits 0 when nothing to do.
+
+Let's craft the script.
+
+Edge cases: The sample names contain hyphens and numbers; they are fine as variable values.
+
+We need to use `set -euo pipefail` at top.
+
+Implementation details:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+samples=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+# Create results dir
+mkdir -p results
+
+# Reference indexing
+if [ ! -f data/ref/chrM.fa.bwt ]; then
+  samtools faidx data/ref/chrM.fa
+  bwa index data/ref/chrM.fa
+fi
+
+# Process each sample
+for sample in "${samples[@]}"; do
+  bam=results/${sample}.bam
+  bai=results/${sample}.bai
+  vcf_gz_tbi=results/${sample}.vcf.gz.tbi
+  # Alignment and sorting
+  if [ ! -f "$bam" ] || [ ! -f "$bai" ]; then
+    bwa mem -t $THREADS \
+      -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+      data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz |
+      samtools sort -@ $THREADS -o "$bam"
+    samtools index -@ $THREADS "$bam"
+  fi
+  # Variant calling and compression
+  if [ ! -f "$vcf_gz_tbi" ]; then
+    lofreq call-parallel --pp-threads $THREADS --verbose \
+      --ref data/ref/chrM.fa --out results/${sample}.vcf \
+      --sig --bonf \
+      "$bam"
+    bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf
+    tabix -p vcf results/${sample}.vcf.gz
+    rm results/${sample}.vcf
+  fi
+done
+
+# Collapse step
+collapsed=results/collapsed.tsv
+needs_collapse=false
+if [ ! -f "$collapsed" ]; then
+  needs_collapse=true
+else
+  for sample in "${samples[@]}"; do
+    if [ "$(stat -c %Y results/${sample}.vcf.gz)" -gt "$(stat -c %Y $collapsed)" ]; then
+      needs_collapse=true
+      break
+    fi
+  done
+fi
+
+if $needs_collapse; then
+  tmp=$(mktemp)
+  for sample in "${samples[@]}"; do
+    bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> "$tmp"
+  done
+  printf "sample\tchrom\tpos\tref\talt\taf\n" > "$collapsed"
+  cat "$tmp" >> "$collapsed"
+  rm "$tmp"
+fi
+
+exit 0
+```
+
+But we need to ensure that the `stat -c %Y` works on all systems. Use `touch`? But it's fine.
+
+Also, we used `--sig --bonf`. The plan says they can be omitted; but we include them as per plan.
+
+We also used `samtools index -@ $THREADS "$bam"`, which produces .bai file.
+
+Check idempotency: For each sample, if bam or bai missing, run alignment. But what if bam exists but bai missing? We check both. Good.
+
+But we might want to skip alignment if both exist; else re-run. That's fine.
+
+For variant calling, we check only tbi existence; if missing, run all steps. That will regenerate vcf.gz and tbi. If vcf.gz exists but tbi missing, it will still run. Good.
+
+Collapse: We compute needs_collapse by comparing timestamps of each sample.vcf.gz to collapsed.tsv. Use stat -c %Y. This works on Linux. Good.
+
+Edge: if any .vcf.gz newer than collapsed, we rebuild.
+
+We used `tmp=$(mktemp)`; ensure mktemp exists (should). We then append outputs.
+
+Finally exit 0.
+
+Check no extraneous output: The script will produce tool outputs to stdout/stderr as usual. No echo except for header line? Wait we use printf "sample\tchrom..." > collapsed.tsv. That's fine, it's part of output file; not user-facing prose.
+
+But we used `printf` which writes to stdout? Actually we redirect with > so no console output. Good.
+
+We also used `cat "$tmp" >> "$collapsed"`; that's fine.
+
+Check that we didn't use any disallowed commands: We used `stat`, `mktemp`. Are these allowed? Not listed in TOOL_INVENTORY, but they are standard Unix utilities. The instruction only restricts tools from inventory for the workflow steps, not general system utilities. So it's okay.
+
+But maybe to be safe, we can avoid stat and use find -newer. But simpler: Use `find` approach earlier. Let's adjust collapse logic:
+
+```
+needs_collapse=false
+if [ ! -f "$collapsed" ]; then
+  needs_collapse=true
+else
+  for sample in "${samples[@]}"; do
+    if [ "$(find results/${sample}.vcf.gz -newer $collapsed)" ]; then
+      needs_collapse=true
+      break
+    fi
+  done
+fi
+```
+
+But `find` returns path or nothing; we can test with `[ -n "$(find ...)" ]`. That uses find. That's fine.
+
+Let's implement that.
+
+Also, we used `samtools index -@ $THREADS "$bam"` but samtools index doesn't support -@? It does: yes, it supports -@ threads. Good.
+
+Now final script.
+
+Check for missing variable expansions: In the alignment step, we used `$sample` inside double quotes; that's fine.
+
+We need to ensure that `bwa mem` command line is correct: The read group string uses literal backslash-t. We wrote `"@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`. That passes the string with \t characters. Good.
+
+Now final script.
+
+Let's produce final answer.

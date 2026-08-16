@@ -1,0 +1,450 @@
+We need to produce a bash script meeting constraints:
+
+- First line: #!/usr/bin/env bash
+- Second line: set -euo pipefail
+- Must be self-contained, idempotent: if results directory already has outputs, exit 0 without error.
+- Use only tools listed; no external commands like curl etc. We can use bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff maybe not needed. Need variant calling per sample on paired-end MiSeq amplicon data mapped to chrM.fa.
+
+Workflow likely:
+
+1. Ensure results directory exists.
+2. For each sample (list of 4 base names: M117-bl, M117-ch, M117C1-bl, M117C1-ch). Actually they have paired-end fastq files with _1.fq.gz and _2.fq.gz suffixes.
+
+3. Align each pair to chrM.fa using bwa mem (or bwa aln? but simple: bwa mem ref chrM.fa sample_R1.fastq.gz sample_R2.fastq.gz | samtools view -@ 4 -b - > results/sample.bam). Use appropriate threads? We have THREADS=4 constraint for wall-clock; we can set a variable THREADS=4 and use -t $THREADS.
+
+But need to be idempotent: if output files already exist, skip steps. Could check if .bam exists and is non-empty? Simpler: if results/{sample}.bam exists, then assume done; else run alignment.
+
+But also need index .bai.
+
+Variant calling: Use lofreq or bcftools? For amplicon data on mitochondrial reference, maybe use bcftools mpileup + call. But we have lofreq tool available. Could use lofreq's "lofreq call" but it expects a reference and BAMs. Simpler: Use samtools mpileup and bcftools call.
+
+Given constraints, we can implement:
+
+- For each sample:
+   - Align to chrM.fa with bwa mem (or bwa mem -t 4) producing .sam then convert to .bam sorted? Could use samtools view -@ 4 -b -o results/sample.bam -.
+
+But need sorted BAM for downstream steps. Use samtools sort maybe.
+
+Simplify: Use bwa mem -t $THREADS ref.fa reads | samtools view -@ $THREADS -b - > results/sample.bam; then samtools index results/sample.bam (produces .bai). Then mpileup: samtools mpileup -f data/ref/chrM.fa -Ou results/sample.bam | bcftools call -mv -Oz -o results/sample.vcf.gz; then tabix to index vcf.gz.
+
+But need to ensure proper options for amplicon data (e.g., -C 50?). Might be okay.
+
+Then use SnpSift or snpEff? Not required but maybe used for annotation. However final collapsed.tsv requires columns sample chrom pos ref alt af. Could generate from VCF using bcftools query or grep. Simpler: Use bcftools query -f '%CHROM %POS %REF %ALT [ADF]\t%AF\n'?? Actually AF is allele frequency; can compute from genotype fields.
+
+Simplify: Extract variant info and allele frequency from VCF using bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' results/*.vcf.gz? But need per sample collapsed.tsv with columns sample chrom pos ref alt af. So we can loop over each sample's VCF and output lines.
+
+But final collapsed.tsv should be a single file containing rows for all samples, maybe one row per variant per sample? Or aggregated? The spec: "collapsed.tsv must have columns (tab-separated, with header): sample  chrom  pos  ref  alt  af". Likely each line is a variant per sample. So we can generate by iterating over each sample's VCF and outputting lines.
+
+Implementation plan:
+
+- Define THREADS=4.
+- Ensure results directory exists: mkdir -p results.
+- If results/collapsed.tsv already exists, then check if all required files exist; but idempotent: if any of the outputs are missing, we need to redo? Actually requirement: rerunning on a populated results/ must exit 0 without redoing work or erroring. So we can early-exit if all expected output files exist (i.e., for each sample .bam .bai .vcf.gz .vcf.gz.tbi and collapsed.tsv). If they are present, just exit 0.
+
+- For each sample in list:
+   - Check if results/${sample}.bam exists; if not, run alignment.
+   - After bam creation, index with samtools index (produces .bai).
+   - Then mpileup + bcftools call to produce VCF.gz and index with tabix.
+
+- After all samples processed, generate collapsed.tsv:
+   - If file already exists, skip; else create header and then for each sample, use bcftools query to extract variant lines with sample name and AF.
+
+But need to compute allele frequency (af). In VCF, there is INFO field AF. We can extract using bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' but need sample column? Actually we also need sample identifier; we can use bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' and prepend sample name manually. Simpler: Use grep to get lines, then output with sample prefix.
+
+But maybe easier: Use "bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz | sed 's/^/\t${sample}/'"? Actually we need columns: sample chrom pos ref alt af. So we can produce lines like:
+
+sample1 chrM 100 A T 0.05
+
+We can generate using awk: while read -r line; do echo -e "${sample}\t$line"; done.
+
+But need to preserve tab separation and header.
+
+Implementation steps for collapsed.tsv:
+
+- If results/collapsed.tsv exists, skip generation.
+- Else:
+   - Create file with header: sample\tchrom\tpos\tref\talt\taf
+   - For each sample in list:
+        - Use bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz | while read -r chrom pos ref alt af; do echo -e "${sample}\t${chrom}\t${pos}\t${ref}\t${alt}\t${af}"; done >> results/collapsed.tsv
+
+But need to handle cases where AF may be missing for some variants? Usually AF is present. Use bcftools query format string: '%CHROM\t%POS0\t%REF\t%ALT[\t%AF]\n' maybe.
+
+Better: Use "bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz" which outputs lines like "chrM 100 A T [AC=...];AF=0.5". Actually the format string with brackets includes AF field? The syntax: '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' will output fields separated by tabs, and if we include [\t%AF] it adds a tab then AF value. So final line would be "chrM 100 A T \t0.5"? Actually there is a leading tab before AF? The format string includes a literal tab character inside brackets; that will produce a tab between ALT and AF. But we want a single column for AF after alt, separated by tabs. So we can use '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' which yields something like "chrM 100 A T \t0.5". That's okay; then we can replace the leading tab with nothing? Actually we want columns: sample chrom pos ref alt af, all separated by tabs. So we need to output sample name, then the fields separated by tabs. We can do:
+
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz | while IFS=$'\t' read -r chrom pos ref alt af; do echo -e "${sample}\t${chrom}\t${pos}\t${ref}\t${alt}\t${af}"; done >> collapsed.tsv
+
+But need to handle cases where AF may be missing (e.g., no allele frequency). Could default to ".\" but maybe not needed.
+
+Simplify: Use "bcftools query -f '%CHROM\t%POS0\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz | awk -v sample="${sample}" '{print sample "\t" $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5}' >> collapsed.tsv
+
+But need to ensure header. We'll add header before loop.
+
+Now idempotency: At start, check if results/collapsed.tsv exists and is non-empty; if so, maybe skip everything? But we also need to ensure all per-sample outputs exist. Could check for each sample .bam existence; if any missing, proceed; else if all present, just exit 0.
+
+Implementation details:
+
+- Use set -euo pipefail.
+- Define THREADS=4 (but not required to be variable; just use -t 4 in commands).
+- Use list of samples: SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+- For each sample, define R1 and R2 files: data/raw/${sample}_1.fq.gz etc.
+
+- Alignment step:
+   - If results/${sample}.bam exists, skip.
+   - Else run:
+        bwa mem -t 4 data/ref/chrM.fa ${R1} ${R2} | samtools view -@ 4 -b - > results/${sample}.bam
+        samtools sort -@ 4 -o results/${sample}.sorted.bam results/${sample}.bam   # maybe not needed; but index expects sorted? Actually samtools index works on any BAM but better to have sorted. We can just index the unsorted BAM; it's okay.
+        samtools index results/${sample}.bam
+
+- Variant calling step:
+   - If results/${sample}.vcf.gz exists, skip.
+   - Else run:
+        samtools mpileup -f data/ref/chrM.fa -Ou results/${sample}.bam | bcftools call -mv -Oz -o results/${sample}.vcf.gz
+        tabix -p vcf results/${sample}.vcf.gz
+
+- Index BAM already done.
+
+Potential issues: mpileup may need -d 1000 etc. But okay.
+
+Now collapsed.tsv generation:
+
+- If results/collapsed.tsv exists, skip.
+- Else:
+   - Write header: echo -e "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv
+   - For each sample in ${SAMPLES}; do
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz | while IFS=$'\t' read -r chrom pos ref alt af; do
+            echo -e "${sample}\t${chrom}\t${pos}\t${ref}\t${alt}\t${af}"
+        done >> results/collapsed.tsv
+   - Done
+
+But need to ensure that the while loop inside a pipeline may not preserve exit status? Not critical.
+
+Potential quoting issues: Use printf maybe.
+
+Now idempotency: At script start, after mkdir -p results, we can check if all expected files exist; if so, exit 0. Let's implement:
+
+expected=()
+for s in "${SAMPLES[@]}"; do
+    expected+=("results/${s}.bam")
+    expected+=("results/${s}.bai")
+    expected+=("results/${s}.vcf.gz")
+    expected+=("results/${s}.vcf.gz.tbi") # actually tabix creates .tbi index; but the file is .vcf.gz.tbi? The index file name is .tbi. So we can check existence of .tbi.
+done
+expected+=("results/collapsed.tsv")
+
+if all files exist, then exit 0.
+
+Implementation:
+
+all_exist=true
+for f in "${expected[@]}"; do
+    if [[ ! -e "$f" ]]; then
+        all_exist=false
+        break
+    fi
+done
+if $all_exist; then
+    exit 0
+fi
+
+But need to set a variable.
+
+Simplify: Use a function that checks existence of each required file; if any missing, continue; else after loop, if none missing, exit 0.
+
+Implementation:
+
+missing=0
+for s in "${SAMPLES[@]}"; do
+    for ext in bam bai vcf.gz tbi; do
+        if [[ ! -e "results/${s}.${ext}" ]]; then
+            missing=1
+        fi
+    done
+done
+if [[ $missing -eq 0 && -e "results/collapsed.tsv" ]]; then
+    exit 0
+fi
+
+But we need to also check collapsed.tsv existence.
+
+Better: Check each required file individually; if any missing, break and proceed; else if all present, exit 0.
+
+Implementation:
+
+all_present=true
+for s in "${SAMPLES[@]}"; do
+    for f in "results/${s}.bam" "results/${s}.bai" "results/${s}.vcf.gz" "results/${s}.vcf.gz.tbi"; do
+        if [[ ! -e "$f" ]]; then
+            all_present=false
+        fi
+    done
+done
+if $all_present && [[ -e "results/collapsed.tsv" ]]; then
+    exit 0
+fi
+
+But need to set a flag.
+
+Simplify: Use a loop that checks each required file; if any missing, break out and continue; else after checking all, exit 0.
+
+Implementation:
+
+need_to_run=1
+for s in "${SAMPLES[@]}"; do
+    for f in "results/${s}.bam" "results/${s}.bai" "results/${s}.vcf.gz" "results/${s}.vcf.gz.tbi"; do
+        if [[ ! -e "$f" ]]; then
+            need_to_run=0
+            break 2
+        fi
+    done
+done
+if [[ $need_to_run -eq 1 && -e "results/collapsed.tsv" ]]; then
+    exit 0
+fi
+
+But we also need to generate collapsed.tsv if missing; but if all per-sample files exist but collapsed.tsv missing, we still need to run generation step. So maybe simpler: If any of the required outputs are missing, we need to run; else exit 0.
+
+Thus:
+
+if [[ -e results/collapsed.tsv && -e results/M117-bl.bam && ... ]]; then exit 0; fi
+
+But easier: At start, if all expected files exist (including collapsed.tsv), then exit 0. So we can check each required file existence; if all present, exit 0.
+
+Implementation:
+
+declare -a required=(
+    "results/M117-bl.bam"
+    "results/M117-bl.bai"
+    "results/M117-bl.vcf.gz"
+    "results/M117-bl.vcf.gz.tbi"
+    "results/M117-ch.bam"
+    "results/M117-ch.bai"
+    "results/M117-ch.vcf.gz"
+    "results/M117-ch.vcf.gz.tbi"
+    "results/M117C1-bl.bam"
+    "results/M117C1-bl.bai"
+    "results/M117C1-bl.vcf.gz"
+    "results/M117C1-bl.vcf.gz.tbi"
+    "results/M117C1-ch.bam"
+    "results/M117C1-ch.bai"
+    "results/M117C1-ch.vcf.gz"
+    "results/M117C1-ch.vcf.gz.tbi"
+    "results/collapsed.tsv"
+)
+
+if all files exist, exit 0.
+
+Implementation:
+
+all_exist=1
+for f in "${required[@]}"; do
+    if [[ ! -e "$f" ]]; then
+        all_exist=0
+        break
+    fi
+done
+if (( all_exist )); then
+    exit 0
+fi
+
+Now proceed with processing.
+
+Now need to ensure that we use only allowed tools: bwa, samtools, bcftools, tabix. lofreq not needed; but can be used optionally. We'll stick with bcftools mpileup + call.
+
+Potential issues: samtools view -@ 4 -b - may need -h? Not needed for BAM output.
+
+Now script structure:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Define threads
+THREADS=4
+
+# Sample list
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+# Create results dir
+mkdir -p results
+
+# Idempotency check: if all required files exist, exit 0
+required_files=(
+    "results/M117-bl.bam"
+    "results/M117-bl.bai"
+    "results/M117-bl.vcf.gz"
+    "results/M117-bl.vcf.gz.tbi"
+    "results/M117-ch.bam"
+    "results/M117-ch.bai"
+    "results/M117-ch.vcf.gz"
+    "results/M117-ch.vcf.gz.tbi"
+    "results/M117C1-bl.bam"
+    "results/M117C1-bl.bai"
+    "results/M117C1-bl.vcf.gz"
+    "results/M117C1-bl.vcf.gz.tbi"
+    "results/M117C1-ch.bam"
+    "results/M117C1-ch.bai"
+    "results/M117C1-ch.vcf.gz"
+    "results/M117C1-ch.vcf.gz.tbi"
+    "results/collapsed.tsv"
+)
+all_present=1
+for f in "${required_files[@]}"; do
+    if [[ ! -e "$f" ]]; then
+        all_present=0
+        break
+    fi
+done
+if (( all_present )); then
+    exit 0
+fi
+
+# Loop over samples for alignment and variant calling
+for sample in "${SAMPLES[@]}"; do
+    r1="data/raw/${sample}_1.fq.gz"
+    r2="data/raw/${sample}_2.fq.gz"
+
+    # Alignment
+    if [[ ! -e "results/${sample}.bam" ]]; then
+        echo "Aligning $sample..." >&2  # but we cannot use echo for user-facing prose? The constraint says: Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose. So we must avoid echo. We can redirect errors from commands if they happen, but we shouldn't print messages. So we should not echo anything. Just run commands; if they fail, script will exit due to set -e. That's okay.
+
+        # Actually we need to avoid any output besides tool natural output. So we cannot echo "Aligning $sample..." because that writes to stdout. So remove that line.
+
+        # Just run alignment command directly.
+    fi
+
+    # Run bwa mem
+    bwa mem -t "$THREADS" data/ref/chrM.fa "$r1" "$r2" | samtools view -@ "$THREADS" -b - > "results/${sample}.bam"
+
+    # Index BAM
+    samtools index "results/${sample}.bam"
+
+    # Variant calling
+    if [[ ! -e "results/${sample}.vcf.gz" ]]; then
+        samtools mpileup -f data/ref/chrM.fa -Ou "results/${sample}.bam" | \
+            bcftools call -mv -Oz -o "results/${sample}.vcf.gz"
+        tabix -p vcf "results/${sample}.vcf.gz"
+    fi
+done
+
+# Generate collapsed.tsv if not exists
+if [[ ! -e "results/collapsed.tsv" ]]; then
+    # Write header
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+    for sample in "${SAMPLES[@]}"; do
+        # Query VCF for CHROM POS REF ALT AF
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' "results/${sample}.vcf.gz" |
+        while IFS=$'\t' read -r chrom pos ref alt af; do
+            printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$sample" "$chrom" "$pos" "$ref" "$alt" "$af"
+        done >> results/collapsed.tsv
+    done
+fi
+
+But need to avoid using printf? It's okay; it's a tool. Not prohibited.
+
+Potential issues: The while loop inside pipeline may not preserve variable expansions correctly; but should work.
+
+Need to ensure that the header line is written only once; we used printf to write header then append lines.
+
+Now check for any stray echo or output. We removed all echo statements. The script now has no echo except maybe from commands that naturally emit output (like bcftools call may print nothing). That's fine.
+
+But need to ensure that the script does not produce any extra output on stderr besides natural errors; but set -e will cause exit on error, which prints error messages automatically? Actually bash prints error messages to stderr when a command fails, which is allowed because it's natural output of the tool (error). The constraint says "Do not write to stderr/stdout beyond what tools naturally emit". So it's okay to let errors propagate; they will be printed by the failing command.
+
+Now ensure that we use only tools from inventory: bwa, samtools, bcftools, tabix. All are present.
+
+Potential missing: samtools index may produce .bai file but also prints nothing.
+
+Now need to ensure that the script uses relative paths only; we used data/ref/chrM.fa etc. That's fine.
+
+Now final check: The script must be self-contained and idempotent. It checks for existence of all required files at start and exits if present. However, there is a nuance: If some per-sample outputs exist but collapsed.tsv missing, the script will still run variant calling again? Actually we check for each sample .bam existence before alignment; if .bam exists, skip alignment. But if .vcf.gz missing, we will still run mpileup+call even if .bam exists. That's okay; but idempotent requirement says rerunning on a populated results/ must exit 0 without redoing work or erroring. If collapsed.tsv is missing but other files present, script would not exit early and would attempt to generate collapsed.tsv (which may be fine). But if we run again after having all outputs including collapsed.tsv, the initial check will see all required files exist and exit 0, so no redo.
+
+Thus idempotent.
+
+Now ensure that we don't produce any extra output besides tool natural output. The script uses printf for header; that's okay (tool). It also uses while loop with read; that's fine.
+
+Potential issue: The while loop may not preserve exit status? Not relevant.
+
+Now final script must be exactly one self-contained bash script, no markdown fences, no extra commentary. Provide only the script.
+
+Let's craft final script accordingly.
+
+One more nuance: The required files list includes .vcf.gz.tbi; but tabix creates index file with same basename plus .tbi? Actually tabix command "tabix -p vcf results/${sample}.vcf.gz" creates a .tbi file alongside the .vcf.gz. So we need to check for that file existence: "results/${sample}.vcf.gz.tbi". That's fine.
+
+Now final script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p results
+
+# Idempotency check: if all required outputs exist, exit 0
+required=(
+    "results/M117-bl.bam"
+    "results/M117-bl.bai"
+    "results/M117-bl.vcf.gz"
+    "results/M117-bl.vcf.gz.tbi"
+    "results/M117-ch.bam"
+    "results/M117-ch.bai"
+    "results/M117-ch.vcf.gz"
+    "results/M117-ch.vcf.gz.tbi"
+    "results/M117C1-bl.bam"
+    "results/M117C1-bl.bai"
+    "results/M117C1-bl.vcf.gz"
+    "results/M117C1-bl.vcf.gz.tbi"
+    "results/M117C1-ch.bam"
+    "results/M117C1-ch.bai"
+    "results/M117C1-ch.vcf.gz"
+    "results/M117C1-ch.vcf.gz.tbi"
+    "results/collapsed.tsv"
+)
+all_present=1
+for f in "${required[@]}"; do
+    if [[ ! -e "$f" ]]; then
+        all_present=0
+        break
+    fi
+done
+if (( all_present )); then
+    exit 0
+fi
+
+# Process each sample
+for sample in "${SAMPLES[@]}"; do
+    r1="data/raw/${sample}_1.fq.gz"
+    r2="data/raw/${sample}_2.fq.gz"
+
+    # Align if BAM not present
+    if [[ ! -e "results/${sample}.bam" ]]; then
+        bwa mem -t "$THREADS" data/ref/chrM.fa "$r1" "$r2" | samtools view -@ "$THREADS" -b - > "results/${sample}.bam"
+        samtools index "results/${sample}.bam"
+    fi
+
+    # Variant calling if VCF not present
+    if [[ ! -e "results/${sample}.vcf.gz" ]]; then
+        samtools mpileup -f data/ref/chrM.fa -Ou "results/${sample}.bam" | \
+            bcftools call -mv -Oz -o "results/${sample}.vcf.gz"
+        tabix -p vcf "results/${sample}.vcf.gz"
+    fi
+done
+
+# Generate collapsed.tsv if missing
+if [[ ! -e "results/collapsed.tsv" ]]; then
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' "results/${sample}.vcf.gz" |
+        while IFS=$'\t' read -r chrom pos ref alt af; do
+            printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$sample" "$chrom" "$pos" "$ref" "$alt" "$af"
+        done >> results/collapsed.tsv
+    done
+fi
+
+Check for any prohibited constructs: using while loop inside pipeline; that's okay. Using printf is fine.
+
+Potential issue: The script uses "set -euo pipefail". That's required.
+
+Now ensure no stray echo or output. We removed all echo statements. Good.
+
+One more nuance: The script uses "printf" to write header and lines; that's okay.
+
+Now final answer should be just the script, no markdown fences.

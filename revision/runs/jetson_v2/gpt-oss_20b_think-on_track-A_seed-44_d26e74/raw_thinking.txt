@@ -1,0 +1,128 @@
+We need to produce a bash script following constraints.
+
+Key points:
+
+- Shebang line: #!/usr/bin/env bash
+- set -euo pipefail
+
+- Use THREADS=4 and SAMPLES array.
+
+- Create results dir.
+
+- For each sample, guard steps.
+
+- Reference indexing: bwa index data/ref/chrM.fa if not already .bwt exists. Also samtools faidx.
+
+- Alignment pipeline: bwa mem with RG string using \t escapes as per instructions. Use -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA". Note that inside double quotes we need to escape backslashes? Actually the instruction says use literal two characters \t inside double-quoted string; bwa expands them. So we should write "-R \"@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA\"" but they say do not use $'\t', etc. But using backslash escape in double quotes will produce a literal \t? In bash, inside double quotes, backslash escapes certain characters; \t is not special, so it remains as backslash t. So we can write "-R \"@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA\"" but that would produce a literal backslash t? Actually double quotes treat backslash before certain characters specially: \\, \$, `, ", newline. For other characters, the backslash is preserved. So writing "\\t" results in two characters: backslash and t. Good.
+
+But we need to ensure no actual tab inserted. So we can write:
+
+-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"
+
+Yes.
+
+- Use bwa mem -t 4 -R ... data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ 4 -o results/${sample}.bam -
+
+Guard: [[ -f results/${sample}.bam ]] || { bwa mem ... | samtools sort ... ; }
+
+- Index bam: guard on .bai.
+
+- Variant calling: lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+
+Guard: [[ -f results/${sample}.vcf.gz.tbi ]] || { ... }
+
+But they suggest guard on .vcf or .vcf.gz. We'll use .vcf.gz.tbi sentinel.
+
+- Compression and tabix: bgzip -f results/${sample}.vcf ; tabix -p vcf results/${sample}.vcf.gz
+
+Guard: [[ -f results/${sample}.vcf.gz.tbi ]] || { bgzip -f results/${sample}.vcf && tabix -p vcf results/${sample}.vcf.gz ; }
+
+- Collapsed TSV: always rebuild.
+
+Header line: printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+
+Then loop over samples: bcftools query ... | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+
+Need to ensure bcftools query uses correct format string: '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'
+
+Also need to use tabix index for VCFs.
+
+Edge cases: The script should exit 0 if all outputs exist. Since we guard each step, re-running will skip steps and then rebuild collapsed.tsv. That is fine.
+
+We must not write to stderr/stdout beyond tool output; but using printf writes to stdout. That's okay? They said "Do not write to stderr/stdout beyond what tools naturally emit". Using printf might violate that. But maybe it's acceptable because it's minimal. However they say "Do not use echo for user-facing prose." Printf is also a command; but printing header may be considered output. Might be okay. But we can redirect to /dev/null? No, we need the file.
+
+We could use `printf` which writes to stdout; that's fine as it's part of script's normal operation. It's not "user-facing prose" maybe acceptable.
+
+But they said "Do not write to stderr/stdout beyond what tools naturally emit". That might mean avoid any extraneous output. Using printf will produce output to stdout, but we redirect it to file via > results/collapsed.tsv, so no output to console. So it's fine.
+
+Similarly the awk command writes to file via >>.
+
+Thus script should be okay.
+
+We must ensure that bgzip is available; tool inventory includes bcftools and tabix, but not bgzip explicitly. However bgzip is part of htslib and usually installed with samtools or bcftools. But it's not listed in TOOL_INVENTORY. The plan uses bgzip. But we can use `samtools view -b`? Actually bgzip is part of samtools/htslib; but not explicitly listed. However the inventory includes tabix, which requires bgzip. Usually bgzip is installed with htslib and accessible as bgzip. It's likely available. We'll assume.
+
+Alternatively we could use `bcftools view -O z` to compress VCF. But plan uses bgzip. Let's stick with bgzip.
+
+Also need to ensure that the script uses correct quoting for awk: 'BEGIN{OFS="\t"}{print s,$0}'.
+
+Now produce final script.
+
+Let's write:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Reference indexing
+if [[ ! -f data/ref/chrM.fa.bwt ]]; then
+    bwa index data/ref/chrM.fa
+fi
+
+if [[ ! -f data/ref/chrM.fa.fai ]]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    # Alignment and sort
+    if [[ ! -f results/${sample}.bam ]]; then
+        bwa mem -t ${THREADS} -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+            data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+        samtools sort -@ ${THREADS} -o results/${sample}.bam -
+    fi
+
+    # BAM index
+    if [[ ! -f results/${sample}.bam.bai ]]; then
+        samtools index -@ ${THREADS} results/${sample}.bam
+    fi
+
+    # Variant calling with LoFreq
+    if [[ ! -f results/${sample}.vcf.gz.tbi ]]; then
+        lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa \
+            -o results/${sample}.vcf results/${sample}.bam
+    fi
+
+    # Compress and index VCF
+    if [[ ! -f results/${sample}.vcf.gz.tbi ]]; then
+        bgzip -f results/${sample}.vcf
+        tabix -p vcf results/${sample}.vcf.gz
+    fi
+done
+
+# Build collapsed TSV
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' \
+        results/${sample}.vcf.gz | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+
+That's it.
+
+Check for any missing tools: bgzip may not be available; but we can use `samtools view`? Actually bcftools has `bcftools norm -Oz`. But plan uses bgzip. We'll keep as is.
+
+Also need to ensure that the script uses correct quoting for awk: 'BEGIN{OFS="\t"}{print s,$0}'. That's fine.
+
+Now produce final answer with only script.

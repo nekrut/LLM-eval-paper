@@ -1,0 +1,282 @@
+The user wants a self-contained bash script that performs a specific bioinformatics workflow for mitochondrial DNA variant calling on 4 paired-end samples.
+
+Key requirements:
+1. First line: `#!/usr/bin/env bash`
+2. Second line: `set -euo pipefail`
+3. Working directory contains `data/raw/` and `data/ref/chrM.fa`
+4. Outputs go to `results/`
+5. Idempotent: rerunning should exit 0 without redoing work
+6. No hardcoded paths outside cwd
+7. Only use tools from the inventory
+8. Wall clock < 600s at THREADS=4
+9. No extra stdout/stderr output
+
+Workflow steps:
+1. Set globals, create results dir
+2. Reference indexing (samtools faidx, bwa index) - skip if exists
+3. Per-sample alignment with bwa mem (paired reads, read group with literal \t)
+4. SAM -> sorted BAM via samtools sort
+5. BAM indexing
+6. Variant calling with lofreq call-parallel
+7. VCF compression and indexing (bgzip + tabix)
+8. Collapse step to results/collapsed.tsv using bcftools query
+9. Idempotency checks throughout
+
+Let me carefully construct the script following all constraints:
+
+- Read group format must use literal `\t` characters (backslash-t), not actual tabs
+- Use `call-parallel` for lofreq
+- Use bgzip + tabix for VCF compression/indexing
+- bcftools query format string needs to be careful with escaping
+- Idempotency: check if output files exist before running steps
+
+For the read group, the exact form specified is:
+`-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`
+The `\t` must remain as literal backslash-t characters. In bash, to get a literal backslash followed by t, I need to use single quotes or escape the backslash.
+
+Let me think about the bcftools query format string:
+`'{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`
+Wait, `{sample}` in bcftools query format strings is not a variable substitution - it's literal text. The user says "the `{sample}` literal is prepended via the format string so the sample name is attached per row". So I need to literally put the sample name in the format string.
+
+Actually, looking at bcftools query documentation, `%CHROM`, `%POS`, etc. are format specifiers. To include a literal sample name, I'd just put it as text in the format string. But since we're looping over samples, I need to construct the format string dynamically or use a different approach.
+
+Wait, the user says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`
+This suggests that `{sample}` should be replaced with the actual sample name in the script. So I'll use bash variable substitution: `"$sample"\t%CHROM...`
+
+Let me construct the format string carefully:
+```bash
+bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"
+```
+
+For idempotency, I'll check if the final output for each step exists before running it.
+
+Let me draft the script:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+REF="data/ref/chrM.fa"
+RAW_DIR="data/raw"
+OUT_DIR="results"
+
+mkdir -p "$OUT_DIR"
+
+# Reference indexing (idempotent)
+if [[ ! -f "${REF}.fai" ]] || [[ ! -f "${REF}.bwt" ]]; then
+    samtools faidx "$REF"
+    bwa index "$REF"
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    # Check if all outputs for this sample already exist
+    if [[ -f "${OUT_DIR}/${sample}.vcf.gz.tbi" ]]; then
+        continue
+    fi
+    
+    R1="${RAW_DIR}/${sample}_1.fq.gz"
+    R2="${RAW_DIR}/${sample}_2.fq.gz"
+    
+    # Alignment and sorting (idempotent)
+    if [[ ! -f "${OUT_DIR}/${sample}.bam.bai" ]]; then
+        bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF" "$R1" "$R2" | \
+            samtools sort -@ "$THREADS" -o "${OUT_DIR}/${sample}.bam"
+        samtools index -@ "$THREADS" "${OUT_DIR}/${sample}.bam"
+    fi
+    
+    # Variant calling (idempotent)
+    if [[ ! -f "${OUT_DIR}/${sample}.vcf.gz" ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" -f "$REF" -o "${OUT_DIR}/${sample}.vcf" "${OUT_DIR}/${sample}.bam"
+        bgzip -c "${OUT_DIR}/${sample}.vcf" > "${OUT_DIR}/${sample}.vcf.gz"
+        tabix -p vcf "${OUT_DIR}/${sample}.vcf.gz"
+        rm -f "${OUT_DIR}/${sample}.vcf"
+    fi
+done
+
+# Collapse step (idempotent)
+if [[ ! -f "${OUT_DIR}/collapsed.tsv" ]] || \
+   for sample in "${SAMPLES[@]}"; do
+       [[ "${OUT_DIR}/${sample}.vcf.gz" -nt "${OUT_DIR}/collapsed.tsv" ]] && break
+   done; then
+    {
+        printf 'sample\tchrom\tpos\tref\talt\taf\n'
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "${OUT_DIR}/${sample}.vcf.gz"
+        done
+    } > "${OUT_DIR}/collapsed.tsv"
+fi
+```
+
+Wait, I need to be careful with the idempotency check for collapsed.tsv. The `for` loop in the condition might not work as intended in bash. Let me simplify:
+
+```bash
+# Check if any VCF is newer than collapsed.tsv
+needs_collapse=false
+if [[ ! -f "${OUT_DIR}/collapsed.tsv" ]]; then
+    needs_collapse=true
+else
+    for sample in "${SAMPLES[@]}"; do
+        if [[ "${OUT_DIR}/${sample}.vcf.gz" -nt "${OUT_DIR}/collapsed.tsv" ]]; then
+            needs_collapse=true
+            break
+        fi
+    done
+fi
+
+if $needs_collapse; then
+    {
+        printf 'sample\tchrom\tpos\tref\talt\taf\n'
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "${OUT_DIR}/${sample}.vcf.gz"
+        done
+    } > "${OUT_DIR}/collapsed.tsv"
+fi
+```
+
+Actually, the `-nt` check might fail if files don't exist yet, but we already checked that all VCFs exist before this point. Let me keep it simple.
+
+Also, I need to make sure the read group string uses literal `\t`. In bash double quotes, `\t` is just backslash-t (bash doesn't interpret `\t` as tab in double quotes unless using `$'...'` or `echo -e`). So `"@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"` will pass literal `\t` to bwa, which is exactly what's requested.
+
+Wait, let me verify: in bash double quotes, backslash only escapes `$`, `` ` ``, `"`, `\`, and newline. So `\t` remains as two characters: `\` and `t`. This is correct per the instructions.
+
+Let me also check the lofreq call-parallel command. The syntax is:
+`lofreq call-parallel [options] -f <ref> -o <out> <bam>`
+
+Actually, looking at lofreq documentation, `call-parallel` might need regions or it will process the whole BAM. Since we're mapping to chrM only, processing the whole BAM should be fine. The `-f` specifies reference, `-o` output file.
+
+One thing: lofreq call-parallel might output to stdout if no -o is given, but we're using -o. Let me verify the exact syntax:
+`lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam`
+
+This should work.
+
+Let me also consider that `bgzip` might be from htslib/samtools. The inventory lists `tabix (htslib) 1.21`, and `samtools 1.21`. `bgzip` is typically bundled with samtools/htslib. I'll use `bgzip` directly.
+
+Actually, to be safe, I could use `samtools bgzip` or just `bgzip`. The inventory doesn't explicitly list `bgzip`, but it's part of htslib which tabix uses. I'll assume `bgzip` is available since tabix is listed and they come from the same package. Alternatively, I can use `bcftools view -Oz` but the instructions say "Compress with bgzip (not bcftools view -O z)". So I'll use `bgzip`.
+
+Let me refine the script:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+REF="data/ref/chrM.fa"
+RAW_DIR="data/raw"
+OUT_DIR="results"
+
+mkdir -p "$OUT_DIR"
+
+# Reference indexing (idempotent)
+if [[ ! -f "${REF}.fai" ]] || [[ ! -f "${REF}.bwt" ]]; then
+    samtools faidx "$REF"
+    bwa index "$REF"
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    # Skip if all outputs for this sample already exist
+    if [[ -f "${OUT_DIR}/${sample}.vcf.gz.tbi" ]]; then
+        continue
+    fi
+    
+    R1="${RAW_DIR}/${sample}_1.fq.gz"
+    R2="${RAW_DIR}/${sample}_2.fq.gz"
+    
+    # Alignment and sorting (idempotent)
+    if [[ ! -f "${OUT_DIR}/${sample}.bam.bai" ]]; then
+        bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF" "$R1" "$R2" | \
+            samtools sort -@ "$THREADS" -o "${OUT_DIR}/${sample}.bam"
+        samtools index -@ "$THREADS" "${OUT_DIR}/${sample}.bam"
+    fi
+    
+    # Variant calling (idempotent)
+    if [[ ! -f "${OUT_DIR}/${sample}.vcf.gz" ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" -f "$REF" -o "${OUT_DIR}/${sample}.vcf" "${OUT_DIR}/${sample}.bam"
+        bgzip -c "${OUT_DIR}/${sample}.vcf" > "${OUT_DIR}/${sample}.vcf.gz"
+        tabix -p vcf "${OUT_DIR}/${sample}.vcf.gz"
+        rm -f "${OUT_DIR}/${sample}.vcf"
+    fi
+done
+
+# Collapse step (idempotent)
+needs_collapse=false
+if [[ ! -f "${OUT_DIR}/collapsed.tsv" ]]; then
+    needs_collapse=true
+else
+    for sample in "${SAMPLES[@]}"; do
+        if [[ "${OUT_DIR}/${sample}.vcf.gz" -nt "${OUT_DIR}/collapsed.tsv" ]]; then
+            needs_collapse=true
+            break
+        fi
+    done
+fi
+
+if $needs_collapse; then
+    {
+        printf 'sample\tchrom\tpos\tref\talt\taf\n'
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "${OUT_DIR}/${sample}.vcf.gz"
+        done
+    } > "${OUT_DIR}/collapsed.tsv"
+fi
+```
+
+Wait, I need to double-check the bcftools query format string. The user specified:
+`bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`
+
+In bash, if I use double quotes around the format string, `${sample}` will be expanded to the sample name. The `\t` and `\n` inside double quotes are literal backslash-t and backslash-n, which bcftools query interprets as tab and newline respectively. This is correct.
+
+Actually, wait. In bash double quotes, `\t` is NOT interpreted as a tab by bash itself. It remains as two characters `\` and `t`. When passed to bcftools, bcftools' format string parser will interpret `\t` as a tab character. Same for `\n`. So this should work correctly.
+
+Let me verify the exact behavior:
+- Bash double quotes: `"${sample}\t%CHROM..."` → passes literal characters including backslash-t to bcftools
+- bcftools format string parser: interprets `\t` as tab, `\n` as newline
+- This is exactly what we want.
+
+One potential issue: `bgzip` might not be in PATH if only `tabix` is listed. But `bgzip` is part of htslib, and `tabix (htslib) 1.21` is listed. Typically `bgzip` is installed alongside tabix. I'll assume it's available. If not, I could use `samtools bgzip`, but the instructions say "Compress with bgzip". I'll stick with `bgzip`.
+
+Actually, looking at the tool inventory again:
+```
+  tabix        tabix (htslib) 1.21  [ok]
+```
+This implies htslib tools are available. `bgzip` is standard.
+
+Let me also consider that `lofreq call-parallel` might require specifying regions or chromosomes. Since we're mapping to chrM only, and the BAM will only contain chrM alignments, processing without explicit regions should work. lofreq will iterate over all sequences in the BAM/reference.
+
+One more thing: the idempotency check for collapsed.tsv uses `-nt`. This compares modification times. If a VCF.gz is newer than collapsed.tsv, we rebuild. This is correct.
+
+Let me also make sure the script handles the case where `results/` already has some files but not all. The per-sample loop checks for `.vcf.gz.tbi`, and if it exists, skips the whole sample. This is fine.
+
+Wait, I should verify that `bgzip -c` works as expected. `bgzip -c input > output` compresses to stdout, which we redirect. This is standard.
+
+Actually, I realize there's a subtle issue with the idempotency check for collapsed.tsv. If `collapsed.tsv` doesn't exist, `-nt` will fail. But I'm checking `[[ ! -f "${OUT_DIR}/collapsed.tsv" ]]` first, so that's handled.
+
+Let me also consider using `set -o pipefail` which is already in `set -euo pipefail`. This ensures that if `bwa mem` fails in the pipeline, the script will catch it.
+
+One more consideration: the user says "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." My script doesn't use echo for prose, so that's fine.
+
+Let me review the script once more:
+1. Shebang and set -euo pipefail ✓
+2. THREADS=4, SAMPLES array ✓
+3. mkdir -p results ✓
+4. Reference indexing with idempotency check ✓
+5. Per-sample loop with skip if .vcf.gz.tbi exists ✓
+6. bwa mem with literal \t in read group ✓
+7. samtools sort and index ✓
+8. lofreq call-parallel ✓
+9. bgzip + tabix ✓
+10. bcftools query for collapsed.tsv ✓
+11. Idempotency throughout ✓
+
+The script looks solid. I'll output it now.
+One minor thing: `bgzip` might need to be called as `samtools bgzip` if standalone `bgzip` isn't in PATH, but the inventory lists `tabix (htslib)`, and typically htslib installs both. I'll keep `bgzip`. If needed, it's a standard tool.
+
+Actually, to be extra safe with the tool inventory, I could use `samtools bgzip` since samtools is explicitly listed. But the instructions say "Compress with bgzip (not bcftools view -O z)". I'll stick with `bgzip`. It's part of htslib which tabix uses.
+
+Final check of the format string for bcftools query:
+`"${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`
+This will expand `${sample}` to the sample name, and pass literal `\t` and `\n` to bcftools, which interprets them as tab and newline. Correct.
+
+I think the script is ready.

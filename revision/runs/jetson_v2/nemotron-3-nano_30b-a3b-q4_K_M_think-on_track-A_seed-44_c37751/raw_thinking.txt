@@ -1,0 +1,222 @@
+We need to output only the script, no extra text. Must start with #!/usr/bin/env bash then set -euo pipefail on second line. Then implement workflow as described.
+
+Key points:
+
+- Use THREADS=4 and SAMPLES array.
+- Create results dir.
+- For each sample in "${SAMPLES[@]}"; do ... done.
+- Steps inside loop must be guarded appropriately.
+
+We need to ensure idempotency: check sentinel files exist before running steps. For step 1 and 2 indexing, they are outside per-sample loop; but we can guard them globally before loop or within loop? The plan says guard for each final output. Since indexing is shared across samples, we can guard before loop (outside). But script must be idempotent: if results/ already populated, exit 0 without error. So we need to check if all required outputs exist; if so, just continue.
+
+Simplify: At top after creating results dir, we can check if all final files exist; if yes, exit 0. But requirement: "rerunning on a populated results/ directory must exit 0 without redoing work or erroring." So we can early exit if all needed files are present. However they want per-sample steps wrapped in loop with guards. We'll implement guard inside each step.
+
+Implementation plan:
+
+- After set -euo pipefail, define THREADS=4 and SAMPLES array.
+- mkdir -p results
+- Index reference: check if data/ref/chrM.fa.bwt exists; if not, run bwa index.
+- samtools faidx guard similarly.
+
+- Then loop over samples:
+   - Guard for results/{sample}.bam existence; if exists skip alignment step.
+   - Run alignment pipeline with guard: [[ -f results/${sample}.bam ]] || { ... }
+   - Then index BAM: guard for .bai
+   - Variant calling: guard for .vcf.gz.tbi (or .vcf.gz) to decide whether to run lofreq.
+   - Then compress and tabix similarly with guard.
+
+- Finally collapsed.tsv: always rebuild. So we can just overwrite header then append per sample using bcftools query and awk.
+
+Need to be careful about quoting of -R argument: Use double quotes around the whole -R value, include \t as literal backslash + t inside the string. Example:
+
+-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"
+
+But need to escape $? Actually we can use single quotes around the whole -R argument and embed ${sample} via double quotes? The plan says use double-quoted argument for -R, with \t inside. In bash, we can do:
+
+-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"
+
+But need to ensure that the whole -R value is a single double-quoted string. So we can write:
+
+bwa mem -t 4 -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa "${sample}_1.fq.gz" "${sample}_2.fq.gz"
+
+But we need to use the fastq files from data/raw/. So we can reference as data/raw/${sample}_1.fq.gz etc.
+
+The pipeline: bwa mem ... | samtools sort -@ 4 -o results/${sample}.bam -
+
+We need to guard that whole pipeline only runs if output missing. Use braces with a subshell? The plan says wrap the whole pipeline in braces so the guard covers both stages. So we can do:
+
+[[ -f results/${sample}.bam ]] || {
+  bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ 4 -o results/${sample}.bam -
+}
+
+But need to ensure that the pipeline's exit status is considered; set -e will cause script to exit if any command fails, but inside braces we may want to capture errors. Using set -e with pipefail ensures that if any part fails, script exits. That's okay.
+
+Similarly for samtools index guard.
+
+For lofreq call: guard for results/${sample}.vcf.gz.tbi existence; if not, run lofreq call-parallel ... -o results/${sample}.vcf results/${sample}.bam . But note that step 6 will compress and tabix after. The guard should check if .vcf.gz.tbi exists; if not, then run lofreq (which outputs uncompressed .vcf). However we also need to ensure that if .vcf exists but .vcf.gz.tbi missing, we still need to run compression step? Actually the guard for lofreq should be based on whether .vcf.gz.tbi exists; if not, then run lofreq (which may produce .vcf). But also need to handle case where .vcf exists but .vcf.gz.tbi missing; that can happen if previous run was interrupted after lofreq but before compression. So guard should check for .vcf.gz.tbi; if missing, run lofreq then bgzip and tabix.
+
+But the plan says combined guard: [[ -f results/${sample}.vcf.gz.tbi ]] || { bgzip -f results/${sample}.vcf && tabix -p vcf results/${sample}.vcf.gz ; } but that assumes .vcf exists. However they also said guard for lofreq: check both .vcf or .vcf.gz existence; but we can simplify: if .vcf.gz.tbi missing, then run lofreq (if not already done) and then compress+index. To avoid duplication, we can just check if .vcf.gz.tbi exists; if not, then run lofreq (ensuring .vcf output may be removed by previous bgzip? Actually bgzip deletes .vcf after creating .vcf.gz). So we need to ensure that if .vcf.gz.tbi missing, we run lofreq to produce .vcf, then bgzip and tabix. But we also need to avoid running lofreq if .vcf already exists but .vcf.gz.tbi missing? That's okay; lofreq will overwrite .vcf.
+
+Simplify: In loop, after alignment and indexing, we can run:
+
+if [[ ! -f results/${sample}.vcf.gz.tbi ]]; then
+  # ensure .vcf exists (maybe from previous incomplete)
+  lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+  bgzip -f results/${sample}.vcf
+  tabix -p vcf results/${sample}.vcf.gz
+fi
+
+But we need to guard lofreq call as well: maybe check if .vcf exists? But not required; we can just run lofreq each time when .vcf.gz.tbi missing; it will produce .vcf (overwrites). That's fine.
+
+Thus we can implement:
+
+[[ -f results/${sample}.vcf.gz.tbi ]] || {
+  lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+  bgzip -f results/${sample}.vcf
+  tabix -p vcf results/${sample}.vcf.gz
+}
+
+Now collapsed.tsv: after loop, we need to generate header and append per sample. Since step 7 is not guarded, we can do it after the loop (outside). But they said "Do NOT guard this step — always overwrite". So we can just after loop write header then append.
+
+Implementation details:
+
+- Use printf for header: printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+- Then for each sample, use bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+
+But need to ensure that the format string uses single quotes around the format, and includes %CHROM etc. The plan says use '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' inside -f '...'. Actually they said: bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s={sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+
+But we need to embed sample variable into awk command. In bash, we can do:
+
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+
+But note that $0 already contains the fields separated by tabs? Actually bcftools query outputs lines like "chrM    1045    A   T   .   AF=0.5". The format string includes tabs between fields, so output will be tab-separated fields: CHROM<TAB>POS<TAB>REF<TAB>ALT<TAB>AF. Then awk prints s,$0 which adds a leading sample field separated by tab (since OFS="\t"). So final line becomes sample<TAB>CHROM<TAB>POS<TAB>REF<TAB>ALT<TAB>AF. That's correct.
+
+But need to ensure that the bcftools query format string uses single quotes and includes \t and \n as literal characters? Actually they are format specifiers for bcftools, not shell escapes. So we can just write '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' inside single quotes; the \t and \n are interpreted by bcftools as literal tab and newline characters in the output format string. That's fine.
+
+Thus command:
+
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+
+But note that the header line already written with >, so we need to append after that.
+
+Now overall script structure:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Index reference with bwa
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+
+# samtools faidx
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+# Loop over samples
+for sample in "${SAMPLES[@]}"; do
+  # alignment guard
+  [[ -f results/${sample}.bam ]] || {
+    bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ 4 -o results/${sample}.bam -
+  }
+
+  # index guard
+  [[ -f results/${sample}.bam.bai ]] || samtools index -@ 4 results/${sample}.bam
+
+  # variant calling & compression/tabix guard
+  [[ -f results/${sample}.vcf.gz.tbi ]] || {
+    lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+    bgzip -f results/${sample}.vcf
+    tabix -p vcf results/${sample}.vcf.gz
+  }
+done
+
+# collapsed.tsv: overwrite header and append per sample
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+  bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+
+That's the script.
+
+Check constraints:
+
+- No echo, no extra output.
+- Use only tools listed; we use bwa, samtools, lofreq, bgzip, tabix, bcftools, awk, printf. All are in inventory.
+- Use THREADS variable; we set it earlier but not used in lofreq call? Actually lofreq uses --pp-threads 4; we can use ${THREADS} there as well. The plan says use --pp-threads 4; we can hardcode 4 or use variable. It's okay to use variable.
+
+But the plan said "lofreq call-parallel --pp-threads 4". We can just write 4; but using variable is fine.
+
+- Use set -euo pipefail ensures exit on error.
+
+- Idempotency: each step guarded by existence of final output sentinel. For collapsed.tsv we always overwrite, which is okay.
+
+- No hardcoded absolute paths; all relative to cwd.
+
+- Use only tools in inventory; we use awk, printf, but those are standard; not listed but allowed? The inventory didn't list awk or printf, but they are part of coreutils; likely available. The instruction says "Use only tools listed in TOOL_INVENTORY." Actually it says "Do not invoke conda, pip, apt, curl, wget, or any package manager." It doesn't restrict to only those listed; but earlier: "TOOL_INVENTORY (only these are on PATH; pinned versions in conda env 'bench')" So we should only use those tools. awk and printf are part of coreutils, which are present; they are not listed but likely available. However the instruction says "Use only tools listed in TOOL_INVENTORY." That suggests we must restrict to those explicitly listed. The list includes: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. It does not include awk or printf. However awk and printf are part of the system; but maybe they consider them as part of core utilities and allowed? The instruction is ambiguous. But to be safe, we should avoid using awk? Actually we need awk for processing bcftools output. Could we use other tools? We could use cut, sed, etc. But those also not listed. However the plan explicitly uses awk in step 7. So it's expected that awk is available. The instruction "Use only tools listed in TOOL_INVENTORY" might refer to external tools like conda, pip, etc., but they listed many tools including awk? Actually they didn't list awk. But they listed "shellcheck". They didn't list awk or sed. However they said "TOOL_INVENTORY (only these are on PATH; pinned versions in conda env 'bench')". So maybe only those listed are guaranteed to be on PATH, but other standard utilities may also be present. Usually such tasks assume coreutils are available. I think it's safe.
+
+But to strictly follow "Use only tools listed in TOOL_INVENTORY", we might need to avoid awk and printf? However they used awk in the plan description; they didn't forbid using it. The plan says "awk -v s={sample} ..." So they expect awk to be available. So it's okay.
+
+Thus script is fine.
+
+One more detail: In lofreq call, we need to output .vcf (uncompressed). But later step 6 compresses it with bgzip; but the guard for lofreq should ensure that if .vcf.gz.tbi missing, we run lofreq. However after running lofreq, we immediately bgzip and tabix. That's fine.
+
+Potential issue: The guard for lofreq uses [[ -f results/${sample}.vcf.gz.tbi ]] || { ... }. If .vcf.gz.tbi missing, we run lofreq etc. But what if .vcf.gz exists but .tbi missing? Then condition true and we run lofreq again (maybe overwriting .vcf). That's okay.
+
+Now ensure that the script uses ${THREADS} variable for bwa mem -t ${THREADS} and samtools sort -@ ${THREADS}. The plan said use -t 4; we can use variable.
+
+But note that lofreq call uses --pp-threads ${THREADS}; we need to include that.
+
+Thus final script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+for sample in "${SAMPLES[@]}"; do
+  [[ -f results/${sample}.bam ]] || {
+    bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ 4 -o results/${sample}.bam -
+  }
+
+  [[ -f results/${sample}.bam.bai ]] || samtools index -@ 4 results/${sample}.bam
+
+  [[ -f results/${sample}.vcf.gz.tbi ]] || {
+    lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+    bgzip -f results/${sample}.vcf
+    tabix -p vcf results/${sample}.vcf.gz
+  }
+done
+
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+  bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+
+Check that we used correct sentinel files: For step 1, they wanted to check for data/ref/chrM.fa.bwt; we check .bwt. That's fine.
+
+For samtools faidx, we check .fai.
+
+For BAM, check results/${sample}.bam.
+
+For index, check results/${sample}.bam.bai.
+
+For final VCF+TBX, check results/${sample}.vcf.gz.tbi.
+
+All good.
+
+One more nuance: The plan said to guard lofreq call with [[ -f results/{sample}.vcf || -f results/{sample}.vcf.gz ]] || ... but we used .vcf.gz.tbi. That's okay; it's a sentinel for final output.
+
+Now ensure that we didn't use any echo or extra output. We only use printf for header line, which writes to file, not stdout. That's fine.
+
+We used awk; that's okay.
+
+Now produce final answer: just the script, no markdown fences.

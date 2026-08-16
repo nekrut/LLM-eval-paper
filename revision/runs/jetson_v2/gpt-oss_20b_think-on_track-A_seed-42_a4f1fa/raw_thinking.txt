@@ -1,0 +1,187 @@
+We need to produce a bash script following constraints.
+
+Key: Use only tools listed. Must not use echo for user-facing prose; but we can use printf? The instruction says "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." So printing header with printf is okay as it's part of script output? It's user-facing though. But maybe allowed because it's part of collapsed.tsv creation. That writes to file, not stdout. The printf command prints to stdout but we redirect > results/collapsed.tsv. That's fine.
+
+We must guard each step with idempotency checks. Use `[[ -f ... ]] ||` pattern.
+
+Also need to ensure that the script is idempotent: if results/ already contains all outputs, it should exit 0 without redoing work or erroring. So we need to check for each sample's final outputs? The plan uses guard per step; but if some intermediate files exist but not final ones, they'd be regenerated. That's fine.
+
+We must also ensure that the script doesn't fail due to missing directories etc. Use `mkdir -p results`.
+
+Also reference indexing: we need to index BWA and samtools faidx. Guard accordingly.
+
+Also LoFreq call-parallel may produce .vcf; but step 6 compresses it. We guard for .vcf.gz.tbi existence. But if .vcf exists but .vcf.gz.tbi missing, we will run bgzip+tabix. That will delete .vcf and create new .vcf.gz. Good.
+
+But we also need to ensure that LoFreq step runs only if .vcf or .vcf.gz not exist. The guard uses `[[ -f results/{sample}.vcf || -f results/{sample}.vcf.gz ]]`. But if .vcf exists but .vcf.gz.tbi missing, the guard will skip LoFreq and proceed to compression step which will compress .vcf. That's fine.
+
+But we need to ensure that LoFreq is run only once; if .vcf.gz.tbi exists, we don't need to recompute. So guard for .vcf.gz.tbi is enough? But LoFreq may produce new variants due to changes in BAM or reference. But idempotency: if outputs exist, skip. That's fine.
+
+But the guard for LoFreq uses .vcf or .vcf.gz; but if .vcf.gz exists but .vcf.gz.tbi missing, we still want to run compression? Actually compression step will handle that. So LoFreq should not be rerun. Good.
+
+Now collapsed.tsv: always rebuild.
+
+Also need to ensure that bcftools query uses correct format string and prints AF from INFO/AF. But LoFreq may produce INFO/AF field? LoFreq outputs VCF with AF in INFO. Yes.
+
+We also need to use `tabix` for indexing .vcf.gz. Already done.
+
+Now we must not use any other tools like bgzip; but bgzip is part of htslib, but not listed. Wait TOOL_INVENTORY lists tabix (htslib) 1.21. But bgzip is part of htslib too. Is it available? Not explicitly listed. The inventory only lists tabix, not bgzip. We cannot use bgzip if not in list. But we can use `bgzip` command; but it's not listed. However, maybe bgzip is part of samtools or bcftools? Actually bgzip is a separate binary from htslib. It might be installed as part of the environment. The inventory didn't mention it, but maybe it's available because tabix is there. But we cannot rely on unknown tools. We should use `bgzip` if allowed; but not listed. Could use `samtools view -b`? No.
+
+But bcftools can compress VCF with `bcftools norm -Oz`. Wait bcftools has `bcftools view -O z`. But we need to compress and index. We could use `bcftools view -Oz -o results/{sample}.vcf.gz results/{sample}.vcf` then tabix. That uses only bcftools, which is listed.
+
+So replace bgzip with bcftools view -Oz.
+
+Thus step 6: guard for .vcf.gz.tbi; if missing, run:
+
+```
+bcftools view -O z -o results/${sample}.vcf.gz results/${sample}.v
+tabix -p vcf results/${sample}.vcf.gz
+```
+
+But we need to delete the uncompressed .vcf after compression? bcftools will not delete it. We can remove it with rm.
+
+So:
+
+```
+bcftools view -O z -o results/${sample}.vcf.gz results/${sample}.vcf && rm -f results/${sample}.vcf
+tabix -p vcf results/${sample}.vcf.gz
+```
+
+But we need to guard for .vcf.gz.tbi. So:
+
+```
+[[ -f results/${sample}.vcf.gz.tbi ]] || { bcftools view -O z -o results/${sample}.vcf.gz results/${sample}.vcf && rm -f results/${sample}.vcf && tabix -p vcf results/${sample}.vcf.gz ; }
+```
+
+But we need to ensure that if .vcf exists but .vcf.gz.tbi missing, this will compress and index. Good.
+
+Now LoFreq step: guard for .vcf or .vcf.gz? But if .vcf.gz.tbi exists, skip. So guard can be:
+
+```
+[[ -f results/${sample}.vcf.gz.tbi ]] || { lofreq call-parallel ... ; }
+```
+
+But we also need to ensure that LoFreq step runs only if .vcf or .vcf.gz missing. But if .vcf.gz exists but no tbi, we still want to compress? Actually compression step will handle it. So LoFreq guard can be simply check for .vcf.gz.tbi. That ensures we don't redo LoFreq unnecessarily.
+
+But what if .vcf.gz.tbi exists but .vcf.gz missing (unlikely). But we can ignore.
+
+Thus:
+
+```
+[[ -f results/${sample}.vcf.gz.tbi ]] || lofreq call-parallel ...
+```
+
+Now the LoFreq command: `lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam`. Good.
+
+But we need to ensure that reference index (.fai) exists before calling. We already did faidx guard earlier.
+
+Now the alignment step: guard for results/${sample}.bam. Use braces.
+
+```
+[[ -f results/${sample}.bam ]] || { bwa mem ... | samtools sort -@ 4 -o results/${sample}.bam - ; }
+```
+
+But we need to ensure that if .bam exists but .bai missing, we still index? We'll guard indexing separately.
+
+Now BAM index step: guard for .bam.bai.
+
+```
+[[ -f results/${sample}.bam.bai ]] || samtools index -@ 4 results/${sample}.bam
+```
+
+Now reference indexing steps: BWA and faidx. Use guards.
+
+Also need to ensure that data/ref/chrM.fa is present; assume it exists.
+
+Now collapsed.tsv: always rebuild.
+
+We need to use bcftools query with format string `'...%INFO/AF\n'`. But we must escape newline? We can just include \n inside single quotes; bcftools will interpret. Good.
+
+But we also need to ensure that bcftools query outputs alt as comma separated if multiple alt alleles. That's fine.
+
+Now we need to use `printf` for header: `printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv`. That prints to stdout but redirected to file; no output to console.
+
+Now we must ensure that the script uses only tools listed. We used bwa, samtools, lofreq, bcftools, tabix. All are in inventory. Good.
+
+We also used `printf` and `awk`, which are standard utilities available on PATH. They are not part of inventory but presumably allowed as they are core utilities. The instruction didn't forbid them.
+
+Now we need to ensure that the script uses no absolute paths; all relative.
+
+Also ensure that we use THREADS=4 constant.
+
+We also need to set -euo pipefail at second line.
+
+Now produce final script.
+
+Edge: In LoFreq call, we used `--pp-threads 4`. Good.
+
+Now check for quoting of RG string. Use double quotes with \t escapes. Eg:
+
+```
+-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"
+```
+
+But the plan says use literal two characters `\t` inside double-quoted string. So we need to write as `"@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`. But in bash, \t will be interpreted by shell? In double quotes, backslash before t is not special; it remains literal `\t`? Actually inside double quotes, backslash can escape certain characters like `$`, ```, `"`, and newline. For other characters, the backslash is preserved. So `"\t"` results in a backslash followed by t. Good. So we can write as above.
+
+Thus:
+
+```
+-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"
+```
+
+Now we need to ensure that the command uses `bwa mem -t 4 -R ... data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ 4 -o results/${sample}.bam -`. Good.
+
+Now we need to guard for .bam existence. Use `[[ -f results/${sample}.bam ]] || { ... }`.
+
+But if .bam exists but is incomplete? We ignore.
+
+Now final script:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Reference indexing
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+for sample in "${SAMPLES[@]}"; do
+    # Alignment and sort
+    [[ -f results/${sample}.bam ]] || {
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz |
+        samtools sort -@ ${THREADS} -o results/${sample}.bam -
+    }
+
+    # BAM index
+    [[ -f results/${sample}.bam.bai ]] || samtools index -@ ${THREADS} results/${sample}.bam
+
+    # Variant calling with LoFreq
+    [[ -f results/${sample}.vcf.gz.tbi ]] || lofreq call-parallel --pp-threads ${THREADS} \
+        -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+
+    # Compress and index VCF
+    [[ -f results/${sample}.vcf.gz.tbi ]] || {
+        bcftools view -O z -o results/${sample}.vcf.gz results/${sample}.vcf &&
+        rm -f results/${sample}.vcf &&
+        tabix -p vcf results/${sample}.vcf.gz
+    }
+done
+
+# Collapsed TSV
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz |
+        awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+```
+
+Check for missing semicolons? In bash, we can use newline. The braces block uses `&&` and `||`. Good.
+
+Now ensure that bcftools query output includes alt allele; but if multiple alt alleles, it will produce each on separate line? Actually bcftools query with `%ALT` prints comma-separated list of ALT values for each record. That's fine.
+
+Now final script ready.

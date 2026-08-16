@@ -1,0 +1,436 @@
+The user wants a bash script that performs variant calling on 4 paired-end MiSeq amplicon samples mapped to human mitochondrial reference (chrM).
+
+Let me break down the workflow:
+1. Index the reference genome (chrM.fa) using bwa index
+2. For each sample:
+   - Align reads using bwa mem
+   - Sort and index BAM files using samtools
+   - Call variants using lofreq call
+   - Compress VCF with bgzip/tabix
+3. Collapse all per-sample VCFs into a single TSV file
+
+Let me think about the details:
+
+**Reference indexing:**
+- `bwa index data/ref/chrM.fa`
+- `samtools faidx data/ref/chrM.fa` (for reference in variant calling)
+
+**Per-sample workflow:**
+For each sample (M117-bl, M117-ch, M117C1-bl, M117C1-ch):
+1. `bwa mem data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -o results/${sample}.bam`
+2. `samtools index results/${sample}.bam`
+3. `lofreq call --bcf -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam`
+4. `bgzip results/${sample}.vcf` → `results/${sample}.vcf.gz`
+5. `tabix -p vcf results/${sample}.vcf.gz`
+
+**Collapsed TSV:**
+- Extract variant info from each VCF and combine into a single TSV with columns: sample, chrom, pos, ref, alt, af
+
+Let me think about idempotency. I need to check if files exist before doing work. I can use `if [ ! -f results/${sample}.bam ]` type checks.
+
+For the collapsed.tsv, I need to parse VCF files. The VCF from lofreq will have FORMAT fields including AF (allele frequency). Let me think about how to extract this.
+
+Actually, let me reconsider the lofreq call command. For mitochondrial data with high coverage, I should probably use appropriate settings. But the user didn't specify particular parameters, so I'll use defaults which should be fine for mtDNA.
+
+Let me think about the VCF parsing for collapsed.tsv:
+- Need to extract: sample name, chrom, pos, ref, alt, af
+- The AF field is in the FORMAT column of the VCF
+
+For bcftools query or awk parsing:
+`bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz`
+
+Wait, I need to be careful. The AF field might not always be present or might have different naming. Let me use bcftools query which is more robust.
+
+Actually, let me think about this more carefully. lofreq call outputs VCF with FORMAT fields. The allele frequency in lofreq is typically stored as AF in the INFO or FORMAT field depending on settings.
+
+Let me use `bcftools query` to extract the needed fields:
+```
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz
+```
+
+But I need to prepend the sample name. Let me use awk for this.
+
+Actually, a cleaner approach:
+```
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz | awk -v s="${sample}" '{print s"\t"$0}'
+```
+
+Wait, the AF field might be in INFO rather than FORMAT for lofreq. Let me check... Actually with `--bcf` flag and default settings, lofreq puts allele frequency in the FORMAT field as AF. But to be safe, I could also check INFO/AF.
+
+Let me use a more robust approach with bcftools query:
+```
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%FORMAT/AF]\n' results/${sample}.vcf.gz
+```
+
+Hmm, actually the syntax for FORMAT fields in bcftools query is `%FORMAT/AF` or just `%AF` if it's unambiguous. Let me use `%AF` which should work.
+
+Actually wait - I need to be careful about multi-allelic sites and the AF field format. For simplicity, let me handle this with awk parsing of the VCF directly, or use bcftools query properly.
+
+Let me think about the structure more carefully:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p results
+
+# Index reference if not already done
+if [ ! -f data/ref/chrM.fa.bwt ]; then
+    bwa index data/ref/chrM.fa
+fi
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+for sample in "${SAMPLES[@]}"; do
+    # Align and sort if BAM doesn't exist
+    if [ ! -f "results/${sample}.bam" ]; then
+        bwa mem data/ref/chrM.fa \
+            "data/raw/${sample}_1.fq.gz" \
+            "data/raw/${sample}_2.fq.gz" | \
+            samtools sort -o "results/${sample}.bam"
+    fi
+    
+    # Index BAM if not done
+    if [ ! -f "results/${sample}.bam.bai" ]; then
+        samtools index "results/${sample}.bam"
+    fi
+    
+    # Call variants if VCF doesn't exist
+    if [ ! -f "results/${sample}.vcf.gz" ]; then
+        lofreq call --bcf -f data/ref/chrM.fa \
+            -o "results/${sample}.vcf" \
+            "results/${sample}.bam"
+        bgzip "results/${sample}.vcf"
+        tabix -p vcf "results/${sample}.vcf.gz"
+    fi
+done
+
+# Create collapsed.tsv if not exists
+if [ ! -f "results/collapsed.tsv" ]; then
+    printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+    
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' \
+            "results/${sample}.vcf.gz" | \
+            awk -v s="${sample}" '{print s"\t"$0}' >> results/collapsed.tsv
+    done
+fi
+```
+
+Wait, I need to think about the AF field more carefully. In lofreq VCF output, the allele frequency might be in different places depending on version and options. Let me check what fields are available.
+
+Actually, with `lofreq call --bcf`, the output VCF has:
+- INFO/AF for allele frequency at the site level
+- FORMAT/AF per-sample allele frequency
+
+Since we're calling per-sample (one BAM at a time), both should be equivalent. Let me use `%INFO/AF` to be explicit, or just `%AF`.
+
+Actually, I realize there might be an issue with multi-allelic sites where AF is a comma-separated list. The bcftools query format `%AF` would output comma-separated values for multi-allelic sites. That should be fine for the TSV.
+
+Let me also consider: should I filter out low-quality variants? The user didn't specify, so I'll include all called variants.
+
+One more thing - the `lofreq call` command might need `-x` or other options for mitochondrial DNA to handle high coverage properly. But without specific instructions, I'll use defaults.
+
+Actually, let me reconsider the bcftools query format string. For multi-allelic sites:
+- `%ALT` gives comma-separated alternate alleles
+- `%AF` gives comma-separated allele frequencies
+
+This should work fine for the TSV output.
+
+Let me also think about whether I need to handle the case where lofreq produces no variants (empty VCF). The bcftools query would just produce no lines, which is fine.
+
+One issue: `bgzip` might not be in the tool inventory directly, but it's part of htslib which comes with samtools/bcftools. Actually, looking at the inventory, I see `tabix (htslib) 1.21` which suggests bgzip should be available as part of htslib. Let me use `bgzip` which should be on PATH.
+
+Actually wait - I should double-check. The tool inventory lists:
+- samtools 1.21
+- bcftools 1.21
+- tabix (htslib) 1.21
+
+bgzip is typically bundled with htslib/samtools, so it should be available. Let me use it.
+
+Let me also think about the `-o` flag for lofreq call. In newer versions of lofreq, the output file specification might differ. With `lofreq call --bcf -f ref.fa -o outfile.vcf infile.bam`, this should work.
+
+Actually, I just realized that `lofreq call` in version 2.1.5 might have slightly different syntax. Let me check... In lofreq 2.x, the command is:
+```
+lofreq call --bcf -f <ref> [-o <outfile>] <infile.bam>
+```
+
+This should work. The `--bcf` flag outputs in BCF/VCF format.
+
+Let me also consider using `lofreq call-parallel` for speed, but since we're dealing with mtDNA (16kb), the whole genome is small enough that parallelization won't help much and might complicate things. Single-threaded call should be fast enough.
+
+One more consideration: the user wants the script to be idempotent. My current approach checks for file existence before doing work, which handles this.
+
+Let me also think about whether I need to clean up intermediate files (like the uncompressed .vcf). Since bgzip creates .vcf.gz and tabix creates .vcf.gz.tbi, I should remove the intermediate .vcf after compression. But actually, bgzip replaces the file with .gz version by default... wait, no. `bgzip input.vcf` creates `input.vcf.gz` and leaves `input.vcf` in place. I need to either use `bgzip -c` and redirect, or remove the original after.
+
+Actually, looking at bgzip behavior: `bgzip file.vcf` creates `file.vcf.gz` and keeps `file.vcf`. So I should add `rm "results/${sample}.vcf"` after bgzip, or use a different approach.
+
+Alternatively, I could pipe lofreq output directly to bgzip:
+```
+lofreq call --bcf -f data/ref/chrM.fa "results/${sample}.bam" | bgzip > "results/${sample}.vcf.gz"
+```
+
+This is cleaner and avoids the intermediate file. Let me use this approach.
+
+Wait, but then I need to make sure the VCF header is properly handled. bgzip should handle streaming fine for VCF/BCF data.
+
+Actually, let me reconsider. The `lofreq call` with `-o` flag writes to a file. If I don't specify `-o`, it writes to stdout. So:
+```
+lofreq call --bcf -f data/ref/chrM.fa "results/${sample}.bam" | bgzip > "results/${sample}.vcf.gz"
+```
+
+This should work and is cleaner.
+
+Let me finalize the script:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p results
+
+# Index reference if needed
+if [ ! -f data/ref/chrM.fa.bwt ]; then
+    bwa index data/ref/chrM.fa
+fi
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+for sample in "${SAMPLES[@]}"; do
+    # Align and sort
+    if [ ! -f "results/${sample}.bam" ]; then
+        bwa mem data/ref/chrM.fa \
+            "data/raw/${sample}_1.fq.gz" \
+            "data/raw/${sample}_2.fq.gz" | \
+            samtools sort -o "results/${sample}.bam"
+    fi
+    
+    # Index BAM
+    if [ ! -f "results/${sample}.bam.bai" ]; then
+        samtools index "results/${sample}.bam"
+    fi
+    
+    # Call variants and compress
+    if [ ! -f "results/${sample}.vcf.gz" ]; then
+        lofreq call --bcf -f data/ref/chrM.fa \
+            "results/${sample}.bam" | \
+            bgzip > "results/${sample}.vcf.gz"
+        tabix -p vcf "results/${sample}.vcf.gz"
+    fi
+done
+
+# Create collapsed.tsv
+if [ ! -f "results/collapsed.tsv" ]; then
+    printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+    
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' \
+            "results/${sample}.vcf.gz" | \
+            awk -v s="${sample}" '{print s"\t"$0}' >> results/collapsed.tsv
+    done
+fi
+```
+
+Hmm, wait. I need to think about the bcftools query format more carefully. The `%AF` field might not exist in all VCFs from lofreq. Let me check what fields lofreq actually outputs.
+
+In lofreq 2.x, the VCF output includes:
+- INFO/AF: allele frequency
+- FORMAT/AD: allele depths
+- FORMAT/DP: total depth
+- etc.
+
+Since we're calling one sample at a time, `%INFO/AF` should give us the allele frequency. Let me use that to be safe:
+
+```
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%INFO/AF]\n'
+```
+
+Actually, I just realized that for single-sample calling, lofreq might put AF in FORMAT rather than INFO. Let me think... In lofreq 2.x with `--bcf`, the allele frequency is typically in both INFO/AF and FORMAT/AF for the single sample case. Using `%AF` without prefix should work as bcftools will resolve it.
+
+Actually, I'm overthinking this. Let me just use `%AF` which bcftools will resolve to either INFO/AF or FORMAT/AF depending on what's available. For single-sample VCFs from lofreq, both should be present and equivalent.
+
+One more thing: I should consider whether the VCF might have no variants (all reference). In that case, bcftools query would output nothing, which is fine - the sample just won't appear in collapsed.tsv (except for the header).
+
+Wait, actually the user wants per-sample variant calling results. If a sample has no variants, it should still potentially be represented... but actually, if there are no variants, there's nothing to add to the TSV. The header is already written. So this is fine.
+
+Let me also think about whether I need to handle the case where lofreq outputs BCF instead of VCF text. The `--bcf` flag in lofreq 2.x actually means "output in VCF/BCF format" (as opposed to the older custom format). When piped to bgzip, it should work fine regardless.
+
+Actually wait - I need to double-check the lofreq call syntax for version 2.1.5. In lofreq 2.x:
+```
+lofreq call [options] <input.bam>
+```
+
+Options include:
+- `-f <ref>`: reference genome
+- `--bcf`: output in VCF/BCF format (default in newer versions)
+- `-o <file>`: output file
+
+So my command should work. Let me verify the pipe to bgzip works correctly.
+
+One potential issue: if lofreq outputs BCF binary format, piping to bgzip might not work correctly because bgzip expects text input for VCF. Actually, bgzip can compress any binary data, but tabix needs a proper index. For BCF files, tabix should still work with `-p vcf`.
+
+Actually, in lofreq 2.x, `--bcf` outputs VCF text format by default (not binary BCF). To get binary BCF, you'd need additional flags. So piping to bgzip should work fine.
+
+Let me also consider adding `-t chrM` or similar region specification to lofreq call to ensure we only call variants on the mitochondrial chromosome. This would speed things up and avoid any issues with reads mapping elsewhere (though for mtDNA reference, all reads should map to chrM).
+
+Actually, since the reference is just chrM, all alignments will be to chrM, so this isn't necessary.
+
+Let me finalize the script. I think it's solid. Let me review once more:
+
+1. mkdir -p results ✓
+2. Index reference (bwa + samtools faidx) with idempotency checks ✓
+3. For each sample: align, sort, index, call variants, compress, index VCF ✓
+4. Create collapsed.tsv with header and per-sample variant data ✓
+
+One thing I want to verify: the bcftools query format string `'%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n'` - the `[...]` syntax means "repeat for each alternate allele". So for a biallelic site with one alt, it outputs one line. For a multiallelic site with two alts, it would output... hmm, actually the `[...]` repeats the content inside for each alt allele. So `%ALT[\t%AF]` would give `A\t0.5,G\t0.3` for a site with two alts. But this is all on one line per variant record.
+
+Wait, I need to reconsider. The bcftools query format:
+- `%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n` 
+
+For a biallelic site (one alt): `chrM  1234  A  G  0.5`
+For a multiallelic site (two alts): `chrM  5678  A  G,T  0.3,0.2`
+
+Actually no, the `[...]` syntax in bcftools query repeats for each element. So `%ALT[\t%AF]` would produce:
+- For one alt: `G\t0.5`
+- For two alts: `G\t0.3,T\t0.2`
+
+All on the same line. This means the TSV would have variable numbers of columns for multiallelic sites, which is problematic.
+
+Let me use a different approach. I'll normalize the VCF first to split multiallelic sites, or handle this differently.
+
+Actually, for mitochondrial DNA, multiallelic sites are relatively rare but possible. Let me use `bcftools norm` to split multiallelics before querying:
+
+```
+bcftools norm -m +any "results/${sample}.vcf.gz" | bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n'
+```
+
+Wait, but this would modify the VCF. I don't want to modify the stored VCF. Let me pipe through norm without saving:
+
+```
+bcftools norm -m +any "results/${sample}.vcf.gz" | bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n'
+```
+
+This should work - it normalizes on the fly and then queries. Each line will have exactly one alt allele after normalization.
+
+Actually, I realize there's another issue. After splitting multiallelics with `bcftools norm -m +any`, the AF values need to be recalculated or properly split. bcftools norm should handle this correctly by splitting the AF values appropriately.
+
+Let me use this approach for robustness:
+
+```bash
+bcftools norm -m +any "results/${sample}.vcf.gz" | \
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' | \
+    awk -v s="${sample}" '{print s"\t"$0}' >> results/collapsed.tsv
+```
+
+Hmm, but actually for simplicity and since mtDNA multiallelics are uncommon, let me just handle the basic case. If there are multiallelic sites, the AF field will be comma-separated which is still informative. The user didn't specify how to handle multiallelics, so I'll keep it simple.
+
+Actually wait, let me reconsider the format string once more. In bcftools query:
+- `%ALT` gives the alternate allele(s), comma-separated for multiallelic sites
+- `%AF` gives the allele frequency(ies), comma-separated for multiallelic sites
+
+So without normalization, a line might look like:
+`chrM  1234  A  G,T  0.5,0.3`
+
+This has 6 tab-separated fields if we count carefully... no wait, the commas are within fields, not tabs. So it's still 6 columns: sample, chrom, pos, ref, alt (G,T), af (0.5,0.3).
+
+Actually that works fine for a TSV! The alt and af columns can contain comma-separated values. This is standard VCF representation. So my original approach is fine without normalization.
+
+Let me stick with the simpler version:
+
+```bash
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' \
+    "results/${sample}.vcf.gz" | \
+    awk -v s="${sample}" '{print s"\t"$0}' >> results/collapsed.tsv
+```
+
+Wait, I just realized there might be an issue with the `%AF` field. In some VCFs from lofreq, the allele frequency might be stored differently. Let me check what's actually in the FORMAT or INFO fields.
+
+In lofreq 2.x VCF output:
+- INFO contains: AF (allele frequency), DP (depth), etc.
+- FORMAT contains: AD (allele depths), DP (sample depth), etc.
+
+So `%INFO/AF` should work. Let me use that to be explicit:
+
+```bash
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%INFO/AF]\n' \
+    "results/${sample}.vcf.gz" | \
+    awk -v s="${sample}" '{print s"\t"$0}' >> results/collapsed.tsv
+```
+
+Actually, I just tested mentally: `%AF` without prefix in bcftools query will look for AF in INFO first, then FORMAT. Since lofreq puts AF in INFO, `%AF` should work fine. Let me keep it simple with `%AF`.
+
+One more consideration: the user wants `af` (lowercase) in the output. My header uses lowercase which is correct.
+
+Let me also think about whether I need to filter variants by quality or other criteria. The user didn't specify, so I'll include all called variants.
+
+Final script:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p results
+
+# Index reference if needed
+if [ ! -f data/ref/chrM.fa.bwt ]; then
+    bwa index data/ref/chrM.fa
+fi
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+for sample in "${SAMPLES[@]}"; do
+    # Align and sort
+    if [ ! -f "results/${sample}.bam" ]; then
+        bwa mem data/ref/chrM.fa \
+            "data/raw/${sample}_1.fq.gz" \
+            "data/raw/${sample}_2.fq.gz" | \
+            samtools sort -o "results/${sample}.bam"
+    fi
+    
+    # Index BAM
+    if [ ! -f "results/${sample}.bam.bai" ]; then
+        samtools index "results/${sample}.bam"
+    fi
+    
+    # Call variants and compress
+    if [ ! -f "results/${sample}.vcf.gz" ]; then
+        lofreq call --bcf -f data/ref/chrM.fa \
+            "results/${sample}.bam" | \
+            bgzip > "results/${sample}.vcf.gz"
+        tabix -p vcf "results/${sample}.vcf.gz"
+    fi
+done
+
+# Create collapsed.tsv
+if [ ! -f "results/collapsed.tsv" ]; then
+    printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+    
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' \
+            "results/${sample}.vcf.gz" | \
+            awk -v s="${sample}" '{print s"\t"$0}' >> results/collapsed.tsv
+    done
+fi
+```
+
+This looks good. Let me verify the idempotency:
+- Reference indexing: checked for .bwt and .fai files ✓
+- BAM creation: checked for .bam file ✓
+- BAM indexing: checked for .bai file ✓
+- VCF creation: checked for .vcf.gz file ✓
+- collapsed.tsv: checked for file existence ✓
+
+The script should exit 0 on rerun without redoing work.
+
+One thing I want to double-check: does `lofreq call` write to stdout when no `-o` is specified? Yes, in lofreq 2.x, if no output file is specified with `-o`, it writes to stdout. This allows piping to bgzip.
+
+I think this script is complete and correct. Let me output it.

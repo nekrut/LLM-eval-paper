@@ -1,0 +1,647 @@
+The user wants a self-contained bash script that performs a specific bioinformatics workflow for mitochondrial DNA variant calling on 4 paired-end samples.
+
+Key constraints:
+1. First line: `#!/usr/bin/env bash`
+2. Second line: `set -euo pipefail`
+3. Working directory contains `data/raw/` and `data/ref/chrM.fa`
+4. Outputs go to `results/`
+5. Idempotent: rerunning should exit 0 without redoing work
+6. No hardcoded paths outside cwd
+7. Only use tools in TOOL_INVENTORY
+8. Wall-clock < 600s at THREADS=4
+9. No extra stdout/stderr output
+
+Workflow steps:
+1. Set globals, create results dir
+2. Reference indexing (samtools faidx, bwa index) - skip if exists
+3. Per-sample alignment with bwa mem (paired FASTQs, read group with literal `\t`)
+4. SAM -> sorted BAM via samtools sort
+5. BAM indexing via samtools index
+6. Variant calling with lofreq call-parallel
+7. VCF compression (bgzip) and indexing (tabix), remove intermediate .vcf
+8. Collapse to TSV using bcftools query, prepend header
+9. Idempotency checks throughout
+
+Let me carefully construct the script following all constraints:
+
+- THREADS=4
+- Samples: M117-bl M117-ch M117C1-bl M117C1-ch
+- Read group format: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"` with literal backslash-t
+- lofreq call-parallel invocation as specified
+- bgzip and tabix for VCF
+- bcftools query for collapsing
+- Idempotency guards using file existence/timestamp checks
+
+For idempotency, I'll check if the final artifact for each step exists before running. For example:
+- Reference indexing: check if .fai and bwa index files exist
+- BAM: check if results/{sample}.bam.bai exists (implies bam exists)
+- VCF: check if results/{sample}.vcf.gz.tbi exists
+- collapsed.tsv: check if it exists and is newer than all input VCFs
+
+Let me write this carefully.
+
+For the read group, the prompt says:
+"exact form: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`"
+"The `\t` must remain the two characters backslash and `t` — bwa parses them itself."
+
+So in bash, I need to make sure the string contains literal `\t`. In double quotes, `\t` is just `\t` (bash doesn't interpret it unless using `$'...'` or `echo -e`). So `"@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"` should work.
+
+Wait, let me verify: in bash double quotes, backslash only escapes `$`, `` ` ``, `"`, `\`, and newline. So `\t` remains as literal backslash-t. Good.
+
+For lofreq call-parallel, the plan says:
+```
+lofreq call-parallel --pp-threads 4 --verbose
+--ref data/ref/chrM.fa --out results/{sample}.vcf
+--sig
+--bonf
+results/{sample}.bam
+```
+But also says "(The bare `--sig` and `--bonf` lines come from Galaxy-runtime-supplied values; you can omit them and use lofreq's defaults."
+
+I'll include them as specified but it doesn't matter much. The key is the positional argument at the end.
+
+For bgzip, I need to make sure I'm using the right tool. `bgzip` is typically part of htslib/samtools. It should be available. Actually, `bgzip` might not be explicitly in the inventory, but it's part of samtools/htslib. The inventory lists `tabix (htslib) 1.21`, so bgzip should be there too. Alternatively, I could use `bcftools view -O z` but the plan says "Compress with `bgzip` (not `bcftools view -O z`)".
+
+Let me check if `bgzip` is available. It's part of htslib which comes with samtools/tabix. I'll assume it's on PATH.
+
+For idempotency of collapsed.tsv:
+"Rebuild only if any input VCF is newer than the TSV."
+I can use `find` or compare timestamps with `[[ file1 -nt file2 ]]`.
+
+Let me structure the script:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+REF=data/ref/chrM.fa
+OUTDIR=results
+
+mkdir -p "$OUTDIR"
+
+# Step 2: Reference indexing
+if [[ ! -f "${REF}.fai" ]]; then
+    samtools faidx "$REF"
+fi
+if [[ ! -f "${REF}.bwt" ]]; then
+    bwa index "$REF"
+fi
+
+# Steps 3-7: Per-sample processing
+for sample in "${SAMPLES[@]}"; do
+    bam="${OUTDIR}/${sample}.bam"
+    bai="${bam}.bai"
+    vcf_gz="${OUTDIR}/${sample}.vcf.gz"
+    tbi="${vcf_gz}.tbi"
+
+    # Skip if final VCF index exists (implies all previous steps done)
+    if [[ -f "$tbi" ]]; then
+        continue
+    fi
+
+    # Step 3 & 4: Alignment and sorting
+    if [[ ! -f "$bai" ]]; then
+        bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            "$REF" "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" | \
+        samtools sort -@ "$THREADS" -o "$bam"
+    fi
+
+    # Step 5: BAM indexing
+    if [[ ! -f "$bai" ]]; then
+        samtools index -@ "$THREADS" "$bam"
+    fi
+
+    # Step 6: Variant calling
+    vcf="${OUTDIR}/${sample}.vcf"
+    if [[ ! -f "$vcf_gz" ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" --verbose \
+            --ref "$REF" --out "$vcf" \
+            --sig --bonf \
+            "$bam"
+    fi
+
+    # Step 7: VCF compression and indexing
+    if [[ ! -f "$tbi" ]]; then
+        bgzip -c "$vcf" > "$vcf_gz"
+        tabix -p vcf "$vcf_gz"
+        rm -f "$vcf"
+    fi
+done
+
+# Step 8: Collapse to TSV
+TSV="${OUTDIR}/collapsed.tsv"
+REBUILD=0
+if [[ ! -f "$TSV" ]]; then
+    REBUILD=1
+else
+    for sample in "${SAMPLES[@]}"; do
+        vcf_gz="${OUTDIR}/${sample}.vcf.gz"
+        if [[ "$vcf_gz" -nt "$TSV" ]]; then
+            REBUILD=1
+            break
+        fi
+    done
+fi
+
+if [[ "$REBUILD" -eq 1 ]]; then
+    {
+        printf "sample\tchrom\tpos\tref\talt\taf\n"
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" \
+                "${OUTDIR}/${sample}.vcf.gz"
+        done
+    } > "$TSV"
+fi
+```
+
+Wait, I need to be careful about the idempotency checks. The prompt says:
+"Treat every output step as idempotent: guard each artifact with an existence check (e.g. skip if `results/{sample}.vcf.gz.tbi` already exists and is newer than its inputs)."
+
+My current approach skips if `.tbi` exists, which implies everything before it is done. That's fine for idempotency.
+
+But wait, there's a subtle issue: if the script is interrupted between steps, we want to resume. My checks handle that by checking each intermediate file.
+
+Let me reconsider the VCF compression step. The plan says "Compress with `bgzip` (not `bcftools view -O z`) producing `results/{sample}.vcf.gz`."
+Using `bgzip -c "$vcf" > "$vcf_gz"` is correct.
+
+Actually, `bgzip` might not be explicitly in the inventory, but it's part of htslib which provides tabix. I'll assume it's available. If not, I could use `samtools bgzip` or just rely on `bgzip` being there. The inventory says `tabix (htslib) 1.21`, so bgzip should be there.
+
+Wait, let me check the exact lofreq command. The plan says:
+```
+lofreq call-parallel --pp-threads 4 --verbose
+--ref data/ref/chrM.fa --out results/{sample}.vcf
+--sig
+--bonf
+results/{sample}.bam
+```
+
+I'll use exactly that structure.
+
+One thing: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`
+The `{sample}` here is a literal string in the format, not a bcftools variable. So I need to make sure bash expands `${sample}` before passing to bcftools. Using double quotes for the format string will do that.
+
+Let me verify the format string: `"${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`
+In double quotes, `\t` and `\n` are literal backslash-t and backslash-n. bcftools query interprets `\t` as tab and `\n` as newline in the format string. This is correct.
+
+Wait, actually in bash double quotes, `\t` remains `\t`. bcftools query's `-f` option processes escape sequences like `\t` and `\n`. So this should work correctly.
+
+Let me double-check the idempotency for collapsed.tsv:
+"Rebuild only if any input VCF is newer than the TSV."
+My check does exactly that.
+
+One potential issue: `bgzip` might not be in PATH explicitly, but it's usually installed alongside samtools/tabix. I'll use `bgzip` as requested. If needed, I could use `samtools bgzip`, but the plan says `bgzip`. I'll stick with `bgzip`.
+
+Actually, looking at the inventory again:
+- samtools 1.21
+- tabix (htslib) 1.21
+bgzip is part of htslib/samtools suite. It should be available as `bgzip` or `samtools bgzip`. I'll use `bgzip`.
+
+Let me also make sure the script handles the case where intermediate files exist but are stale. The prompt says "guard each artifact with an existence check". Simple existence checks should suffice for idempotency in this context.
+
+One more thing: the read group string. The prompt emphasizes:
+"The `\t` must remain the two characters backslash and `t` — bwa parses them itself. Do NOT use `printf`, `echo -e`, `$'\t'`, or any mechanism that turns them into real tabs"
+
+In bash, `"@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"` will pass literal `\t` to bwa. This is correct.
+
+Let me refine the script:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+REF=data/ref/chrM.fa
+OUTDIR=results
+
+mkdir -p "$OUTDIR"
+
+# Step 2: Reference indexing
+if [[ ! -f "${REF}.fai" ]]; then
+    samtools faidx "$REF"
+fi
+if [[ ! -f "${REF}.bwt" ]]; then
+    bwa index "$REF"
+fi
+
+# Steps 3-7: Per-sample processing
+for sample in "${SAMPLES[@]}"; do
+    bam="${OUTDIR}/${sample}.bam"
+    bai="${bam}.bai"
+    vcf_gz="${OUTDIR}/${sample}.vcf.gz"
+    tbi="${vcf_gz}.tbi"
+
+    # Skip if final VCF index exists
+    if [[ -f "$tbi" ]]; then
+        continue
+    fi
+
+    # Step 3 & 4: Alignment and sorting
+    if [[ ! -f "$bai" ]]; then
+        bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            "$REF" "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" | \
+        samtools sort -@ "$THREADS" -o "$bam"
+    fi
+
+    # Step 5: BAM indexing
+    if [[ ! -f "$bai" ]]; then
+        samtools index -@ "$THREADS" "$bam"
+    fi
+
+    # Step 6: Variant calling
+    vcf="${OUTDIR}/${sample}.vcf"
+    if [[ ! -f "$vcf_gz" ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" --verbose \
+            --ref "$REF" --out "$vcf" \
+            --sig --bonf \
+            "$bam"
+    fi
+
+    # Step 7: VCF compression and indexing
+    if [[ ! -f "$tbi" ]]; then
+        bgzip -c "$vcf" > "$vcf_gz"
+        tabix -p vcf "$vcf_gz"
+        rm -f "$vcf"
+    fi
+done
+
+# Step 8: Collapse to TSV
+TSV="${OUTDIR}/collapsed.tsv"
+REBUILD=0
+if [[ ! -f "$TSV" ]]; then
+    REBUILD=1
+else
+    for sample in "${SAMPLES[@]}"; do
+        vcf_gz="${OUTDIR}/${sample}.vcf.gz"
+        if [[ "$vcf_gz" -nt "$TSV" ]]; then
+            REBUILD=1
+            break
+        fi
+    done
+fi
+
+if [[ "$REBUILD" -eq 1 ]]; then
+    {
+        printf "sample\tchrom\tpos\tref\talt\taf\n"
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" \
+                "${OUTDIR}/${sample}.vcf.gz"
+        done
+    } > "$TSV"
+fi
+```
+
+Wait, I should check if `bgzip` is available. The inventory lists `tabix (htslib) 1.21`. Usually `bgzip` is installed alongside tabix in htslib. I'll assume it's there. If not, I could use `samtools bgzip`, but the plan explicitly says `bgzip`. I'll stick with it.
+
+Actually, let me reconsider the idempotency check for collapsed.tsv. The prompt says "Rebuild only if any input VCF is newer than the TSV." My implementation does this correctly.
+
+One minor thing: `printf "sample\tchrom\tpos\tref\talt\taf\n"` - in bash, printf interprets `\t` as tab and `\n` as newline. This is correct for generating the header.
+
+Wait, should I use `echo -e` or `printf`? The prompt says "Do not use `echo` for user-facing prose." but using printf for data generation is fine. Actually, `printf` is standard and safe.
+
+Let me verify the bcftools query format string again:
+`"${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`
+This will expand `${sample}` to the sample name, then pass `\t%CHROM...` to bcftools. bcftools will interpret `\t` as tab and `\n` as newline. This is correct.
+
+One potential issue: `lofreq call-parallel` might output warnings to stderr, which is fine per constraints ("Do not write to stderr/stdout beyond what tools naturally emit").
+
+Let me also check if I need to handle the case where `.vcf` exists but `.vcf.gz` doesn't. My checks handle this: if `.vcf.gz` doesn't exist, it runs bgzip. If `.vcf` doesn't exist (because lofreq hasn't run), it runs lofreq first. The order of checks ensures correct execution.
+
+Actually, there's a subtle bug in my logic:
+```bash
+    vcf="${OUTDIR}/${sample}.vcf"
+    if [[ ! -f "$vcf_gz" ]]; then
+        lofreq call-parallel ... --out "$vcf" ...
+    fi
+
+    if [[ ! -f "$tbi" ]]; then
+        bgzip -c "$vcf" > "$vcf_gz"
+        tabix -p vcf "$vcf_gz"
+        rm -f "$vcf"
+    fi
+```
+If `.vcf.gz` exists but `.vcf` doesn't (because it was already removed), the first `if` won't run lofreq (correct). The second `if` will check for `.tbi`. If `.tbi` exists, it skips. If not, it tries to bgzip `.vcf` which doesn't exist -> error.
+
+I should adjust the logic to be more robust:
+```bash
+    vcf="${OUTDIR}/${sample}.vcf"
+    
+    # Run lofreq if VCF or compressed VCF doesn't exist
+    if [[ ! -f "$vcf_gz" && ! -f "$vcf" ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" --verbose \
+            --ref "$REF" --out "$vcf" \
+            --sig --bonf \
+            "$bam"
+    fi
+
+    # Compress and index if not already done
+    if [[ ! -f "$tbi" ]]; then
+        bgzip -c "$vcf" > "$vcf_gz"
+        tabix -p vcf "$vcf_gz"
+        rm -f "$vcf"
+    fi
+```
+
+This is safer. If `.vcf.gz` exists, we skip lofreq. If neither exists, we run lofreq. Then if `.tbi` doesn't exist, we compress and index.
+
+Wait, what if `.vcf` exists but `.vcf.gz` doesn't? The first condition `! -f "$vcf_gz" && ! -f "$vcf"` would be false, so lofreq wouldn't run. Then the second block would run bgzip on existing `.vcf`. That's correct.
+
+What if both exist? First condition false, second condition checks `.tbi`. If `.tbi` exists, skip. If not, bgzip (overwrites), tabix, rm. That's fine.
+
+Actually, let's simplify: the prompt says "guard each artifact with an existence check". I'll keep it simple and just check for the final artifact of each step.
+
+Let me revise:
+
+```bash
+    # Step 6: Variant calling
+    vcf="${OUTDIR}/${sample}.vcf"
+    if [[ ! -f "$vcf_gz" ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" --verbose \
+            --ref "$REF" --out "$vcf" \
+            --sig --bonf \
+            "$bam"
+    fi
+
+    # Step 7: VCF compression and indexing
+    if [[ ! -f "$tbi" ]]; then
+        bgzip -c "$vcf" > "$vcf_gz"
+        tabix -p vcf "$vcf_gz"
+        rm -f "$vcf"
+    fi
+```
+
+If `.vcf.gz` exists, we assume lofreq already ran and produced `.vcf`, which was then compressed and removed. So `.vcf` won't exist. The second block checks `.tbi`. If `.tbi` exists, skip. If not, it tries to bgzip `.vcf` which doesn't exist -> error.
+
+To fix this properly:
+```bash
+    # Step 6: Variant calling
+    vcf="${OUTDIR}/${sample}.vcf"
+    if [[ ! -f "$vcf_gz" && ! -f "$vcf" ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" --verbose \
+            --ref "$REF" --out "$vcf" \
+            --sig --bonf \
+            "$bam"
+    fi
+
+    # Step 7: VCF compression and indexing
+    if [[ ! -f "$tbi" ]]; then
+        bgzip -c "$vcf" > "$vcf_gz"
+        tabix -p vcf "$vcf_gz"
+        rm -f "$vcf"
+    fi
+```
+
+This handles all cases correctly.
+
+Actually, I realize there's another issue: `bgzip -c "$vcf" > "$vcf_gz"` will fail if `$vcf` doesn't exist. But with the first check, if neither `.vcf.gz` nor `.vcf` exists, lofreq runs and creates `.vcf`. Then the second block runs bgzip. If `.vcf.gz` already exists, the first block is skipped, but `.vcf` might not exist (it was removed after compression). So the second block would fail.
+
+Let me think about this more carefully. The idempotency requirement says "rerunning on a populated results/ directory must exit 0 without redoing work or erroring."
+
+If everything is done:
+- `.vcf.gz` exists -> first if skipped
+- `.tbi` exists -> second if skipped
+Works.
+
+If interrupted after lofreq but before compression:
+- `.vcf.gz` doesn't exist, `.vcf` exists -> first if skipped (because `! -f "$vcf"` is false)
+- `.tbi` doesn't exist -> second if runs bgzip on existing `.vcf`, creates `.vcf.gz`, tabix, rm `.vcf`
+Works.
+
+If interrupted after compression but before indexing:
+- `.vcf.gz` exists -> first if skipped
+- `.tbi` doesn't exist -> second if runs bgzip... wait, `.vcf` was already removed! This will fail.
+
+To handle this properly, I should check if `.vcf` exists before bgzip, or just rely on the fact that if `.vcf.gz` exists but `.tbi` doesn't, we need to re-compress? No, that's wasteful.
+
+Better approach: check for `.tbi` first. If it exists, skip everything for this sample. If not, proceed step by step.
+
+```bash
+    if [[ -f "$tbi" ]]; then
+        continue
+    fi
+
+    # Step 3 & 4
+    if [[ ! -f "$bai" ]]; then
+        bwa mem ... | samtools sort ...
+    fi
+
+    # Step 5
+    if [[ ! -f "$bai" ]]; then
+        samtools index ...
+    fi
+
+    # Step 6
+    vcf="${OUTDIR}/${sample}.vcf"
+    if [[ ! -f "$vcf_gz" && ! -f "$vcf" ]]; then
+        lofreq call-parallel ... --out "$vcf" ...
+    fi
+
+    # Step 7
+    if [[ ! -f "$tbi" ]]; then
+        bgzip -c "$vcf" > "$vcf_gz"
+        tabix -p vcf "$vcf_gz"
+        rm -f "$vcf"
+    fi
+```
+
+Wait, the early `continue` at the top handles the fully complete case. But if interrupted after compression but before indexing, `.tbi` doesn't exist, so we proceed. Then step 6 is skipped (`.vcf.gz` exists). Step 7 tries to bgzip `.vcf` which doesn't exist -> error.
+
+I need to handle this edge case. One way: if `.vcf.gz` exists but `.vcf` doesn't, skip bgzip and just run tabix. Or, simpler: just check if `.vcf` exists before bgzip.
+
+Actually, the simplest robust approach for idempotency in bioinformatics pipelines is to check each output file individually and only run the step if its output is missing. But here we have a dependency chain.
+
+Let me restructure slightly:
+
+```bash
+    # Step 6: Variant calling
+    vcf="${OUTDIR}/${sample}.vcf"
+    if [[ ! -f "$vcf_gz" ]]; then
+        if [[ ! -f "$vcf" ]]; then
+            lofreq call-parallel --pp-threads "$THREADS" --verbose \
+                --ref "$REF" --out "$vcf" \
+                --sig --bonf \
+                "$bam"
+        fi
+        bgzip -c "$vcf" > "$vcf_gz"
+        rm -f "$vcf"
+    fi
+
+    # Step 7: VCF indexing
+    if [[ ! -f "$tbi" ]]; then
+        tabix -p vcf "$vcf_gz"
+    fi
+```
+
+This is cleaner. If `.vcf.gz` doesn't exist, we ensure `.vcf` exists (run lofreq if needed), compress it, and remove `.vcf`. Then index if `.tbi` doesn't exist.
+
+What if interrupted after bgzip but before rm? `.vcf.gz` exists, so step 6 is skipped. Step 7 runs tabix. Works.
+What if interrupted after lofreq but before bgzip? `.vcf.gz` doesn't exist, `.vcf` exists. Step 6 skips lofreq, runs bgzip, removes `.vcf`. Works.
+What if fully done? `.vcf.gz` exists, step 6 skipped. `.tbi` exists, step 7 skipped. Works.
+
+This is robust. Let me update the script accordingly.
+
+One more check: `bgzip -c "$vcf" > "$vcf_gz"` might fail if `$vcf` is empty or corrupted, but that's beyond idempotency scope.
+
+Final script structure:
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+REF=data/ref/chrM.fa
+OUTDIR=results
+
+mkdir -p "$OUTDIR"
+
+# Step 2: Reference indexing
+if [[ ! -f "${REF}.fai" ]]; then
+    samtools faidx "$REF"
+fi
+if [[ ! -f "${REF}.bwt" ]]; then
+    bwa index "$REF"
+fi
+
+# Steps 3-7: Per-sample processing
+for sample in "${SAMPLES[@]}"; do
+    bam="${OUTDIR}/${sample}.bam"
+    bai="${bam}.bai"
+    vcf_gz="${OUTDIR}/${sample}.vcf.gz"
+    tbi="${vcf_gz}.tbi"
+
+    # Skip if fully processed
+    if [[ -f "$tbi" ]]; then
+        continue
+    fi
+
+    # Step 3 & 4: Alignment and sorting
+    if [[ ! -f "$bai" ]]; then
+        bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            "$REF" "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" | \
+        samtools sort -@ "$THREADS" -o "$bam"
+    fi
+
+    # Step 5: BAM indexing
+    if [[ ! -f "$bai" ]]; then
+        samtools index -@ "$THREADS" "$bam"
+    fi
+
+    # Step 6 & 7: Variant calling, compression, and indexing
+    vcf="${OUTDIR}/${sample}.vcf"
+    if [[ ! -f "$vcf_gz" ]]; then
+        if [[ ! -f "$vcf" ]]; then
+            lofreq call-parallel --pp-threads "$THREADS" --verbose \
+                --ref "$REF" --out "$vcf" \
+                --sig --bonf \
+                "$bam"
+        fi
+        bgzip -c "$vcf" > "$vcf_gz"
+        rm -f "$vcf"
+    fi
+
+    if [[ ! -f "$tbi" ]]; then
+        tabix -p vcf "$vcf_gz"
+    fi
+done
+
+# Step 8: Collapse to TSV
+TSV="${OUTDIR}/collapsed.tsv"
+REBUILD=0
+if [[ ! -f "$TSV" ]]; then
+    REBUILD=1
+else
+    for sample in "${SAMPLES[@]}"; do
+        vcf_gz="${OUTDIR}/${sample}.vcf.gz"
+        if [[ "$vcf_gz" -nt "$TSV" ]]; then
+            REBUILD=1
+            break
+        fi
+    done
+fi
+
+if [[ "$REBUILD" -eq 1 ]]; then
+    {
+        printf "sample\tchrom\tpos\tref\talt\taf\n"
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" \
+                "${OUTDIR}/${sample}.vcf.gz"
+        done
+    } > "$TSV"
+fi
+```
+
+Wait, I should verify the `bcftools query` format string behavior. In bcftools 1.21, `-f` takes a format string where `\t` is tab and `\n` is newline. The `${sample}` will be expanded by bash before passing to bcftools. This is correct.
+
+One minor thing: `printf "sample\tchrom\tpos\tref\talt\taf\n"` - printf interprets escape sequences in the format string. This will produce a tab-separated header with a newline at the end. Correct.
+
+Let me double-check the lofreq command syntax. The plan says:
+```
+lofreq call-parallel --pp-threads 4 --verbose
+--ref data/ref/chrM.fa --out results/{sample}.vcf
+--sig
+--bonf
+results/{sample}.bam
+```
+My script uses:
+```bash
+lofreq call-parallel --pp-threads "$THREADS" --verbose \
+    --ref "$REF" --out "$vcf" \
+    --sig --bonf \
+    "$bam"
+```
+This matches.
+
+One thing: `--sig` and `--bonf` are on the same line in my script, which is fine for bash. The plan shows them on separate lines but that's just formatting.
+
+I think this script meets all requirements. Let me review once more:
+- First line: `#!/usr/bin/env bash` ✓
+- Second line: `set -euo pipefail` ✓
+- Uses only listed tools ✓
+- Idempotent with existence checks ✓
+- No hardcoded paths outside cwd ✓
+- Outputs to results/ ✓
+- Read group format correct ✓
+- lofreq invocation correct ✓
+- bgzip/tabix for VCF ✓
+- bcftools query for collapsed.tsv ✓
+- Header and columns match spec ✓
+
+One potential issue: `bgzip` might not be in PATH as a standalone command in some environments, but it's part of htslib which provides tabix. The inventory lists `tabix (htslib) 1.21`, so `bgzip` should be available. If not, I could use `samtools bgzip`, but the plan explicitly says `bgzip`. I'll trust it's there.
+
+Actually, to be safe, I'll check if `bgzip` is available or fall back to `samtools bgzip`. But the constraints say "Use only tools listed in TOOL_INVENTORY". `bgzip` isn't explicitly listed, but `tabix (htslib)` is. Usually they're installed together. I'll stick with `bgzip` as requested by the plan.
+
+Wait, the plan says "Compress with `bgzip` (not `bcftools view -O z`)". It's explicit. I'll use `bgzip`.
+
+Final check of the script... looks solid.
+I'll output it now.
+One minor adjustment: I'll make sure the bcftools query format string uses single quotes for the literal parts and double quotes for variable expansion, or just keep it in double quotes as is. Double quotes work fine here since there are no special characters that bash would interpret unexpectedly (except `$` which we want expanded).
+
+Actually, `%CHROM` etc. don't contain `$`, so double quotes are safe.
+
+The script is ready.
+Output matches requirements exactly.
+Proceeds. 
+Self-Correction/Refinement during thought:
+I should verify that `bgzip` is indeed available. In conda environments with htslib/samtools, `bgzip` is typically symlinked or installed alongside. Given the explicit instruction to use `bgzip`, I'll assume it's on PATH.
+
+Also, I notice the plan says "The bare `--sig` and `--bonf` lines come from Galaxy-runtime-supplied values; you can omit them and use lofreq's defaults." I'll keep them as they don't hurt and match the canonical invocation.
+
+One thing: `lofreq call-parallel` might require the BAM to be indexed, which we do in step 5. Good.
+
+The script looks complete and correct.
+Outputting now. 
+All constraints met.
+No extra text.
+Just the script.
+Done. 
+Let me generate it. 
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+...
+```
+Matches exactly.
+Proceeds. 
+[Output Generation]

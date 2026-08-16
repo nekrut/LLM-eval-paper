@@ -1,0 +1,353 @@
+1.  **Analyze the Request:**
+    *   **Goal:** Create a single bash script for variant calling on mitochondrial DNA (chrM) amplicons.
+    *   **Input:** 4 paired-end FASTQ files in `data/raw/`, reference `chrM.fa` in `data/ref/`.
+    *   **Output:** BAM, BAI, VCF, TBI per sample in `results/`, plus a `collapsed.tsv` in `results/`.
+    *   **Constraints:**
+        *   Shebang: `#!/usr/bin/env bash`
+        *   Set: `set -euo pipefail`
+        *   Paths: Relative only (no absolute paths).
+        *   Output dir: `results/`.
+        *   Idempotent: Must not redo work if outputs exist.
+        *   Tools: `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`, `SnpSift`, `snpEff`, `fastqc`, `seqkit`, `snakemake`, `shellcheck`, `java`. *Note: The prompt lists many tools, but the plan suggests `bwa -> samtools -> lofreq -> bcftools -> awk`. I should stick to the plan but ensure I use the available tools effectively.*
+        *   Time limit: < 600s at THREADS=4.
+        *   Output: ONLY the script.
+
+2.  **Determine the Workflow:**
+    *   **Step 1: Reference Indexing.** BWA needs an index. `bwa index`.
+    *   **Step 2: Alignment.** BWA-MEM for paired-end reads.
+    *   **Step 3: Sorting/Marking Duplicates (Optional but good practice, though lofreq often handles raw BAMs).** The prompt asks for `results/{sample}.bam`. Usually, BAMs are sorted. Let's sort and index.
+    *   **Step 4: Variant Calling.** `lofreq call-parallel` is efficient for amplicons and mitochondrial DNA.
+    *   **Step 5: VCF Processing.** `bcftools view` to filter/prepare.
+    *   **Step 6: Collapsing.** Combine VCFs into a TSV.
+
+3.  **Refining the Workflow for Idempotency & Constraints:**
+    *   *Reference Index:* Check if `data/ref/chrM.fa.bwt` exists. If not, create it.
+    *   *Alignment:* Check if `results/{sample}.bam` exists. If not, run BWA and sort.
+    *   *Indexing:* Check if `results/{sample}.bam.bai` exists. If not, run `samtools index`.
+    *   *Calling:* Check if `results/{sample}.vcf.gz` exists. If not, run lofreq.
+    *   *Indexing VCF:* Check if `results/{sample}.vcf.gz.tbi` exists. If not, run `tabix`.
+    *   *Collapsing:* Check if `results/collapsed.tsv` exists. If not, run the merge logic.
+
+4.  **Drafting the Script Logic:**
+
+    *   *Variables:*
+        *   `THREADS=4`
+        *   `REF=data/ref/chrM.fa`
+        *   `RAW=data/raw`
+        *   `OUT=results`
+
+    *   *Setup:*
+        *   Create `results` dir if missing.
+
+    *   *Ref Indexing:*
+        *   `bwa index "$REF"`
+
+    *   *Loop over samples:*
+        *   Sample names: `M117-bl`, `M117-ch`, `M117C1-bl`, `M117C1-ch`.
+        *   R1: `${sample}_1.fq.gz`
+        *   R2: `${sample}_2.fq.gz`
+        *   BAM: `results/${sample}.bam`
+        *   VCF: `results/${sample}.vcf.gz`
+
+    *   *Alignment:*
+        *   `bwa mem -t $THREADS "$REF" "${RAW}/${sample}_1.fq.gz" "${RAW}/${sample}_2.fq.gz" | samtools view -b - > "$BAM"`
+        *   *Optimization:* `bwa mem` output is usually sorted by coordinate, but `samtools view -b` might reorder or just pipe it. Actually, `bwa mem` output is unsorted. `samtools sort` is needed.
+        *   *Check:* `if [ ! -f "$BAM" ]; then ... bwa mem ... | samtools sort -o "$BAM" -; fi`
+
+    *   *BAM Index:*
+        *   `if [ ! -f "${BAM}.bai" ]; then samtools index "$BAM"; fi`
+
+    *   *Variant Calling (lofreq):*
+        *   `lofreq call-parallel -f "$REF" -o "$VCF" -m lofreq -t $THREADS "$BAM"`
+        *   *Note:* `lofreq call-parallel` usually outputs a VCF. It might need `--ploidy 1` for mitochondrial DNA, but `lofreq` defaults to 2. Since it's mitochondrial, it's haploid. I should add `-p 1` or `--ploidy 1` to be accurate, though the prompt doesn't explicitly demand strict haploid calling, it's standard for mtDNA. However, `lofreq` might complain if the reference is not indexed for `lofreq` (which uses `samtools faidx`). I need to ensure `samtools faidx "$REF"` is run.
+        *   *Check:* `if [ ! -f "$VCF" ]; then ... fi`
+
+    *   *VCF Index:*
+        *   `if [ ! -f "${VCF}.tbi" ]; then tabix -p vcf "$VCF"; fi`
+
+    *   *Collapsing:*
+        *   Combine all `results/*.vcf.gz`.
+        *   `bcftools merge -Oz -o results/merged.vcf.gz results/*.vcf.gz`
+        *   `tabix -p vcf results/merged.vcf.gz`
+        *   Extract INFO/AF or FORMAT/AF. `lofreq` usually puts AF in INFO.
+        *   `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/merged.vcf.gz > results/collapsed.tsv`
+        *   *Wait*, `bcftools query` might be slow on large files, but for 4 small samples, it's fine.
+        *   *Alternative:* `bcftools view -i 'INFO/AF>0' -Oz -o ...` then `tabix`. Then `bcftools query`.
+        *   *Constraint Check:* The prompt asks for `results/collapsed.tsv` with columns `sample chrom pos ref alt af`.
+        *   *Problem:* `bcftools query` doesn't output the sample name in the main columns unless using specific format strings or `bcftools query -s`. Actually, `bcftools query` outputs one line per variant per sample by default if FORMAT fields are requested, or one line per variant if INFO fields are requested.
+        *   *Requirement:* "sample chrom pos ref alt af". This implies a row per sample per variant.
+        *   *Approach:* `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\t%SAMPLE\n' results/merged.vcf.gz` -> This gives `sample chrom pos ref alt af`.
+        *   *Wait*, `bcftools query` output order is usually `CHROM POS ID REF ALT QUAL FILTER INFO FORMAT`. If I specify `INFO/AF`, it goes there. If I specify `SAMPLE`, it goes at the end.
+        *   Let's verify `bcftools query` syntax. `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\t%SAMPLE\n'`.
+        *   *Refinement:* `bcftools query` might be tricky with the header. The prompt asks for a header. I can add it manually or rely on `bcftools query` outputting the header if I use `-h`. But `bcftools query` outputting a header line with custom fields is tricky.
+        *   *Simpler approach:* `bcftools view` to get the VCF, then `awk` to format it.
+        *   `bcftools view results/merged.vcf.gz | awk '{print $1"\t"$2"\t"$4"\t"$5"\t"$8}'` -> This is messy because AF is in INFO.
+        *   *Better approach:* `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\t%SAMPLE\n' results/merged.vcf.gz > results/collapsed.tsv`.
+        *   *Header:* The prompt asks for a header. `bcftools query` doesn't output a header for the custom format string by default. I will add the header manually using `echo` or `printf`. The prompt says "Do not use `echo` for user-facing prose", but adding a header to a file is standard. However, to be safe and strictly follow "Do not write to stderr/stdout beyond what tools naturally emit", I should probably let the tools emit the data and maybe add the header via `printf` or `cat`. Actually, `bcftools query` outputting a header line is possible with `-h`, but usually it's the VCF header. I will use `printf` to add the header line `sample\tchrom\tpos\tref\talt\taf` to the file.
+
+5.  **Refining the Script Structure:**
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    THREADS=4
+    REF=data/ref/chrM.fa
+    RAW=data/raw
+    OUT=results
+
+    mkdir -p "$OUT"
+
+    # 1. Index Reference
+    if [ ! -f "${REF}.bwt" ]; then
+        bwa index "$REF"
+        samtools faidx "$REF"
+    fi
+
+    # 2. Samples
+    SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+    for SAMPLE in "${SAMPLES[@]}"; do
+        R1="${RAW}/${SAMPLE}_1.fq.gz"
+        R2="${RAW}/${SAMPLE}_2.fq.gz"
+        BAM="${OUT}/${SAMPLE}.bam"
+        VCF="${OUT}/${SAMPLE}.vcf.gz"
+
+        # 2a. Align
+        if [ ! -f "$BAM" ]; then
+            bwa mem -t "$THREADS" "$REF" "$R1" "$R2" | \
+            samtools sort -o "$BAM" -
+        fi
+
+        # 2b. Index BAM
+        if [ ! -f "${BAM}.bai" ]; then
+            samtools index "$BAM"
+        fi
+
+        # 2c. Call Variants
+        if [ ! -f "$VCF" ]; then
+            lofreq call-parallel -f "$REF" -o "$VCF" -m lofreq -t "$THREADS" "$BAM"
+        fi
+
+        # 2d. Index VCF
+        if [ ! -f "${VCF}.tbi" ]; then
+            tabix -p vcf "$VCF"
+        fi
+    done
+
+    # 3. Collapse
+    MERGED="${OUT}/merged.vcf.gz"
+    COLLAPSED="${OUT}/collapsed.tsv"
+
+    if [ ! -f "$COLLAPSED" ]; then
+        bcftools merge -Oz -o "$MERGED" "${OUT}"/*.vcf.gz
+        tabix -p vcf "$MERGED"
+        # Extract data
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\t%SAMPLE\n' "$MERGED" > "$COLLAPSED"
+        # Add header
+        printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"
+        # Wait, bcftools query output order: CHROM POS ID REF ALT QUAL FILTER INFO FORMAT.
+        # If I ask for INFO/AF, it goes to INFO column. If I ask for SAMPLE, it goes to FORMAT column (usually).
+        # Let's check `bcftools query` behavior.
+        # `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\t%SAMPLE\n'`
+        # This usually outputs: CHROM POS ID REF ALT QUAL FILTER INFO/AF SAMPLE
+        # The prompt wants: sample chrom pos ref alt af.
+        # So I need to reorder.
+        # `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\t%SAMPLE\n' "$MERGED" | sort -k6,6 -k1,1n > "$COLLAPSED"`
+        # Actually, `bcftools query` output is unsorted by sample usually.
+        # Let's just use `bcftools query` and then `sort` to ensure order, or just let it be.
+        # The prompt doesn't specify sort order, just the columns.
+        # However, `bcftools query` puts AF in the INFO column. The header of the output file needs to match.
+        # If I use `bcftools query`, the output columns are:
+        # 1: CHROM
+        # 2: POS
+        # 3: ID
+        # 4: REF
+        # 5: ALT
+        # 6: QUAL
+        # 7: FILTER
+        # 8: INFO (which contains AF if requested)
+        # 9: FORMAT (which contains SAMPLE if requested)
+        # So `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\t%SAMPLE\n'` produces:
+        # CHROM POS ID REF ALT QUAL FILTER INFO/AF SAMPLE
+        # I need to swap columns 1 and 6 (sample and chrom).
+        # `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\t%SAMPLE\n' "$MERGED" | awk '{print $6"\t"$1"\t"$2"\t"$4"\t"$5"\t"$8}' > "$COLLAPSED"`
+        # This looks correct.
+    fi
+    ```
+
+6.  **Reviewing Tool Inventory & Constraints:**
+    *   `bwa mem`: Used.
+    *   `samtools sort`: Used.
+    *   `samtools index`: Used.
+    *   `samtools faidx`: Used (for lofreq).
+    *   `lofreq call-parallel`: Used.
+    *   `tabix`: Used.
+    *   `bcftools merge`: Used.
+    *   `bcftools query`: Used.
+    *   `awk`: Used for reordering columns.
+    *   `java`: Not needed for this specific workflow (lofreq handles its own java needs usually, or uses system java if available, but I don't need to invoke it explicitly).
+    *   `snakemake`: Not needed, I'm writing a bash script.
+    *   `fastqc`: Not needed.
+    *   `seqkit`: Not needed.
+    *   `shellcheck`: Not needed.
+    *   `SnpSift`: Not needed.
+    *   `snpEff`: Not needed.
+
+7.  **Final Polish of the Script:**
+    *   Ensure `set -euo pipefail` is there.
+    *   Ensure `mkdir -p results`.
+    *   Ensure `bwa index` and `samtools faidx` are idempotent checks.
+    *   Ensure `lofreq` uses `-p 1` (haploid) for mitochondrial DNA? The prompt says "human mitochondrial reference". It is haploid. `lofreq` defaults to 2. I should add `-p 1` to `lofreq call-parallel` to be correct, though the prompt didn't explicitly demand it, it's standard bioinformatics practice for mtDNA. Without it, it might call heterozygous sites which shouldn't exist in mtDNA (unless there is heteroplasmy, but usually called as AF). Actually, `lofreq` handles heteroplasmy well with ploidy 2, but ploidy 1 is safer for calling variants. I will add `-p 1`.
+    *   Wait, `lofreq call-parallel` options: `-p` or `--ploidy`. Yes.
+    *   Check `lofreq` output format. It outputs VCF.
+    *   Check `bcftools merge`. It needs sorted VCFs. `lofreq` outputs sorted VCFs. `tabix` sorts them. So `bcftools merge` should work fine.
+    *   Check `bcftools query` format string again.
+    *   `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\t%SAMPLE\n'`
+    *   Output: `chrM  123  .  A  T  0.5  .  .  GT:AF  0/1`
+    *   Wait, `bcftools query` output format is: `CHROM POS ID REF ALT QUAL FILTER INFO FORMAT`.
+    *   If I request `INFO/AF`, it appears in the INFO column.
+    *   If I request `SAMPLE`, it appears in the FORMAT column.
+    *   So the line is: `chrM  123  .  A  T  0.5  .  AF=0.5  GT:AF  0/1`
+    *   My awk command: `awk '{print $6"\t"$1"\t"$2"\t"$4"\t"$5"\t"$8}'`
+    *   $6 is QUAL (0.5). $1 is CHROM (chrM). $2 is POS (123). $4 is REF (A). $5 is ALT (T). $8 is INFO (AF=0.5).
+    *   This matches the required columns `sample chrom pos ref alt af`.
+    *   Wait, $6 is QUAL. The prompt wants `af` in the last column. $8 is AF. So the awk command is correct.
+
+8.  **Handling "Do not use echo for user-facing prose":**
+    *   The header generation `printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"` is necessary for the output format. It's not "prose", it's data structure definition.
+
+9.  **Handling "Do not hardcode any path outside the current working directory":**
+    *   I used `data/raw`, `data/ref`, `results`. These are relative. Correct.
+
+10. **Handling "Total wall-clock must be under 600 seconds at THREADS=4":**
+    *   4 samples, small amplicons. BWA + lofreq is very fast. This will easily pass.
+
+11. **Final check on `lofreq` syntax:**
+    *   `lofreq call-parallel -f ref.fa -o output.vcf -m lofreq -t 4 input.bam`
+    *   It requires `samtools faidx` on the reference. I added that check.
+
+12. **Constructing the final script.**
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    THREADS=4
+    REF=data/ref/chrM.fa
+    RAW=data/raw
+    OUT=results
+
+    mkdir -p "$OUT"
+
+    # Index reference
+    if [ ! -f "${REF}.bwt" ]; then
+        bwa index "$REF"
+        samtools faidx "$REF"
+    fi
+
+    # Process samples
+    for SAMPLE in M117-bl M117-ch M117C1-bl M117C1-ch; do
+        R1="${RAW}/${SAMPLE}_1.fq.gz"
+        R2="${RAW}/${SAMPLE}_2.fq.gz"
+        BAM="${OUT}/${SAMPLE}.bam"
+        VCF="${OUT}/${SAMPLE}.vcf.gz"
+
+        # Align
+        if [ ! -f "$BAM" ]; then
+            bwa mem -t "$THREADS" "$REF" "$R1" "$R2" | \
+            samtools sort -o "$BAM" -
+        fi
+
+        # Index BAM
+        if [ ! -f "${BAM}.bai" ]; then
+            samtools index "$BAM"
+        fi
+
+        # Call variants
+        if [ ! -f "$VCF" ]; then
+            lofreq call-parallel -f "$REF" -o "$VCF" -m lofreq -t "$THREADS" -p 1 "$BAM"
+        fi
+
+        # Index VCF
+        if [ ! -f "${VCF}.tbi" ]; then
+            tabix -p vcf "$VCF"
+        fi
+    done
+
+    # Collapse
+    MERGED="${OUT}/merged.vcf.gz"
+    COLLAPSED="${OUT}/collapsed.tsv"
+
+    if [ ! -f "$COLLAPSED" ]; then
+        bcftools merge -Oz -o "$MERGED" "${OUT}"/*.vcf.gz
+        tabix -p vcf "$MERGED"
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\t%SAMPLE\n' "$MERGED" | \
+            awk '{print $6"\t"$1"\t"$2"\t"$4"\t"$5"\t"$8}' > "$COLLAPSED"
+        printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"
+    fi
+    ```
+
+    *Self-Correction on `bcftools query` output:*
+    `bcftools query` output lines look like:
+    `chrM  123  .  A  T  0.5  .  AF=0.5  GT:AF  0/1`
+    Columns: 1:CHROM, 2:POS, 3:ID, 4:REF, 5:ALT, 6:QUAL, 7:FILTER, 8:INFO, 9:FORMAT.
+    My awk: `print $6"\t"$1"\t"$2"\t"$4"\t"$5"\t"$8`
+    Result: `0.5  chrM  123  A  T  AF=0.5`
+    This matches `sample chrom pos ref alt af`.
+    Wait, `bcftools query` output is unsorted by sample. The prompt doesn't specify sort order. I'll leave it as is.
+
+    *One detail:* `lofreq call-parallel` might output a `.vcf` or `.vcf.gz`. I specified `-o "$VCF"` where VCF is `.vcf.gz`. `lofreq` usually handles the compression if the output filename ends in `.gz`. I should check if `lofreq` supports `.gz` output directly. Yes, `lofreq` supports `--output` with `.gz` extension.
+
+    *Refining the header addition:*
+    `printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"`
+    This overwrites the file. `bcftools query` output is appended to the file. This is correct.
+
+    *Idempotency check:*
+    If `results/collapsed.tsv` exists, the script exits 0 (due to `set -e` and `if [ ! -f ... ]`). Correct.
+
+    *Tool versions:*
+    `bwa 0.7.18` - standard.
+    `samtools 1.21` - standard.
+    `bcftools 1.21` - standard.
+    `tabix 1.21` - standard.
+    `lofreq 2.1.5` - standard.
+
+    *Final check on paths:*
+    `data/raw/` and `data/ref/` are assumed present. `results/` is created.
+    No absolute paths used.
+
+    *One small optimization:*
+    `bcftools merge` might fail if the VCFs are not sorted. `lofreq` outputs sorted VCFs. `tabix` sorts them. So `bcftools merge` should work.
+
+    *Wait, `bcftools query` output format:*
+    If I use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\t%SAMPLE\n'`, the output is:
+    `chrM  123  .  A  T  0.5  .  AF=0.5  GT:AF  0/1`
+    The `INFO/AF` is in the INFO column ($8).
+    The `SAMPLE` is in the FORMAT column ($9).
+    My awk command puts $6 (QUAL) as sample, $1 (CHROM) as chrom, $2 (POS) as pos, $4 (REF) as ref, $5 (ALT) as alt, $8 (INFO/AF) as af.
+    This is correct.
+
+    *Wait, `bcftools query` output order:*
+    `bcftools query` output is: `CHROM POS ID REF ALT QUAL FILTER INFO FORMAT`.
+    Yes.
+    $1=CHROM, $2=POS, $3=ID, $4=REF, $5=ALT, $6=QUAL, $7=FILTER, $8=INFO, $9=FORMAT.
+    My awk: `print $6"\t"$1"\t"$2"\t"$4"\t"$5"\t"$8`
+    Output: `QUAL CHROM POS REF ALT INFO/AF`
+    This matches `sample chrom pos ref alt af`.
+
+    *Wait, `bcftools query` output:*
+    Does `bcftools query` output the header? No.
+    Does `bcftools query` output the INFO/AF value correctly? Yes, if `INFO/AF` is in the INFO field.
+    Does `bcftools query` output the SAMPLE value correctly? Yes, if `SAMPLE` is in the FORMAT field.
+
+    *One edge case:* `lofreq` might output `INFO/AF` as `AF` or `INFO/AF`. `bcftools query` handles `INFO/AF` correctly.
+
+    *Final check on `set -euo pipefail`:*
+    `set -e` stops on error.
+    `set -u` stops on undefined variable.
+    `set -o pipefail` stops on error in pipe.
+    The `if [ ! -f ... ]` structure prevents errors if files exist.
+    The `|` in `bwa mem ... | samtools sort` requires `set -o pipefail`.
+
+    Looks good.

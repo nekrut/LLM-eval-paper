@@ -1,0 +1,518 @@
+We need answer user's request: produce ONE self-contained bash script. Need think through constraints carefully. Must output only script no prose/fences. We are in analysis; final should be script only.
+
+Need design workflow:
+- cwd contains data/raw/ FASTQ files and data/ref/chrM.fa decompressed present.
+- outputs under results/: per sample bam, bai, vcf.gz, tbi, collapsed.tsv columns sample chrom pos ref alt af tab-separated header.
+- Samples M117-bl, M117-ch, M117C1-bl, M117C1-ch paired files data/raw/{sample}_1.fq.gz and _2.fq.gz.
+- Tools: bwa 0.7.18, samtools 1.21, bcftools 1.21, tabix, lofreq 2.1.5, SnpSift/snpEff/fastqc/seqkit/snakemake/shellcheck/java. Only listed tools on PATH? It says only these are on PATH; pinned versions in conda env bench. But bash builtins and standard utilities? Hard constraints: Use only tools listed in TOOL_INVENTORY. Do not invoke package managers. Does that forbid awk, mkdir, mv, rm, cat? They say recommended tool sequence includes awk for final collapse. So likely basic POSIX utilities allowed? "Use only tools listed" but plan says awk. Need be safe: use bash builtins and maybe standard coreutils? The constraint may mean no other bioinformatics tools; but to create dirs need mkdir. Could avoid mkdir by using results/ if exists? But outputs under results/. Need ensure results dir exists. Can we use `mkdir -p`? It's not in inventory. But likely allowed as shell utility? They explicitly mention awk, so external non-listed utilities may be okay? Hmm. "Use only tools listed in TOOL_INVENTORY." Strictly no mkdir/awk? But plan says awk for final collapse. Maybe they expect using standard Unix tools (awk) despite inventory. Need decide. To maximize compliance, minimize external commands not listed: use bash builtins where possible. For directory creation, can we avoid mkdir by relying on results existing? Constraint says write outputs under results/. It doesn't say create it. But idempotent rerun on populated results/; initial run may need create. Could use `mkdir -p results` but if forbidden maybe fail. In many such tasks, coreutils are assumed available even if not listed? The inventory lists bio tools only. They also list shellcheck, snakemake etc. I think using mkdir and awk is acceptable because plan mentions awk. But "only these are on PATH" would mean no mkdir? That's impossible to create dirs unless results exists. Maybe environment has coreutils but they didn't list. We can use `mkdir -p` as standard. Need not overthink.
+
+Need idempotent: rerunning populated results must exit 0 without redoing work or erroring. So check if outputs exist and are non-empty? If all per-sample final files exist, skip. But need collapsed.tsv too. Could implement function to run sample only if any output missing. Need ensure not partial stale files causing issues. Idempotent means no redo; can just test existence of all four sample outputs plus maybe bai/tbi. If present, skip. For collapsed.tsv, if exists and contains all samples? Could regenerate from existing vcfs cheaply? But "without redoing work" likely means don't remap/call variants. Regenerating collapsed.tsv from existing VCFs is okay? It says rerunning on populated results/ must exit 0 without redoing work or erroring. If collapsed.tsv missing, need create. If present, can skip. But if we always regenerate using bcftools query (fast) maybe considered redo? Probably fine but to be safe check existence and non-empty; skip if exists. However if collapsed.tsv exists but incomplete? Not required.
+
+Need ensure no stderr/stdout beyond tools naturally emit; do not use echo for user-facing prose. We can avoid echoes. Use commands that may output progress to stderr (bwa/samtools/lofreq). That's allowed "beyond what tools naturally emit"? It says Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose. So no custom messages.
+
+Need wall-clock <600s at THREADS=4. Need set threads? Use variable THREADS maybe default 4? Constraint mentions at THREADS=4. We can define `THREADS="${THREADS:-4}"`. Use bwa -t, samtools sort -@, lofreq call --n-threads? bcftools -t? For small chrM and 4 samples, fine.
+
+Need mapping to human mitochondrial reference chrM.fa (16569 bp). Need index if missing: `bwa index` or `samtools faidx`. Idempotent: check .fai/.amb etc. bwa 0.7.18 index creates .amb .ann .pac .sa? For mtDNA maybe use `bwa index -a is`? BWA aln? Wait bwa version 0.7.18 includes bwa (old) and bwa-mem2? Actually BWA 0.7.18 has `bwa` command with algorithms: aln, samse, sampe, bwasw, index, etc. It does not have mem in 0.7.18? BWA-MEM was introduced in 0.7.12? Let's recall: BWA 0.7.18 includes `bwa` with subcommands: aln, samse, sampe, bwasw, index, pack, calib, fb, help. It may not have mem? Actually BWA-MEM is part of BWA since 0.7.12? The command is `bwa mem`. I think yes, BWA 0.7.18 includes mem (BWA-MEM). Let's verify: BWA 0.7.18 release notes include BWA-MEM. Subcommand list likely: aln, samse, sampe, bwasw, index, pack, calib, fb, help? Hmm older docs for 0.7.12: `bwa mem` exists. I think yes. Use `bwa mem -t $THREADS`. For short MiSeq amplicons maybe okay. Could use `bwa aln/sampe` but lofreq expects BAM with proper flags; bwa-mem easier.
+
+Need sort and index bam. `samtools sort -@ THREADS -o results/$s.bam results/$s.unsorted.bam` then rm unsorted? Need avoid temp outside cwd? Use results/. Could use `bwa mem ... | samtools sort -@ $THREADS -m 2G -o results/$s.bam -` to stream, no intermediate. But idempotent skip if bam exists. For rerun, no issue. Streaming may be okay. Need set reference in header? bwa mem includes @SQ from ref. Good.
+
+Variant calling: lofreq call --bam results/$s.bam --ref data/ref/chrM.fa -o results/$s.vcf.gz? LoFreq can output vcf.gz and index? It has `--write-vcf` maybe. In lofreq 2.1.5, command: `lofreq call --bam file --ref ref.fa -o out.vcf.gz`. Does it create .tbi automatically if gzipped? I think lofreq writes VCF and indexes if output is .vcf.gz? Need check. LoFreq docs: `-o/--write-vcf` write to vcf, if ends with .gz maybe compress and index? It may not index by default? There is `--no-index`? Let's recall lofreq call options: `--bam`, `--ref`, `-o/--write-vcf`, `--n-threads`, `--min-bq`, etc. It likely writes bgzipped VCF if .gz and indexes with tabix? In 2.x, it uses htslib and may index. But to be safe, after lofreq call output vcf.gz, run `tabix -p vcf results/$s.vcf.gz` if tbi missing. Need ensure valid bgzip. If lofreq writes plain .vcf.gz not bgzipped? It should use htslib. Could also use bcftools view to compress/index: `bcftools view -Oz -o out.vcf.gz in.vcf; tabix -p vcf`. But if lofreq can output directly, okay. To be robust, maybe call lofreq to plain VCF then bcftools compress? But extra work and temp. LoFreq likely outputs bgzip. Need check: In lofreq 2.1.5, `lofreq call` has `-o/--write-vcf` "Write the variant calls to a VCF file". It may not index unless `--index`? I recall options include `--no-index` maybe default true? Let's search memory: LoFreq CLI:
+```
+usage: lofreq call [-h] [--bam BAM | --fastq FASTQ ...] --ref REF [-o WRITE_VCF] [--n-threads N_THREADS] [--min-bq MIN_BQ] ...
+options:
+  -o, --write-vcf WRITE_VCF   Write the variant calls to a VCF file. If the filename ends with .gz, it will be compressed and indexed.
+```
+Maybe yes. It says if ends with .gz, compress and index? I think so. But we can still ensure tbi exists: `if [[ ! -s results/$s.vcf.gz.tbi ]]; then tabix -p vcf results/$s.vcf.gz; fi`. If lofreq didn't index but file is bgzipped, works. If not bgzipped, tabix fails. Could use bcftools to reindex? `bcftools index -t` also requires bgzip. To be safe, we can force output plain VCF then `bcftools view -Oz`. But lofreq may not support plain if .vcf? It does. Then bcftools compress and tabix. That uses only listed tools. More robust but more I/O. For small data fine.
+
+Need collapsed.tsv columns sample chrom pos ref alt af. Need extract from VCFs. Could use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\tAF]\n'`? AF is INFO field; for single-sample VCF, AF may be present if lofreq writes it. LoFreq VCF includes AF in INFO? It likely includes AF (allele frequency) maybe as INFO/AF or FORMAT/AD? Need ensure column af. If missing, compute from AD? The task expects af. We can use `bcftools query` with `%INFO/AF`. But if multiple ALTs? Amplicon mtDNA may have multiple alt at pos; need one row per sample chrom pos ref alt af. For multi-allelic sites, AF is comma-separated corresponding to ALTs. Need split into rows. Could use bcftools norm -m -a to make biallelic? Then each record has single ALT and AF maybe first. But if we collapse after calling, can normalize. However final per-sample VCF should be as called; collapsed table can be derived. We can use `bcftools query` with `-f '%CHROM\t%POS\t%REF\t%ALT[\tAF]\n'`? If multi-allelic, ALT and AF both comma lists; need expand. Better: `bcftools norm -m -a --output-type b -Ov` then query each alt separately. But if we use bcftools norm to stdout, no extra output files. Need preserve sample name. For each VCF, run:
+`bcftools norm -m -a -H results/$s.vcf.gz | bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\tAF]\n'`? Wait `bcftools norm -m -a` outputs biallelic records; if AF INFO not carried? It should carry. But for multi-allelic, splitting may adjust AF? bcftools norm -m -a splits multiallelic sites into separate records and updates INFO/AF? I think it does. Then query `%INFO/AF`. If no AF, maybe empty. Could compute from FORMAT/AD: `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\tDP]\n'` not enough. LoFreq includes AD in FORMAT and AF in INFO? Let's recall lofreq VCF format: It writes INFO fields: AF, DP, etc? I think yes: `AF=0.123;...`. Also FORMAT: GT, AD, DP, PL maybe. So use AF.
+
+Need collapsed.tsv header exactly: sample chrom pos ref alt af. Tab-separated. Need include all samples in order? Probably list given. We can generate by iterating samples and appending rows. If using `bcftools query` no echo for header? Constraint says do not use echo for user-facing prose, but writing header is output data, not prose. Is `printf` allowed? It's bash builtin. Could use `printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv`. That's okay? They said no echo for user-facing prose; printf to file is fine. But "Do not write to stderr/stdout beyond what tools naturally emit" - writing to file not stdout. Good.
+
+Need idempotent collapsed: If exists and non-empty, skip. But if we skip, ensure header present? Could just check `[[ -s results/collapsed.tsv ]]`. If missing, generate from existing VCFs. If some sample VCF missing but bam exists? We'll run sample first. Need order: define samples array. For each sample, if all outputs exist and non-empty, continue; else perform mapping/calling/indexing. After loop, if collapsed missing or empty, generate. But what if collapsed exists but a new sample output was generated (because previously missing)? Then should regenerate? Idempotent on populated results: all present skip. If partial, maybe regenerate after generating missing. We can track `need_collapse=1` initially if collapsed missing; also set need_collapse=1 when any sample processed. At end if need_collapse and not exists? Actually if collapsed existed but we processed a sample (because missing), should update to include new sample. So set flag if any sample run. Then regenerate collapsed at end if flag or missing. But "without redoing work" on populated results: no sample run, collapsed exists -> skip. Good.
+
+Need check file existence and non-empty. Use `[[ -s file ]]`. For bam.bai/tbi maybe. If vcf.gz.tbi missing but vcf exists, we can index without recalc? But our per-sample condition requires all four; if tbi missing, it will rerun entire sample unless we handle partial. To be idempotent and avoid redoing work on partial? Requirement only populated results (all outputs) must not redo. Partial not specified. Could implement granular: ensure ref index; for each sample, if bam missing or empty -> map/sort; else if bai missing -> index; if vcf missing -> call; if tbi missing -> tabix. That avoids redoing work and handles partial. But need be careful with lofreq output plain? We'll design granular.
+
+Pseudo:
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS="${THREADS:-4}"
+REF="data/ref/chrM.fa"
+RAW="data/raw"
+OUT="results"
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+# ensure results dir? mkdir -p "$OUT" maybe.
+mkdir -p "$OUT"
+
+# index ref if missing: bwa index creates .amb etc; samtools faidx creates .fai. Need both? lofreq needs reference, may use htslib and require .fai? It can read fasta but indexing helps. bwa mem requires BWA index (.amb). We can check for `${REF}.fai` and `${REF}.amb`. If missing:
+if [[ ! -s ${REF}.fai || ! -s ${REF}.amb ]]; then
+  samtools faidx "$REF"
+  bwa index -a is "$REF"? 
+fi
+```
+BWA index algorithm for mtDNA? `bwa index` default may choose bwamem? In 0.7.18, `bwa index [opts] <in.fasta>`; options `-a {is|bwsw}`? For BWA-MEM maybe use `bwa index -a is`? Actually old bwa aln uses is (BWT) and bwasw for long reads. BWA-MEM also uses BWT index, same as aln? I think default okay. Could run `bwa index "$REF"`. If reference already has .amb but no .fai, faidx. Need avoid rerun if one missing. Use separate:
+```
+if [[ ! -s ${REF}.fai ]]; then samtools faidx "$REF"; fi
+if [[ ! -s ${REF}.amb ]]; then bwa index "$REF"; fi
+```
+But `bwa index` may create .ann, .pac, .sa. Check .amb enough? BWA index files include .amb, .ann, .pac, .sa for aln; for mem maybe same? Yes.
+
+Potential issue: bwa 0.7.18 with `bwa mem` on aarch64? okay.
+
+Per sample granular:
+```
+for s in "${SAMPLES[@]}"; do
+  r1="$RAW/${s}_1.fq.gz"
+  r2="$RAW/${s}_2.fq.gz"
+  bam="$OUT/$s.bam"
+  bai="$bam.bai"
+  vcf="$OUT/$s.vcf.gz"
+  tbi="$vcf.tbi"
+
+  if [[ ! -s "$bam" ]]; then
+    bwa mem -t "$THREADS" "$REF" "$r1" "$r2" | samtools sort -@ "$THREADS" -m 4G? -o "$bam" -
+  fi
+  if [[ ! -s "$bai" ]]; then
+    samtools index "$bam"
+  fi
+
+  if [[ ! -s "$vcf" ]]; then
+    lofreq call --n-threads "$THREADS" --bam "$bam" --ref "$REF" -o "$vcf"
+  fi
+  # ensure tbi; if missing, tabix. But if vcf not bgzipped? We can use bcftools index? Let's robustly ensure by using bcftools to create indexed vcf from lofreq plain? Hmm.
+```
+
+If we output directly .vcf.gz with lofreq and it doesn't index, `tabix -p vcf` works if bgzip. If not, fails. To be safe, maybe call lofreq to a temporary plain VCF then use bcftools view to compress/index. But temp file under results? Could write `$OUT/$s.vcf` (not final) then convert and remove. But outputs spec only includes .vcf.gz; extra temp okay if removed. Idempotent: if vcf.gz exists skip. If plain temp leftover, maybe ignore/remove. Use `tmp_vcf="$OUT/$s.vcf"`? Could conflict? Not in required outputs but okay. Better use `lofreq call ... -o "$OUT/$s.vcf"` then `bcftools view -Oz -o "$vcf" "$tmp_vcf"; tabix -p vcf "$vcf"; rm -f "$tmp_vcf"`. But if lofreq can output bgzip, this is extra but robust. However bcftools view on plain VCF with no header? okay. Need ensure `bcftools view` doesn't emit to stdout; use -o. It may warn if no index? Not needed.
+
+But using temp file under results could violate "Write all outputs under results/" (temp is output-ish). Fine. But idempotent rerun: if vcf.gz exists, skip lofreq and temp removal? If temp leftover from previous interrupted run, we might leave it; not required but okay. Could remove at start of sample processing if vcf missing? `rm -f "$tmp_vcf"` maybe uses rm (not listed). But coreutils likely allowed. To avoid extra files, could call lofreq directly to .vcf.gz and then ensure index with tabix. Simpler. Need decide robustness vs tool constraints.
+
+LoFreq 2.1.5: I can recall from docs: `lofreq call` writes VCF using htslib; if output file ends in `.gz`, it compresses and indexes? Let's search memory: In lofreq, `write_vcf` function uses `vcf_writer = htslib.VCFWriter(filename)` maybe. It may not index automatically. There is option `--no-index`? I remember using lofreq: output .vcf.gz often needs tabix indexing separately? Example pipelines:
+```
+lofreq call --bam aligned.bam --ref ref.fa -o variants.vcf.gz
+tabix -p vcf variants.vcf.gz
+```
+Maybe yes. Some docs say "The VCF file is indexed if it ends with .vcf.gz"? Not sure. We can just run tabix if tbi missing; if lofreq output not bgzipped, tabix fails. But I think lofreq uses htslib and writes bgzip for .gz. Good.
+
+Need consider `lofreq call` may require reference indexed? It uses pysam/htslib, needs .fai maybe. We create faidx.
+
+Potential issue: bwa mem output to pipe with samtools sort: if bwa fails, set -o pipefail catches. Good. But bwa mem may emit warnings to stderr; allowed. Need memory: `-m` for samtools sort? Default 1G? For small okay. Could use `samtools sort -@ "$THREADS" -o "$bam" -`. No need -m.
+
+Need set `SAMTOOLS_VIEW_CACHE_SIZE`? no.
+
+Collapsed generation robustly:
+```
+collapse() {
+  local tmp="$OUT/.collapsed.tmp"
+  printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$tmp"
+  for s in "${SAMPLES[@]}"; do
+    vcf="$OUT/$s.vcf.gz"
+    if [[ -s "$vcf" ]]; then
+      bcftools norm -m -a -H "$vcf" | bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\tAF]\n' | awk -v s="$s" '{print s"\t"$0}' >> "$tmp"
+    fi
+  done
+  mv "$tmp" "$OUT/collapsed.tsv"
+}
+```
+But uses awk and mv. Could avoid awk by using bcftools query with sample? There is no sample in query format? `%SAMPLE` maybe? In bcftools query, can use `%SAMPLE` to output sample name? I think yes: `%SAMPLE` outputs sample name (first sample). Then we don't need awk. Format: `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\tAF]\n'` doesn't include sample. Could do `-f '%SAMPLE\t%CHROM...'`. Does bcftools query support `%SAMPLE`? Yes, I think it outputs the sample name (or all samples with `[%SAMPLE]`). For single-sample VCF, `%SAMPLE` works. Then no awk needed. But if we use `bcftools norm -m -a`, sample preserved. So:
+```
+bcftools norm -m -a -H "$vcf" | bcftools query -f '%SAMPLE\t%CHROM\t%POS\t%REF\t%ALT[\tAF]\n' >> tmp
+```
+This avoids awk. But if AF missing, empty field; maybe okay? Need ensure af column numeric. Could use `%INFO/AF`. In format string, `[%INFO/AF]`? For INFO fields, syntax is `%INFO/AF` or `[AF]`? bcftools query: `%INFO/ID` or `%ID`? I think both? Examples: `-f '%CHROM\t%POS[\t%REF][\t%ALT]\n'`; for INFO: `[%INFO/DP]`. Actually format specifiers: `%CHROM`, `%POS`, `%REF`, `%ALT`, `%QUAL`, `%FILTER`, `%ID`, `%INFO/ID` or `%ID`? For sample fields: `%SAMPLE`, `%GT`, etc. To be safe use `%INFO/AF`. If AF absent, outputs empty? It may output `.`? Need check. bcftools query for missing INFO maybe empty string? Could be `.`, not sure. We can postprocess with sed? Not listed? Maybe awk allowed. But likely AF present.
+
+Need handle multi-allelic and AF: `bcftools norm -m -a` splits, but if original has multiple ALTs and AF list, after split each record should have one AF. If not, query `%ALT` may still be comma? With -m -a it shouldn't. But to be extra robust, could use `bcftools norm -d all -m -a`? Not necessary.
+
+Alternative: Use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\tAF]\n'` and then split with awk if multi-allelic. But no need if norm.
+
+Need ensure collapsed.tsv includes only variants? If VCF has no variants, query outputs nothing. Good.
+
+Potential issue: `bcftools norm -m -a -H` on a VCF without index? It can read bgzipped without index for full file. Fine. It may require reference to normalize? `-m -a` doesn't need ref unless checking alleles? It might not. Could add `--no-ref-check`? Not needed. But if no reference, bcftools norm may warn? It can operate without ref for multiallelic splitting? I think yes. To be safe, provide `--ref "$REF"`? `bcftools norm -m -a --ref "$REF"`. That requires .fai. Good. Use it.
+
+Need consider lofreq call output VCF sample name: It may set sample name from BAM header RG SM or first read group? If no read groups, maybe "unknown"? We can add `--sample-name`? LoFreq has option `--sample-name`? I think yes: `lofreq call --bam ... --ref ... -o out.vcf.gz --sample-name $s`. Need ensure. In lofreq 2.x, there is `--sample-name` to set sample name in VCF. Use it to guarantee collapsed sample column matches. If not available, could fail. Let's verify: LoFreq CLI options include `--sample-name SAMPLE_NAME`? I recall yes: "Set the sample name in the VCF output". Good.
+
+Need maybe use `lofreq call --bam ... --ref ... -o ... --n-threads "$THREADS" --sample-name "$s"`. If option not present, script fails. But likely present. Could avoid by using bcftools reheader to set sample name? More complex. Use lofreq option.
+
+Need bwa mem for paired-end MiSeq amplicon: maybe use `-M`? Not necessary. For mitochondrial reference, reads may map multiple times; bwa mem default reports best and secondary? It marks duplicates? No. LoFreq can handle. Could add `--no-dup`? no.
+
+Potential issue with bwa 0.7.18 on aarch64: `bwa mem` may not be available if compiled without? But inventory says bwa version 0.7.18; likely includes mem. If not, could use `bwa aln/sampe`. But lofreq expects SAM/BAM with proper CIGAR; aln works too but needs `bwa sampe`. However BWA-MEM is standard. Use mem.
+
+Need idempotent ref index: bwa index may fail if .amb exists? We check. But if .fai missing and .amb present, faidx only. If .fai present but .amb missing, bwa index. Good.
+
+Need ensure results directory creation without echo. `mkdir -p "$OUT"` external. Could use bash to create? No builtin mkdir. Use mkdir. It's standard. If strict no non-inventory tools, impossible. But likely okay.
+
+Need avoid absolute paths outside cwd. All relative.
+
+Need no hardcoded path outside cwd. Good.
+
+Need total wall-clock under 600s at THREADS=4. Four small samples; bwa mem + lofreq maybe fine. But if data large? MiSeq amplicon maybe moderate. Use threads. Could parallelize samples? Wall-clock <600, sequential may be okay for mtDNA. But to be safe, can run samples in parallel up to THREADS? However complexity and idempotent. Since each sample small, sequential fine. But if 4 samples with large reads, lofreq maybe slow. Could use `&` and wait to parallelize. But output interleaving stderr okay. Need ensure set -e with background jobs: need check exit codes. Could implement simple parallel pool? Overkill. Sequential likely under 600 for mtDNA amplicons. Use THREADS=4 per tool; sequential 4 samples maybe each few seconds/minutes. Fine.
+
+Need consider `lofreq call` memory/time: It calls variants on BAM, can be slow but small reference. Use `--n-threads`. Good.
+
+Potential issue: lofreq requires Python? It's in inventory as command. okay.
+
+Need final script shellcheck clean? Not required but good. Avoid unquoted variables. Use arrays.
+
+Let's draft:
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS="${THREADS:-4}"
+REF="data/ref/chrM.fa"
+RAW="data/raw"
+OUT="results"
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p "$OUT"
+
+if [[ ! -s "${REF}.fai" ]]; then
+  samtools faidx "$REF"
+fi
+if [[ ! -s "${REF}.amb" ]]; then
+  bwa index "$REF"
+fi
+
+collapse_needed=0
+
+for sample in "${SAMPLES[@]}"; do
+  r1="${RAW}/${sample}_1.fq.gz"
+  r2="${RAW}/${sample}_2.fq.gz"
+  bam="${OUT}/${sample}.bam"
+  bai="${bam}.bai"
+  vcf="${OUT}/${sample}.vcf.gz"
+  tbi="${vcf}.tbi"
+
+  if [[ ! -s "$bam" ]]; then
+    bwa mem -t "$THREADS" "$REF" "$r1" "$r2" | samtools sort -@ "$THREADS" -o "$bam" -
+    collapse_needed=1
+  fi
+  if [[ ! -s "$bai" ]]; then
+    samtools index "$bam"
+    collapse_needed=1? # not needed for collapsed but indicates work; okay.
+  fi
+
+  if [[ ! -s "$vcf" ]]; then
+    lofreq call --n-threads "$THREADS" --bam "$bam" --ref "$REF" --sample-name "$sample" -o "$vcf"
+    collapse_needed=1
+  fi
+  if [[ ! -s "$tbi" ]]; then
+    tabix -p vcf "$vcf"
+    collapse_needed=1? no.
+  fi
+done
+
+if [[ ! -s "${OUT}/collapsed.tsv" || $collapse_needed -eq 1 ]]; then
+  tmp="${OUT}/.collapsed.tmp"
+  printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$tmp"
+  for sample in "${SAMPLES[@]}"; do
+    vcf="${OUT}/${sample}.vcf.gz"
+    if [[ -s "$vcf" ]]; then
+      bcftools norm -m -a --no-ref-check? --ref "$REF" -H "$vcf" | bcftools query -f '%SAMPLE\t%CHROM\t%POS\t%REF\t%ALT[\tAF]\n' >> "$tmp"
+    fi
+  done
+  mv "$tmp" "${OUT}/collapsed.tsv"
+fi
+```
+
+Need think about `bcftools norm --ref` with `-m -a`: If reference provided, it may check alleles and drop variants not matching? It might require ref. Use `--no-ref-check` to avoid issues if VCF alleles differ due to lofreq? But we want split only. `bcftools norm -m -a --no-ref-check` is safe. Does bcftools 1.21 have `--no-ref-check`? Yes. Use it to not need ref and avoid dropping. Then no reference needed. Command:
+`bcftools norm -m -a --no-ref-check -H "$vcf" | bcftools query ...`
+This avoids potential ref issues. Good.
+
+But if VCF has multi-allelic with AF list, `norm -m -a --no-ref-check` should split and adjust AF? I think yes. If not, query `%ALT[\tAF]` may output multiple alt/af comma separated in one line, violating columns. Could instead use `bcftools norm -d all -m -a`? `-d all` drops multiallelic? No, we want split. There is option `-m -a` (split). Good.
+
+Need ensure AF field after splitting: bcftools norm updates INFO/AF by default? It has `--update-ids`, maybe not update AF? Let's check: `bcftools norm` options include `-d/--drop-bad`, `-m {,-a,+a}`, `--update-ids`. It may not recalculate AF. If original multi-allelic AF=0.1,0.2; splitting into two records might keep AF as list? I'm not entirely sure. bcftools norm likely adjusts INFO fields that are allele-specific (AF, AN?) when splitting? It has `--update-ids` for ID only. There is `bcftools +fixref`, etc. Maybe it does adjust AF? Need robust alternative: Use `bcftools query` with a format that expands ALT and AF separately using loops over samples? bcftools query can loop over alleles? Format specifiers include `[...]` to iterate over sample fields, but not over ALT/AF lists directly. There is `%ALT` outputs comma-separated; no built-in zip expansion. Could use awk to split if needed. Since plan mentions awk, we can use awk robustly. But if using bcftools norm -m -a, likely single alt. Let's verify from memory: `bcftools norm -m -a` splits multiallelic sites into separate records and updates INFO/AF? I have used it; yes it should split ALT and corresponding AF. Example: `A,C,G` with `AF=0.1,0.2,0.3` becomes three lines each one alt and af. It likely does. Good.
+
+Need consider lofreq VCF may be single-sample but no FORMAT? Query `%SAMPLE` works if header has sample. If sample name set, good.
+
+Potential issue: `bcftools query -f '%INFO/AF'` when AF missing outputs empty or `.`? Could produce line with trailing tab and dot. We can sanitize with awk to replace empty/dot with 0? But not necessary? The column af should be allele frequency; if no variants, none. If variant lacks AF, maybe lofreq always includes. Good.
+
+Need ensure collapsed.tsv rows sorted by sample order then VCF order (chrom pos). bcftools norm preserves order. Good.
+
+Potential issue: `lofreq call` may output VCF with multiple samples? No.
+
+Need idempotency with partial files: Suppose bam exists but empty? `-s` false, rerun. If bwa mem writes to existing file? It overwrites. Good. If previous interrupted left incomplete bam non-empty, we skip and maybe index fails? Could be issue. But requirement only populated valid results. Could add checksum? no.
+
+Need avoid writing stdout: `bwa mem | samtools sort` may output progress to stderr; okay. `lofreq` may output warnings; okay. `bcftools norm | bcftools query` writes to tmp file, no stdout. `printf > tmp`. Good.
+
+Need no user-facing prose. No echo. printf header is data. Fine.
+
+Potential issue: `set -euo pipefail` with `collapse_needed=0` and arithmetic? Use `if [[ ... || $collapse_needed -eq 1 ]]`; okay. But if collapse_needed unset? set. Good.
+
+Need maybe export OMP_NUM_THREADS? Not necessary. Could limit lofreq threads. bwa/samtools use THREADS. If running sequential, total CPU 4 per step. Wall-clock fine.
+
+Could parallelize to reduce wall-clock: Use `&` for each sample after ref index, wait. But then collapse_needed flag in subshell not updated if background. Could just always regenerate collapsed at end if missing or any output newer? Simpler sequential. Under 600 likely.
+
+Need think about bwa index idempotency: If .amb exists but other BWA index files missing/corrupt, skip and bwa mem may fail. Not required. Could check all four? For BWA aln/mem index files: `.amb`, `.ann`, `.pac`, `.sa`. Use if any missing then `bwa index`. But if .fai present and .amb missing, okay. If .amb present but .sa missing, bwa mem fail. To be robust:
+```
+if [[ ! -s "${REF}.amb" || ! -s "${REF}.ann" || ! -s "${REF}.pac" || ! -s "${REF}.sa" ]]; then bwa index "$REF"; fi
+```
+But BWA-MEM may use `.amb`, `.ann`, `.pac`, `.sa`? Yes. Use this. However if reference is small, `bwa index` creates these. Good.
+
+Need faidx: samtools faidx creates .fai only (and maybe .gzi for gz). Reference plain .fa, so .fai. Check `-s`.
+
+Potential issue: bwa index on aarch64 with BWA 0.7.18 may require `bwa index -a is`? Default algorithm might be `is` for aln and `bwsw` for long reads? Let's check: In BWA 0.7.18, `bwa index [opts] <in.fasta>` options include `-a {is|bwsw}` (default: is). So default okay. Could explicitly `bwa index -a is "$REF"` to ensure BWT for mem? I think BWA-MEM uses same BWT index as aln; yes. Use explicit maybe. But if option not recognized in some version? 0.7.18 recognizes. Use `bwa index -a is "$REF"`.
+
+Need bwa mem options: For short reads, `-t` okay. Could add `-R @RG...`? Not necessary. LoFreq sample name set. But for proper BAM header, maybe include read group with SM=sample to help lofreq if no --sample-name. Use `bwa mem -R "@RG\tID:${sample}\tSM:${sample}"`. This adds RG. It may be good. Does bwa 0.7.18 support `-R`? Yes. Need escape tabs in bash: use `$'@RG\tID:'...` or printf. Could avoid complexity. LoFreq sample-name enough. But if lofreq uses read group for sample name and no RG, maybe default. Use --sample-name.
+
+Potential issue: `lofreq call` may require BAM sorted by coordinate; we sort. Good.
+
+Need consider duplicate marking? Not required.
+
+Could use `samtools view -H` to check header? no.
+
+Collapsed generation with `bcftools norm` pipeline under pipefail: If bcftools query fails, script exits. Good. But if VCF has no variants, bcftools norm outputs header only; query outputs nothing. Fine.
+
+Need ensure tmp file not left on failure? set -e may leave .collapsed.tmp. Not required but could clean with trap? Using trap adds complexity and maybe stderr? Could add `trap 'rm -f "$tmp"' EXIT` but tmp variable scope. Not necessary. But idempotent rerun if previous failed leaving tmp, next run overwrites. Fine.
+
+Need use only listed tools: We use mkdir, printf (builtin), mv, rm? If we don't use rm except maybe not. We use bcftools, tabix, lofreq, bwa, samtools. `mkdir` and `mv` are coreutils. Plan mentions awk but we avoid awk. Is `mv` allowed? Could avoid mv by writing directly to collapsed.tsv? But need atomic? Not required. We can write header to final then append; if interrupted, partial. Idempotent rerun would see non-empty collapsed and skip even if incomplete. Better tmp+mv. Use mv. If strict no coreutils, impossible. Accept.
+
+Could avoid mkdir by `results` assumed exists? But initial run needs. Use mkdir.
+
+Need maybe use `command -v` to check tools? Not necessary; would output? no.
+
+Potential issue: The environment says pinned versions in conda env 'bench'. Do we need activate env? Constraint do not invoke conda. Assume tools on PATH already. Good.
+
+Need final script only. Ensure first line shebang, second set. No markdown.
+
+Let's think deeply about lofreq output and indexing. If `lofreq call -o results/sample.vcf.gz` writes plain gzip (not bgzip) or no index, tabix fails. To be robust without temp? We can use `bcftools view` to ensure bgzip/index from whatever lofreq wrote. But if lofreq wrote .vcf.gz not bgzip, bcftools view can read it? It may detect plain gzip and fail? htslib can read uncompressed or bgzipped; if file is plain gzip but named .gz, htslib might treat as compressed? It expects BGZF blocks for random access, but streaming maybe can read? `bcftools view` could read a regular gzipped VCF? I think htslib requires BGZF for .gz? It may fail. LoFreq likely uses htslib so bgzip.
+
+Could call lofreq to plain `.vcf` then bcftools compress/index, guaranteeing. Let's evaluate option availability and idempotency. If we do:
+```
+tmp_vcf="${OUT}/${sample}.vcf"
+if [[ ! -s "$vcf" ]]; then
+  if [[ -s "$tmp_vcf" ]]; then rm -f "$tmp_vcf"; fi
+  lofreq call ... -o "$tmp_vcf"
+  bcftools view -Oz -o "$vcf" "$tmp_vcf"
+  tabix -p vcf "$vcf"
+  rm -f "$tmp_vcf"
+fi
+```
+This uses `rm`. It ensures final VCF is bgzip indexed. But if lofreq can output .gz, this extra step may be slower but small. It also creates an intermediate file not in required outputs; okay under results. Idempotent: If vcf.gz exists, skip and leave tmp? We could remove tmp at start of sample loop unconditionally? `rm -f "${OUT}/${sample}.vcf"` maybe if no final? But if user has a plain VCF intentionally? Not relevant. To avoid leaving temp on rerun populated results (should not redo work), we shouldn't rm if all outputs exist? It's okay to remove extra temp, but "without redoing work" removing file is minor. Could skip entire sample if all four exist; then tmp leftover remains. Not an issue. But if partial with vcf.gz missing and tmp exists from previous successful lofreq but failed bcftools, we can reuse tmp instead of recalc? Granular:
+```
+if [[ ! -s "$vcf" ]]; then
+  if [[ ! -s "$tmp_vcf" ]]; then
+    lofreq call ... -o "$tmp_vcf"
+  fi
+  bcftools view -Oz -o "$vcf" "$tmp_vcf"
+fi
+if [[ -s "$vcf" && ! -s "$tbi" ]]; then tabix...; fi
+# optionally remove tmp if vcf exists? rm -f "$tmp_vcf"
+```
+This avoids redoing lofreq if tmp present. But extra file. Could be robust. However using plain VCF may lose some header compression? fine.
+
+But does `lofreq call` accept output filename `.vcf` (plain)? Yes likely. It writes uncompressed VCF. Then bcftools view -Oz compresses. Good. This avoids uncertainty about lofreq indexing. It uses only listed tools plus coreutils rm/mv. I lean to this robust approach.
+
+Need consider `bcftools view -Oz -o "$vcf" "$tmp_vcf"`: If tmp VCF has no index, fine. It may emit warnings if no header? okay. It will create bgzip. Then tabix. Good.
+
+Potential issue: LoFreq plain VCF may be large; but mtDNA small. Fine.
+
+Could avoid temp by using `lofreq call ... -o "$vcf"` and then `bcftools index`? But robust temp better.
+
+Need ensure final per-sample outputs exactly .bam, .bai, .vcf.gz, .tbi. Extra `.vcf` temp if not removed could be undesirable but not prohibited? "Final outputs (per sample...)" maybe expects only those? It says write all outputs under results/. Extra files likely okay, but to be clean remove temp after conversion. Use `rm -f "$tmp_vcf"` after tabix. If script interrupted before rm, leftover; next run if vcf.gz exists skip and not remove. Could at end of sample processing remove regardless? If we put `rm -f "$tmp_vcf"` inside the block after successful conversion, good. On rerun populated, no removal but temp likely already removed. If previous interrupted left temp and final exists, leftover extra file; not a failure. Could clean all temps at start: for sample in samples: rm -f "${OUT}/${sample}.vcf". But that uses rm and modifies results on rerun (minor). It would ensure no extra files. Is it okay to remove user's plain VCF? Not required outputs. I'd avoid unconditional removal to not touch populated results beyond skip. Extra temp not checked.
+
+Need think about `bcftools view` output: It may preserve sample name. Good.
+
+Collapsed generation from final vcf.gz. If we used bcftools norm, okay.
+
+Alternative for collapsed af: Use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\tAF]\n'` with `%INFO/AF`. In format string, if using brackets around AF? The syntax `[...]` is for iterating over sample fields, not INFO. For a single value, just `%INFO/AF`. But to include tab before AF only if present? Could use `[%INFO/AF]`? Let's recall bcftools query format: You can put any string in brackets to iterate over samples; inside you can use sample-specific fields and also global fields? Example from docs: `-f '%CHROM\t%POS[\t%REF][\t%ALT]\n'`? Actually that example seems wrong. Let's recall exact: `bcftools query -f '%CHROM\t%POS[\t%REF][\t%ALT]\n' file.vcf.gz` maybe outputs one line per sample? No, brackets iterate over samples; fields inside can be global or sample-specific. For single sample, `[...]` will output once. But if we want optional AF only if present, not needed. Use `-f '%SAMPLE\t%CHROM\t%POS\t%REF\t%ALT[\tAF]\n'`? Wait `[%INFO/AF]` inside brackets would iterate over samples and for each sample output tab+AF (global). That's okay for single sample; but if multiple samples, it would repeat global fields per sample. We have single. But syntax: `%SAMPLE\t%CHROM...[\t%INFO/AF]\n`. The bracketed part will be repeated for each sample. Since one sample, fine. If no AF, maybe outputs tab+empty? It may output tab and nothing or dot. Could produce trailing empty field. Accept? Maybe not. Better use no brackets: `-f '%SAMPLE\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`. This always includes tab then AF value (or .). Good.
+
+Does `%INFO/AF` work without brackets? Yes, global fields can be outside. Use that. If AF missing, bcftools query outputs `.`? I think for INFO missing it outputs empty string? Let's check: In bcftools query, if field not present, it prints nothing? For sample format missing maybe empty. It might print `.` for QUAL/ID? Not sure. Could sanitize with awk to replace `.` or empty with 0. But maybe not needed. To be safe and since plan mentions awk, we can pipe through awk to ensure af numeric and handle multi-allelic fallback. But using awk may violate tool inventory less than mkdir? They explicitly mention awk in recommended sequence, so okay. Let's design robust collapse with awk that handles both single and comma lists, and replaces missing/dot with 0.
+
+Option: For each VCF, use `bcftools query -f '%SAMPLE\t%CHROM\t%POS\t%REF\t%ALT[\tAF]\n'`? Need get AF list. Then awk split ALT and AF by comma. But if using norm -m -a, no need. However robust awk can handle multi-allelic without norm. Let's consider:
+```
+bcftools query -f '%SAMPLE\t%CHROM\t%POS\t%REF\t%ALT[\tAF]\n' "$vcf" | awk -F'\t' 'BEGIN{OFS="\t"} { n=split($5, alt, ","); m=split($6, af, ","); for(i=1;i<=n;i++){ a=(i<=m?af[i]:"0"); if(a==""||a==".") a="0"; print $1,$2,$3,$4,alt[i],a } }'
+```
+But format `[\tAF]`? Need correct. If we use `-f '%SAMPLE\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`, fields: 1 sample, 2 chrom, 3 pos, 4 ref, 5 alt, 6 af (maybe comma list). Then awk split. This avoids bcftools norm and handles multi-allelic. It also can handle missing AF by default 0. But if AF is a single value for biallelic, fine. If multi-allelic and AF list length matches ALT. If AF missing/empty/dot, set 0. If AF has fewer values than ALT (shouldn't), use 0. This may be more robust and uses awk (allowed by plan). It doesn't require bcftools norm. But need ensure `%INFO/AF` outputs comma-separated list for multi-allelic. Yes INFO/AF is comma-separated corresponding to ALTs. Good.
+
+Potential issue: If VCF has multiple samples, `%SAMPLE` outside brackets outputs first sample? Actually `%SAMPLE` may output all sample names separated by tabs? Let's check bcftools query: `%SAMPLE` prints the name of the sample (if there are multiple samples, it prints them tab-separated?) I think if used outside brackets, for multi-sample VCF it might print all sample names? But our VCF single. Fine.
+
+Could use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\tAF]\n'` and awk with sample variable. But using `%SAMPLE` simpler. Need verify syntax for INFO in format: Is it `%INFO/AF` or `[AF]`? I know bcftools query examples:
+```
+bcftools query -f '%CHROM\t%POS[\t%REF][\t%ALT]\n' file.vcf.gz
+```
+Actually that example from docs? Let's recall: To print sample-specific fields, use brackets. For INFO, you can use `%INFO/DP` or `[DP]`? The manual: "The format string is a sequence of characters and special tokens. Tokens are %CHROM, %POS, %REF, %ALT, %QUAL, %FILTER, %ID, %INFO/ID, %SAMPLE, %GT, etc." So `%INFO/AF` valid. Good.
+
+If AF missing, bcftools query may output empty string, resulting line with 5 fields? If we use awk -F'\t' and $6 empty, split gives m=0, set a=0. But if line has only 5 fields due to no trailing tab? Our format includes `\t%INFO/AF`, so even if AF empty, there is a trailing tab? It will output tab then empty, so NF=6 with $6="". Good. If bcftools omits the tab when field missing? Format string literal tab remains, so yes.
+
+Need handle ALT multi-allelic: `split($5, alt, ",")`. If ALT is `.` (missing), n=1 alt[1]="."; Should we skip non-variant? VCF records should have ALT not .; but if no variants none. Could skip if alt[i] == "." or empty. Add condition.
+
+Need handle AF values like `0.123` maybe with quotes? no. If AF is `.` set 0. If AF contains multiple values and some missing, okay.
+
+Collapsed generation using awk:
+```
+collapse() {
+  local tmp="${OUT}/.collapsed.tmp"
+  printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$tmp"
+  for sample in "${SAMPLES[@]}"; do
+    vcf="${OUT}/${sample}.vcf.gz"
+    [[ -s "$vcf" ]] || continue
+    bcftools query -f '%SAMPLE\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$vcf" |
+      awk -F'\t' -v OFS='\t' '
+        {
+          n = split($5, alt, ",")
+          m = (NF >= 6 ? split($6, af, ",") : 0)
+          for (i = 1; i <= n; ++i) {
+            a = (i <= m ? af[i] : "0")
+            if (a == "" || a == ".") a = "0"
+            if ($5 != "." && alt[i] != "" && alt[i] != ".") print $1, $2, $3, $4, alt[i], a
+          }
+        }' >> "$tmp"
+  done
+  mv "$tmp" "${OUT}/collapsed.tsv"
+}
+```
+But if `%SAMPLE` outputs sample name maybe not our variable; okay. If lofreq --sample-name works. If not, could use `-v s="$sample"` and ignore $1? But we want sample column exactly. Could force with awk: `print sample, $2,$3,$4,alt[i],a` where fields shift if no %SAMPLE. Maybe safer to not rely on VCF sample name: query without %SAMPLE and use awk -v s="$sample". Format: `%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF`. Then awk prints `s`. This guarantees sample column matches expected, even if VCF sample name differs. Good. Use that. It also avoids multi-sample issues. So:
+```
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$vcf" | awk -F'\t' -v OFS='\t' -v s="$sample" '...'
+```
+Fields: $1 chrom, $2 pos, $3 ref, $4 alt, $5 af. Good.
+
+Need ensure if AF missing and NF=4? Format includes tab before AF, so NF=5 with empty. But if bcftools query for missing INFO maybe doesn't output trailing tab? It should output literal tab then nothing. To be safe, awk uses `m = (NF >= 5 ? split($5, af, ",") : 0)`. Good.
+
+Need skip records where REF or ALT missing? Could add if ($1=="" || $2=="" || $3=="." || $4==".") next. But VCF valid. Add robust:
+```
+if ($1 == "" || $2 == "" || $3 == "." || $4 == ".") next
+```
+But if chrom is `.`? no.
+
+Need sort collapsed rows? The task doesn't require sorted, but per sample order and VCF coordinate order likely fine. If using bcftools query on vcf.gz without index, it reads in file order (coordinate). Good. Could sort with `sort` but not listed? Avoid. Sample loop gives sample order. Within sample, VCF order. Good.
+
+Need consider collapsed.tsv af format: Should be decimal maybe as in VCF. If AF is 0.123456, okay. If lofreq writes AF as e.g. `0.123` or `0.1234`. No need round. If AF missing set 0. Could be integer? fine.
+
+Potential issue: LoFreq VCF may store allele frequency in FORMAT/AD not INFO/AF? Let's verify. I think lofreq writes INFO/AF. From docs: "The VCF file contains the following fields: ... INFO: AF (allele frequency), DP, etc." Yes.
+
+Need maybe filter variants? Task doesn't specify filtering. Use all called variants. Could include low quality; okay. Collapsed af from AF. If they expect only high confidence? Not specified. Do not filter.
+
+Need consider mitochondrial reference circularity? chrM.fa linear 16569 bp. Amplicon reads may span origin? bwa mem maps to linear, maybe some unmapped. Fine.
+
+Potential issue: `bwa mem` with reference length 16k and short reads; default parameters okay. Could use `-K`? no.
+
+Need ensure samtools sort output BAM has header with @SQ from ref. If using pipe, bwa mem includes header. Good.
+
+Could add `samtools sort -@ "$THREADS" -m 2G` to limit memory. Not necessary but safe. Use `-m 1G`? For small. Maybe default okay. Add `-m 4G`? Could exceed if environment low. Use default or `-m 1G`. MiSeq amplicon maybe not huge. Use `samtools sort -@ "$THREADS" -o "$bam" -` no memory option.
+
+Need think about idempotency and file timestamps: If results populated but collapsed.tsv missing, our script will generate collapsed without redoing sample work because collapse_needed=0 (unless bai/tbi indexing sets? We should not set collapse_needed for index only? It doesn't matter; if collapsed missing, condition `! -s collapsed || collapse_needed` true. If all sample outputs exist and we only index missing tbi? But populated means tbi exists. For partial, okay.
+
+Should setting collapse_needed=1 when indexing bai/tbi cause regenerate collapsed even if it existed but only bai was missing? That's fine because work done; collapsed may not need update but regenerating is cheap. Requirement "without redoing work" on populated results: no missing files, so no index, collapse_needed remains 0, skip. Good.
+
+Need maybe check all sample outputs before deciding to regenerate collapsed? We do after loop. If a sample VCF missing and lofreq fails, script exits before collapse. okay.
+
+Potential issue with `lofreq call` output plain temp: It may create `.vcf` file that is not bgzipped; then bcftools view compresses. But if lofreq call itself tries to index? no. Good.
+
+Let's detail per-sample robust block:
+```
+  tmp_vcf="${OUT}/${sample}.vcf"
+  if [[ ! -s "$bam" ]]; then
+    bwa mem -t "$THREADS" "$REF" "$r1" "$r2" | samtools sort -@ "$THREADS" -o "$bam" -
+    collapse_needed=1
+  fi
+  if [[ ! -s "$bai" ]]; then
+    samtools index "$bam"
+    collapse_needed=1
+  fi
+
+  if [[ ! -s "$vcf" ]]; then
+    if [[ ! -s "$tmp_vcf" ]]; then
+      lofreq call --n-threads "$THREADS" --bam "$bam" --ref "$REF" --sample-name "$sample" -o "$tmp_vcf"
+    fi
+    bcftools view -Oz -o "$vcf" "$tmp_vcf"
+    collapse_needed=1
+  fi
+
+  if [[ ! -s "$tbi" ]]; then
+    tabix -p vcf "$vcf"
+    collapse_needed=1
+  fi
+
+  # remove temp if final exists? If we remove here, on rerun populated it will rm extra file (if any) but no work. Is that okay? It writes to results (removes). Could be considered modifying populated directory. But removing non-required temp is fine. However if tmp_vcf is a user's file with same name, not expected. To avoid touching on populated run, only remove inside the block where we created/converted? If final vcf existed from previous but temp leftover, we won't remove. Not an issue.
+  if [[ -s "$vcf" && -s "$tbi" ]]; then rm -f "$tmp_vcf"; fi
+```
+If we put rm after tbi, on populated run it will execute `rm -f` (no output) and modify directory by removing temp if present; if no temp, no effect. Is that "without redoing work"? It's a trivial check/rm. Could avoid by only rm in the branch where vcf was created:
+```
+  if [[ ! -s "$vcf" ]]; then
+    ...
+    bcftools view ...
+    collapse_needed=1
+  fi
+  if [[ ! -s "$tbi" ]]; then tabix...; fi
+  # clean temp only if we just made vcf? Need flag.
+```
+Use `made_vcf=0`; set 1 in branch; after tbi, if made_vcf rm. But if vcf existed and tbi missing, tmp may exist from previous lofreq but not used? Could leave. Not important. Simpler: no rm at all? Extra `.vcf` files remain. Might be undesirable. Use made_vcf flag.
+
+Pseudo:
+```
+  made_vcf=0
+  if [[ ! -s "$vcf" ]]; then
+    if [[ ! -s "$tmp_vcf" ]]; then lofreq ...; fi
+    bcftools view -Oz -o "$vcf" "$tmp_vcf"
+    made_vcf=1
+    collapse_needed=1
+  fi
+  if [[ ! -s "$tbi" ]]; then tabix...; collapse_needed=1; fi
+  if (( made_vcf )); then rm -f "$tmp_vcf"; fi
+```
+If vcf missing but tmp exists, we use tmp and remove after. Good. If vcf existed from previous but tmp leftover, not removed. Could clean at start of sample if all outputs exist? Not necessary.
+
+But `rm` is external. okay.
+
+Need consider `bcftools view -Oz -o "$vcf" "$tmp_vcf"` when `$vcf` already exists? We only run if ! -s vcf, so no. If vcf empty file (0 bytes), it will overwrite. Good.
+
+Potential issue: lofreq plain VCF may not have a header line `##fileformat=VCFv4.2`? It should. bcftools view requires valid VCF. Good.
+
+Could use `bcftools view -Oz -o "$vcf" --no-header`? no, need header for tabix. Keep header.
+
+Need think about `lofreq call` options: Does it have `--sample-name` in 2.1.5? Let's verify from memory of lofreq CLI (version 2.1.5). I used lofreq 2.0: `lofreq call --bam ... --ref ... -o out.vcf.gz`. Options include `--n-threads`, `--min-bq`, `--min-af`, `--write-vcf`? Wait `-o/--write-vcf` maybe not `--sample-name`? Let's search memory: LoFreq has subcommands call, filter. For call:
+```
+usage: lofreq call [-h] [--bam BAM | --fastq FASTQ ...] --ref REF [-o WRITE_VCF] [--n-threads N_THREADS] [--min-bq MIN_BQ] [--min-af MIN_AF] [--write-vcf WRITE_VCF]? 
+```
+I recall option `--sample-name` maybe in lofreq filter? Let's think. LoFreq VCF sample name: It may take from BAM read group or default to "lofreq". There is an option `--sample-name`? I have seen pipelines: `lofreq call --bam aligned.bam --ref ref.fa -o variants.vcf.gz`; then `bcftools reheader -s sample_name`. Not sure. Let's check memory of lofreq docs: It says "The sample name in the VCF is taken from the read group if present, otherwise it is 'unknown'." There may be no CLI option to set. Actually I recall using `lofreq call` and output VCF had sample name `sample1`? Maybe from BAM header. Let's investigate mentally: LoFreq source (Python) has argument parser in lofreq/call.py. Options: `--bam`, `--ref`, `-o/--write-vcf`, `--n-threads`, `--min-bq`, `--min-af`, `--no-dup`? It may have `--sample-name` because I remember `lofreq call --bam ... --ref ... -o out.vcf.gz --sample-name sample`. Hmm.
+
+If `--sample-name` not available, script fails. Need robust alternative: Set read group in bwa mem so lofreq can use it, and/or use bcftools reheader to rename sample after calling. We can avoid relying on lofreq option by adding `-R @RG...SM=sample` to bwa mem. Then VCF sample name likely sample. But if lofreq doesn't use RG? It might. Or we can rename with `bcftools reheader -s` from a temporary file. But that requires knowing current sample name. Could do:
+```
+current_sample=$(bcftools query -l "$vcf" | head -n1) # uses head (coreutils)
+if [[ "$current_sample" != "$sample" ]]; then bcftools reheader -s "$current_sample=$sample" ...; fi
+```
+But `head` external. Could use bash read: `IFS= read -r current_sample < <(bcftools query -l "$vcf")`. But process substitution and command output to stdout? It's internal, not user-facing? It writes to pipe, okay. But extra complexity. Also if multiple samples, only first. We can simply always reheader sample name to expected using `bcftools reheader -s` with a mapping from current to sample. Need know current. Could use `bcftools query -l` and read into variable; no external head. Example:
+```
+current=$(bcftools query -l "$vcf")
+if [[ "$current" != "$sample" ]]; then
+  printf '%s=%s\n' "$current" "$sample" > "${OUT}/.reheader.tmp"
+  bcftools reheader -s "${OUT}/.reheader.tmp" "$vcf" -Oz -o "${OUT}/${sample}.vcf.gz.new"
+  mv ...
+fi
+```
+But this adds files and work. Maybe not needed if lofreq --sample-name exists or bwa RG sets it.
+
+Let's verify lofreq option. I can recall from lofreq README: 
+```
+lofreq call --bam aligned.bam --ref ref.fa -o variants.vcf.gz
+```
+Options include `--n-threads`, `--min-bq`, `--min-af`, `--write-vcf`? There is a section "VCF output" maybe says sample name can be set with `--sample-name`. I think yes. Let's search memory: In lofreq 2.1, CLI help:
+```
+options:
+  -h, --help            show this help message and exit
+  --bam BAM             Input BAM file (must be coordinate sorted)
+  --ref REF             Reference FASTA file
+  -o WRITE_VCF, --write-vcf WRITE_VCF   Write VCF to file
+  --n-threads N_THREADS Number of threads
+  --min-bq MIN_BQ       Minimum base quality
+  --min-af MIN_AF       Minimum allele frequency
+  --sample-name SAMPLE_NAME Sample name for VCF output
+```
+I am leaning it exists. Use it.
+
+But to be extra robust, we can also add bwa `-R` read group. That doesn't hurt. Need format string with tabs. In bash:
+```
+rg="@RG\tID:${sample}\tSM:${sample}"
+bwa mem -t "$THREADS" -R "$rg" ...
+```
+But if variable contains literal `\t`, bwa expects actual tab? The `-R` argument should contain a header line with tabs. If we pass `@RG\tID...` with backslash-t, bwa may interpret? I think it expects actual tab characters, not escape sequences. In shell, use `$'@RG\tID:'${sample}$'\tSM:'${sample}` or printf. Example:
+```
+rg_line=$(printf '@RG\tID:%s\tSM:%s' "$sample" "$sample")
+bwa mem -t "$THREADS" -R "$rg_line" ...
+```
+`printf` builtin. Good. This adds read group. Does bwa 0.7.18 support `-R` with multiple RG? yes one line. It may require `@RG` header; okay.
+
+Potential issue: If sample name contains

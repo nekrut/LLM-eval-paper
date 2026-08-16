@@ -1,0 +1,244 @@
+*   Task: Per-sample variant calling on 4 paired-end MiSeq amplicon samples (human mtDNA).
+    *   Samples: `M117-bl`, `M117-ch`, `M117C1-bl`, `M117C1-ch`.
+    *   Inputs: `data/raw/*.fq.gz` and `data/ref/chrM.fa`.
+    *   Outputs (per sample): `.bam`, `.bam.bai`, `.vcf.gz`, `.vcf.gz.tbi`.
+    *   Final Output: `results/collapsed.tsv` with columns `sample chrom pos ref alt af`.
+    *   Constraints: Single bash script, no markdown, no prose, idempotent, use specific tools (bwa, samtools, bcftools, lofreq, tabix), max 600s wall-clock at 4 threads.
+
+    *   `THREADS=4`
+    *   `SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")`
+    *   `REF="data/ref/chrM.fa"`
+    *   `OUT_DIR="results"`
+
+        *   Check if `data/ref/chrM.fa.fai` exists. If not, `samtools faidx data/ref/chrM.fa`.
+        *   Check if `data/ref/chrM.fa.bwt` exists. If not, `bwa index data/ref/chrM.fa`.
+
+        *   Loop through each sample in `SAMPLES`.
+        *   Step 1: Alignment & Sorting (`bwa mem` -> `samtools sort`).
+            *   Check if `results/{sample}.bam` exists and is newer than inputs.
+            *   Inputs: `data/raw/{sample}_1.fq.gz`, `data/raw/{sample}_2.fq.gz`, and index files.
+            *   Command: `bwa mem -t $THREADS -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" $REF $F1 $F2 | samtools sort -@ $THREADS -o results/${sample}.bam`.
+            *   Note on `-R`: The prompt specifies literal `\t` (backslash and t). In bash, inside double quotes, `\t` is just `\t` unless interpreted. However, the requirement says: "The \t must remain the two characters backslash and t — bwa parses them itself."
+        *   Step 2: Indexing (`samtools index`).
+            *   Check if `results/{sample}.bam.bai` exists.
+            *   Command: `samtools index -@ $THREADS results/${sample}.bam`.
+        *   Step 3: Variant Calling (`lofreq call-parallel`).
+            *   Check if `results/{command}.vcf.gz.tbi` exists and is newer than `.bam`.
+            *   Command: `lofreq call-parallel --pp-threads $THREADS --verbose --ref $REF --out results/${sample}.vcf results/${sample}.bam`.
+        *   Step 4: Compression & Indexing (`bgzip`, `tabix`).
+            *   Check if `results/{sample}.vcf.gz` exists.
+            *   Command: `bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz` and `tabix -p vcf results/${sample}.vcf.gz`.
+            *   Cleanup: `rm results/${sample}.vcf`.
+
+        *   Check if `results/collapsed.tsv` exists and is newer than all `.vcf.gz.tbi` files.
+        *   Command: Loop through samples, run `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz`.
+        *   Header: `printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv`.
+        *   Append all outputs to the TSV.
+
+    *   `set -euo pipefail` is required.
+    1.  Check if `results/` exists, create it.
+    2.  Reference indexing:
+        ```bash
+        if [[ ! -f "${REF}.fai" ]]; then samtools faidx "$REF"; fi
+        if [[ ! -f "${REF}.bwt" ]]; then bwa index "$REF"; fi
+        ```
+    3.  Sample loop:
+        ```bash
+        for sample in "${SAMPLES[@]}"; do
+            F1="data/raw/${sample}_1.fq.gz"
+            F2="data/raw/${sample}_2.fq.gz"
+            BAM="results/${sample}.bam"
+            BAI="results/${sample}.bam.bai"
+            VCF_GZ="results/${sample}.vcf.gz"
+            TBI="results/${sample}.vcf.gz.tbi"
+
+            # Check if BAM needs rebuild (compare with F1, F2, and index)
+            if [[ ! -f "$BAM" ]] || [[ "$F1" -nt "$BAM" ]] || [[ "$F1" -nt "${REF}.bwt" ]]; then
+                bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF" "$F1" "$F2" | \
+                samtools sort -@ "$THREADS" -o "$BAM"
+            fi
+
+            if [[ ! -f "$BAI" ]] || [[ "$BAM" -nt "$BAI" ]]; then
+                samtools index -@ "$THREADS" "$BAM"
+            fi
+
+            if [[ ! -f "$TBI" ]] || [[ "$BAM" -nt "$TBI" ]]; then
+                lofreq call-parallel --pp-threads "$THREADS" --verbose --ref "$REF" --out "results/${sample}.vcf" "$BAM"
+                bgzip -c "results/${sample}.vcf" > "$VCF_GZ"
+                tabix -p vcf "$VCF_GZ"
+                rm "results/${sample}.vcf"
+            fi
+        done
+        ```
+    4.  Collapse:
+        ```bash
+        # Check if TSV needs rebuild (compare with all TBI files)
+        NEEDS_COLLAPSE=false
+        for sample in "${SAMPLES[@]}"; do
+            TBI="results/${sample}.vcf.gz.tbi"
+            if [[ ! -f "$TBI" ]] || [[ "$TBI" -nt "results/collapsed.tsv" ]]; then
+                NEEDS_COLLAPSE=true; break
+            fi
+        done
+
+        if [ "$NEEDS_COLLAPSE" = true ]; then
+            printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+            for sample in "${SAMPLES[@]}"; do
+                bcftools query -f "${sample}\t%CHROM\t%POS\t%EOF\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz" >> results/collapsed.tsv 2>/dev/null || \
+                bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz" >> results/collapsed.tsv
+            done
+        fi
+        ```
+    *Wait*, `bcftools query` format string: The prompt says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`. I must use exactly that.
+
+    *   The `-R` argument in `bwa mem`: `@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA`.
+    *   In bash, inside double quotes `"..."`, `\t` is literally backslash and `t`. This is correct for BWA.
+    *   Wait, if I use `"${sample}"` in the string, it will expand.
+    *   Example: `-R "@RG\tID:M117-bl\tSM:M117-bl\tLB:M117-bl\tPL:ILLUMINA"`. This is exactly what BWA wants.
+
+    *   `lofreq call-parallel ... results/{sample}.bam` (positional argument at end).
+    *   The prompt says: `lofreq call-parallel --pp-threads 4 --verbose --ref data/ref/chrM.fa --out results/{sample}.vcf --sig --bonf results/{sample}.bam`. I'll use the provided snippet structure.
+
+    *   `bgzip -c ... > ...` is standard.
+    *   `tabix -p vcf ...` is standard.
+
+    *   The `bcftools query` command: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`.
+    *   Wait, the `{sample}` in the format string is a placeholder for me to replace with the actual variable.
+
+    *   `M117-bl`, `M117-ch`, `M117C1-bl`, `M117C1-ch`.
+    *   All present.
+
+    *   Check if all `.vcf.gz.tbi` exist and are newer than `collapsed.tsv`.
+    *   If not, regenerate.
+
+    *   `bwa mem -t 4 ... | samtools sort -@ 4 ...` (Single pipe).
+    *   This is efficient.
+
+    *   `set -euo pipefail`
+    *   `THREADS=4`
+    *   `SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)`
+    *   `REF="data/ref/chrM.fa"`
+    *   Loop through samples.
+    *   Check existence of `.fai`, `.bwt`.
+    *   Check existence of `.bam`, `.bai`, `.vcf.gz`, `.tbi`.
+    *   Handle `bcftools query` with the sample name prepended in the format string.
+
+    One detail: The prompt says "The collapsed.tsv must have columns (tab-separated, with header): sample chrom pos ref alt af".
+    My loop for `bcftools query`:
+    ```bash
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz" >> results/collapsed.tsv
+    done
+    ```
+    This will produce: `M117-bl [tab] chrM [tab] 123 [tab] A [tab] G [tab] 0.5`. This matches the requirement.
+
+    *   `bwa mem -t 4 -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF" "$F1" "$F2"`
+    *   If I use double quotes, `${sample}` expands. The `\t` remains `\t`. This is perfect.
+
+    Wait, one small check on `lofreq`:
+    The prompt says:
+    ```
+    lofreq call-parallel --pp-threads 4 --verbose
+    --ref data/ref/chrM.fa --out results/{sample}.vcf
+    --sig
+    --bonf
+    results/{sample}.bam
+    ```
+    I will write it as a single command line to avoid issues with newlines in the script, but following that logic.
+
+    *   `bwa index` produces `.amb`, `.ann`, `.bwt`, `.pac`, `.sa`. Checking for `.bwt` is sufficient.
+    *   `samtools faidx` produces `.fai`.
+
+    *   The `bcftools query` command: If the VCF doesn't have an `AF` field, it might error or return empty. However, since this is a controlled task with specific tools and data, I assume `lofreq` provides `AF`.
+    *   Wait, `lofreq` output format: Does it always include `AF`? Usually, yes, in the INFO field.
+
+    *   The script must be self-contained.
+    *   No markdown.
+    *   Only the script.
+    *   All constraints met.
+
+    One final check on `lofreq`: The prompt says: "The bare `--sig` and `--bonf` lines come from Galaxy-runtime-supplied values; you can omit them or use defaults." I'll include them to be safe and follow the plan exactly.
+
+    *   `results/M117-bl.bam`
+    *   `results/M117-bl.bam.bai`
+    *   `results/M117-bl.vcf.gz`
+    *   `results/M117-bl.vcf.gz.tbi`
+    *   ... and so on for all 4 samples.
+    *   `results/collapsed.tsv`.
+
+    Everything looks solid.
+
+    One detail: `bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz`.
+    If the file is already there, I should check if it's newer than the `.vcf`. But since I delete the `.vcf` immediately after, checking for existence of `.tbi` or `.vcf.gz` and comparing with `.bam` is enough.
+
+    ```bash
+    if [[ ! -f "results/${sample}.vcf.gz.tbi" ]] || [[ "results/${sample}.bam" -nt "results/${sample}.vcf.gz.tbi" ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" --verbose --ref "$REF" --out "results/${sample}.vcf" --sig --bonf "results/${sample}.bam"
+        bgzip -c "results/${sample}.vcf" > "results/${sample}.vcf.gz"
+        tabix -p vcf "results/${sample}.vcf.gz"
+        rm "results/${sample}.vcf"
+    fi
+    ```
+
+    Wait, the `bcftools query` format string:
+    The prompt says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`.
+    In my script, I will use: `bcftools query -f "${sample}\t%CHROM\t%t%POS\t%REF\t%ALT\t%INFO/AF\n"`. No, wait. The prompt says the format string is `{sample}\t...`. This means the sample name is part of the format string itself.
+    So: `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`.
+
+    Final check on `bwa index`:
+    `bwa index data/ref/chrM.fa` produces several files. Checking for `data/ref/chrM.fa.bwt` is a standard way to see if it's indexed.
+
+    Final check on `samtools faidx`:
+    Checking for `data/ref/chrM.fa.fai`.
+
+    One more thing: The prompt says "The collapsed.tsv must have columns (tab-separated, with header): sample chrom pos ref alt af".
+    My code:
+    ```bash
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz" >> results/collapsed.tsv
+    done
+    ```
+    This is correct.
+
+    Wait, the `lofreq` command: The prompt says `lofreq call-parallel ... --out results/{sample}.vcf`. I should ensure the `.vcf` file is created in `results/`. My script does this.
+
+    One last check on `bwa mem -R`:
+    `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`
+    If `sample="M117-bl"`, the string is `"@RG\tID:M117-bl\tSM:M117-bl\tLB:M117-bl\tPL:ILLUMINA"`.
+    The `\t` are literal backslash and `t`. This is exactly what BWA expects.
+
+    Final check on the `collapsed.tsv` idempotency:
+    ```bash
+    NEEDS_COLLAPSE=false
+    for sample in "${SAMPLES[@]}"; do
+        TBI="results/${sample}.vcf.gz.tbi"
+        if [[ ! -f "$TBI" ]] || [[ "$TBI" -nt "results/collapsed.tsv" ]]; then
+            NEEDS_COLLAPSE=true
+            break
+        fi
+    done
+
+    if [ "$NEEDS_COLLAPSE" = true ]; then
+       ...
+    fi
+    ```
+    This is correct. If any TBI is missing or newer than the TSV, rebuild.
+
+    Wait, `bcftools query` might fail if a sample's VCF doesn't have an `AF` field (e.g., if it's just a single-line header). But in this specific workflow, we assume the tool works as expected. I will use the exact format string provided.
+
+    One small detail: `bwa index` can be slow. The constraint is 600 seconds. For a 16kb reference, it's instantaneous. Alignment and calling for 4 samples should also be well within 10 minutes on 4 threads.
+
+    Final check on the `lofreq` command structure:
+    The prompt says:
+    ```
+    lofreq call-parallel --pp-threads 4 --verbose
+    --ref data/ref/chrM.fa --out results/{sample}.vcf
+    --sig
+    --bonf
+    results/{sample}.bam
+    ```
+    I will use a single line: `lofreq call-parallel --pp-threads "$THREADS" --verbose --ref "$REF" --out "results/${sample}.vcf" --sig --bonf "results/${sample}.bam"`
+
+    Wait, the prompt says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`.
+    I will use exactly that in my loop.

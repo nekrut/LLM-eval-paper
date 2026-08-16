@@ -1,0 +1,389 @@
+We need to produce a bash script that does per-sample variant calling on paired-end MiSeq amplicon samples mapped to chrM (16569 bp). Outputs: results/{sample}.bam, .bai, .vcf.gz, .vcf.gz.tbi, and collapsed.tsv. Must be idempotent.
+
+We need to use tools: bwa mem, samtools view, samtools sort, samtools index, bcftools view, bcftools maketable? Actually bcftools view can output VCF directly; then bcftools maketable -Oz -o results/collapsed.tsv. But we need per-sample collapsed table with columns sample chrom pos ref alt af. That's exactly what bcftools maketable produces: sample,chrom,pos,ref,alt,af.
+
+We also need to ensure idempotent: check if outputs exist; skip steps accordingly.
+
+Workflow:
+
+For each sample (M117-*, etc):
+  - Input raw paired-end files in data/raw/{sample}_1. fq.gz and *_2.fq.gz
+  - Use bwa mem chrM.fa paired reads to produce BAM: results/{sample}.bam
+  - samtools view -bS results/{sample}.bam > results/{sample}.bam.sorted? Actually we need .bam already sorted? Usually bwa output is unsorted; we can sort with samtools sort and index. But requirement: results/{sample}.bam (maybe unsorted). We'll just produce BAM from bwa mem, then sort to ensure consistent.
+
+But idempotent: if .bam exists, skip sorting? Might be okay.
+
+Steps:
+
+1. Ensure results directory exists.
+2. For each sample:
+   a. Check if results/{sample}.vcf.gz exists; if not, do variant calling:
+        bwa mem data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz > results/${sample}.bam
+        samtools view -bS results/${sample}.bam | samtools sort -@4 -o results/${sample}.bam.sorted? Actually we want .bam final; maybe just use samtools sort to produce sorted BAM and index.
+        samtools sort -@4 results/${sample}.bam > results/${sample}_sorted.bam
+        samtools index results/${sample}_sorted.bam
+        mv results/${sample}_sorted.bam results/${sample}.bam
+        samtools index results/${sample}.bam
+
+   b. bcftools view -Oz results/${sample}.bam > results/${sample}.vcf.gz
+   c. bcftools maketable -Oz -o results/collapsed.tsv results/*.vcf.gz? Actually we need per-sample collapsed table; but requirement: results/collapsed.tsv is a single collapsed table for all samples. So after generating each sample's VCF, we can append to collapsed.tsv.
+
+   d. Ensure results/{sample}.bam and .bai exist (samtools index creates .bai).
+
+3. At end, ensure collapsed.tsv has header if empty: use seqkit? Or just check existence; if file exists but no header, maybe need to add header. Could use echo -e "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv && cat results/collapsed.tsv >> results/collapsed.tsv.
+
+But idempotent: if header already present, avoid duplicate.
+
+Simplify: At end, ensure collapsed.tsv has header only if file empty. Use seqkit? Not needed; we can use bash conditional.
+
+Implementation details:
+
+- Loop over samples array.
+- Use set -euo pipefail ensures errors abort.
+
+We must not hardcode absolute paths.
+
+Script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Ensure results dir exists
+mkdir -p results
+
+# Sample list
+samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+for sample in "${samples[@]}"; do
+    # BAM output
+    bam_out="results/${sample}.bam"
+    if [[ ! -f "$bam_out" ]]; then
+        bwa mem data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz > "$bam_out"
+        samtools view -bS "$bam_out" | samtools sort -@4 -o results/${sample}.sorted.bam
+        samtools index results/${sample}.sorted.bam
+        mv results/${sample}.sorted.bam "$bam_out"
+    fi
+
+    # VCF.gz output
+    vcf_out="results/${sample}.vcf.gz"
+    if [[ ! -f "$vcf_out" ]]; then
+        bcftools view -Oz "$bam_out" > "$vcf_out"
+    fi
+
+    # Append to collapsed.tsv (if not header already)
+    if [[ ! -s "results/collapsed.tsv" ]] || [[ $(head -n1 results/collapsed.tsv | grep -q '^sample' ) ]]; then
+        echo "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv
+    fi
+    bcftools maketable -Oz -o results/collapsed.tsv "$vcf_out"
+done
+
+But this will overwrite collapsed.tsv each iteration, not append. Need to accumulate.
+
+Better: Use a temporary file and cat at end.
+
+We'll create tempfile=$(mktemp) then after loop cat all vcf.gz into it? Actually we need per-sample collapsed table; bcftools maketable -Oz outputs a single TSV with header sample,chrom,... So each VCF produces its own collapsed.tsv. We want one file containing all samples' rows.
+
+Thus after generating each sample's VCF, we can append its rows to results/collapsed.tsv.
+
+Simplify: Use bcftools view -Oz then bcftools maketable -Oz -o results/tmp.tsv "$vcf_out". Then cat results/tmp.tsv >> results/collapsed.tsv. But need header only once.
+
+Implementation:
+
+tmp=$(mktemp)
+for sample...; do
+    # generate vcf.gz
+    bcftools view -Oz "$bam_out" > "results/${sample}.vcf.gz"
+    bcftools maketable -Oz -o "$tmp" "results/${sample}.vcf.gz"
+done
+
+# Ensure header only once
+if [[ ! -s results/collapsed.tsv ]]; then echo "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv; fi
+cat "$tmp" >> results/collapsed.tsv
+rm "$tmp"
+
+But we also need .bai index for each BAM. samtools index creates it.
+
+Now ensure idempotent: if bam exists, skip generation. If vcf.gz exists, skip view/maketable? But then collapsed table may be missing rows; but idempotent means rerunning does not redo work or error. So if output already exists, we should not generate new BAM/VCF and also not append to collapsed.tsv (since row already present). That's fine.
+
+Thus need to check existence of vcf.gz before generating and appending.
+
+Implementation:
+
+for sample...; do
+    bam_out="results/${sample}.bam"
+    if [[ ! -f "$bam_out" ]]; then
+        # generate BAM
+        bwa mem data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz > "$bam_out"
+        samtools view -bS "$bam_out" | samtools sort -@4 -o results/${sample}.sorted.bam
+        samtools index results/${sample}.sorted.bam
+        mv results/${sample}.sorted.bam "$bam_out"
+    fi
+
+    vcf_out="results/${sample}.vcf.gz"
+    if [[ ! -f "$vcf_out" ]]; then
+        bcftools view -Oz "$bam_out" > "$vcf_out"
+        # append to collapsed.tsv only once per sample? Actually each iteration will create new row; but we want one row per VCF. If vcf already exists, skip.
+    fi
+
+    if [[ ! -s "results/collapsed.tsv" ]] || [[ $(head -n1 results/collapsed.tsv | grep -q '^sample' ) ]]; then
+        echo "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv
+    fi
+    bcftools maketable -Oz -o results/collapsed.tsv "$vcf_out"
+done
+
+But this will overwrite collapsed.tsv each iteration, not append. Need to accumulate.
+
+Better: Use a temporary file for all rows and then cat at end.
+
+tmp=$(mktemp)
+for sample...; do
+    bam_out="results/${sample}.bam"
+    if [[ ! -f "$bam_out" ]]; then
+        bwa mem data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz > "$bam_out"
+        samtools view -bS "$bam_out" | samtools sort -@4 -o results/${sample}.sorted.bam
+        samtools index results/${sample}.sorted.bam
+        mv results/${sample}.sorted.bam "$bam_out"
+    fi
+
+    vcf_out="results/${sample}.vcf.gz"
+    if [[ ! -f "$vcf_out" ]]; then
+        bcftools view -Oz "$bam_out" > "$vcf_out"
+    fi
+
+    # Append rows from this VCF to tmp
+    bcftools maketable -Oz -o /dev/stdout "$vcf_out" >> "$tmp"
+done
+
+# Ensure header only once
+if [[ ! -s results/collapsed.tsv ]]; then echo "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv; fi
+cat "$tmp" >> results/collapsed.tsv
+rm "$tmp"
+
+But note: bcftools maketable -Oz outputs header and rows. If we redirect to stdout, it will include header each time -> duplicate headers. We need only one header at top.
+
+Thus better: Use bcftools view -Oz then bcftools maketable -Oz without header? Actually maketable includes header by default. To avoid duplicates, we can generate rows only (no header) using bcftools view -Oz and then bcftools maketable -Oz -o /dev/stdout "$vcf_out" | tail -n +2.
+
+But that's messy.
+
+Alternative: Use bcftools view -Oz to produce VCF, then use bcftools maketable -Oz -o results/collapsed.tsv "$vcf_out". That overwrites file each iteration. Not good.
+
+Simplify: Since we need only one collapsed table with all samples rows, we can generate a single TSV from concatenated VCFs using bcftools view -Oz on concatenated? But easier: Use bcftools maketable on combined list of VCFs? There is no such command.
+
+Simpler: After generating each sample's VCF, we can append its rows to collapsed.tsv via bcftools maketable -Oz -o results/collapsed.tsv "$vcf_out" but that overwrites. So need to accumulate manually.
+
+We could use seqkit? Not needed.
+
+Maybe we can generate a temporary file with all rows using bcftools view -Oz and then bcftools maketable -Oz -o results/collapsed.tsv<(cat vcf1 vcf2 ...). But that's complex.
+
+Given constraints, maybe acceptable to overwrite collapsed.tsv each iteration; but idempotent means rerunning does not redo work or error. Overwriting is okay as long as output same content (same rows). If we generate same rows each time, it's fine. However if sample VCF changes due to new data? Not.
+
+But requirement: "Do not redo work". So generating BAM/VCF again is redoing work; that's okay because they exist already. Overwriting collapsed.tsv with same content is also okay.
+
+Thus we can keep simple: For each sample, generate BAM if missing, VCF.gz if missing, then bcftools maketable -Oz to results/collapsed.tsv (overwrites). That will produce final collapsed table with all rows. Idempotent because if files exist, nothing runs.
+
+But need header only once; each iteration adds header? bcftools maketable includes header by default. So final file would have multiple headers stacked: first header from first sample, then second header etc. That's wrong.
+
+Thus we must ensure only one header at top. Could generate collapsed.tsv after loop using seqkit to add header if missing.
+
+Simplify: After loop, check if file exists and has header; if not, prepend header.
+
+Implementation:
+
+# Loop generating per-sample BAM/VCF as above
+
+tmp=$(mktemp)
+for sample...; do
+    # generate vcf.gz
+    bcftools view -Oz "$bam_out" > "results/${sample}.vcf.gz"
+    bcftools maketable -Oz -o /dev/stdout "$results/${sample}.vcf.gz" >> "$tmp"
+done
+
+# Ensure header only once
+if [[ ! -s results/collapsed.tsv ]]; then echo "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv; fi
+cat "$tmp" >> results/collapsed.tsv
+rm "$tmp"
+
+But each bcftools maketable outputs header, so we need to skip header for all but first. Use tail -n +2.
+
+Better: In loop, append only rows:
+
+bcftools view -Oz "$bam_out" > "results/${sample}.vcf.gz"
+bcftools maketable -Oz -o /dev/stdout "$results/${sample}.vcf.gz" | tail -n +2 >> "$tmp"
+
+That way header not added.
+
+But need to ensure first sample's header is added via initial echo.
+
+Implementation:
+
+tmp=$(mktemp)
+first=true
+for sample...; do
+    bcftools view -Oz "$bam_out" > "results/${sample}.vcf.gz"
+    if $first; then
+        bcftools maketable -Oz -o /dev/stdout "$results/${sample}.vcf.gz" >> "$tmp"
+        first=false
+    else
+        bcftools view -Oz "$bam_out" > "results/${sample}.vcf.gz"
+        bcftools maketable -Oz -o /dev/stdout "$results/${sample}.vcf.gz" | tail -n +2 >> "$tmp"
+    fi
+done
+
+# Ensure header only once at top
+if [[ ! -s results/collapsed.tsv ]]; then echo "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv; fi
+cat "$tmp" >> results/collapsed.tsv
+rm "$tmp"
+
+But this is getting complex.
+
+Given time, maybe acceptable to produce script that overwrites collapsed.tsv each iteration with proper header only once using bcftools maketable on concatenated VCFs via seqkit? Not available.
+
+Simplify: Use bcftools view -Oz and then use bcftools maketable -Oz -o results/collapsed.tsv<(cat vcf1 vcf2 ...). That would produce header once. But we need to generate each VCF first.
+
+We can do:
+
+tmp=$(mktemp)
+for sample...; do
+    bcftools view -Oz "$bam_out" > "results/${sample}.vcf.gz"
+    cat results/${sample}.vcf.gz >> "$tmp"
+done
+
+# Now create collapsed.tsv with header once
+echo "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv
+bcftools view -Oz<(cat $tmp) | bcftools maketable -Oz -o results/collapsed.tsv
+
+But that's not correct; we need to feed concatenated VCFs to bcftools view? Actually bcftools view expects a BAM, not multiple files. So can't.
+
+Thus best: Use bcftools view on each BAM individually and append rows via bcftools maketable -Oz -o /dev/stdout | tail -n +2.
+
+We'll implement loop with header only first sample.
+
+Let's craft final script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p results
+tmp=$(mktemp)
+first=true
+
+for sample in M117-bl M117-ch M117C1-bl M117C1-ch; do
+    bam="results/${sample}.bam"
+    if [[ ! -f "$bam" ]]; then
+        bwa mem data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz > "$bam"
+        samtools view -bS "$bam" | samtools sort -@4 -o results/${sample}.sorted.bam
+        samtools index results/${sample}.sorted.bam
+        mv results/${sample}.sorted.bam "$bam"
+    fi
+
+    vcf="results/${sample}.vcf.gz"
+    if [[ ! -f "$vcf" ]]; then
+        bcftools view -Oz "$bam" > "$vcf"
+    fi
+
+    if $first; then
+        bcftools maketable -Oz -o /dev/stdout "$vcf" >> "$tmp"
+        first=false
+    else
+        bcftools view -Oz "$bam" > "results/${sample}.vcf.gz"
+        bcftools maketable -Oz -o /dev/stdout "results/${sample}.vcf.gz" | tail -n +2 >> "$tmp"
+    fi
+done
+
+if [[ ! -s results/collapsed.tsv ]]; then echo "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv; fi
+cat "$tmp" >> results/collapsed.tsv
+rm "$tmp"
+
+This should produce correct output.
+
+Check idempotent: if files exist, loop does nothing (bam exists, vcf exists). The collapsed table may be overwritten? Actually we still run loop but only append rows to tmp; then cat into collapsed.tsv again. That would duplicate rows. To avoid redoing work, we should skip generating VCF and appending if already present.
+
+Thus modify: after checking bam exists, also check vcf exists before generating and appending.
+
+Update:
+
+for sample...; do
+    bam="results/${sample}.bam"
+    if [[ ! -f "$bam" ]]; then
+        # generate BAM
+        ...
+    fi
+
+    vcf="results/${sample}.vcf.gz"
+    if [[ ! -f "$vcf" ]]; then
+        bcftools view -Oz "$bam" > "$vcf"
+    fi
+
+    if $first; then
+        bcftools maketable -Oz -o /dev/stdout "$vcf" >> "$tmp"
+        first=false
+    else
+        bcftools view -Oz "$bam" > "results/${sample}.vcf.gz"
+        bcftools maketable -Oz -o /dev/stdout "results/${sample}.vcf.gz" | tail -n +2 >> "$tmp"
+    fi
+done
+
+But if vcf already exists, we still generate new VCF (bcftools view) which is redoing work. To avoid that, skip entire row generation if vcf exists.
+
+Thus:
+
+if [[ ! -f "$vcf" ]]; then
+    bcftools view -Oz "$bam" > "$vcf"
+    # append to tmp only if not first? Actually we need to add rows.
+    if $first; then
+        bcftools maketable -Oz -o /dev/stdout "$vcf" >> "$tmp"
+        first=false
+    else
+        bcftools view -Oz "$bam" > "results/${sample}.vcf.gz"
+        bcftools maketable -Oz -o /dev/stdout "results/${sample}.vcf.gz" | tail -n +2 >> "$tmp"
+    fi
+else
+    # vcf exists, skip generating new VCF and appending rows (already present)
+    :
+fi
+
+But if vcf exists but we still need to append its rows? It's already in collapsed.tsv. So fine.
+
+Thus final script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p results
+tmp=$(mktemp)
+first=true
+
+for sample in M117-bl M117-ch M117C1-bl M117C1-ch; do
+    bam="results/${sample}.bam"
+    if [[ ! -f "$bam" ]]; then
+        bwa mem data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz > "$bam"
+        samtools view -bS "$bam" | samtools sort -@4 -o results/${sample}.sorted.bam
+        samtools index results/${sample}.sorted.bam
+        mv results/${sample}.sorted.bam "$bam"
+    fi
+
+    vcf="results/${sample}.vcf.gz"
+    if [[ ! -f "$vcf" ]]; then
+        bcftools view -Oz "$bam" > "$vcf"
+
+        if $first; then
+            bcftools maketable -Oz -o /dev/stdout "$vcf" >> "$tmp"
+            first=false
+        else
+            bcftools view -Oz "$bam" > "results/${sample}.vcf.gz"
+            bcftools maketable -Oz -o /dev/stdout "results/${sample}.vcf.gz" | tail -n +2 >> "$tmp"
+        fi
+    fi
+done
+
+if [[ ! -s results/collapsed.tsv ]]; then echo "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv; fi
+cat "$tmp" >> results/collapsed.tsv
+rm "$tmp"
+
+This should meet constraints.
+
+Check no hardcoded paths beyond cwd. Yes.
+
+No echo for user-facing prose.
+
+Now produce final answer: only script.

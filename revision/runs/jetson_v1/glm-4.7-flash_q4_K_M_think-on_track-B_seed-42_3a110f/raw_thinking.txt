@@ -1,0 +1,293 @@
+1.  **Analyze the Request:**
+
+    *   **Role:** Expert Bioinformatician.
+    *   **Output:** ONE self-contained bash script.
+    *   **Constraints:**
+        *   Shebang: `#!/usr/bin/env bash`
+        *   Set: `set -euo pipefail`
+        *   Input: `data/raw/` (4 paired-end FASTQs), `data/ref/` (chrM.fa).
+        *   Output: `results/` directory.
+        *   Idempotent: Must not redo work if results exist.
+        *   Paths: Relative only. No absolute paths.
+        *   Tools: `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`, `SnpSift`, `snpEff`, `fastqc`, `seqkit`, `snakemake`, `shellcheck`, `java`.
+        *   Time: < 600s at THREADS=4.
+        *   Output Files:
+            *   `results/{sample}.bam`
+            *   `results/{sample}.bam.bai`
+            *   `results/{sample}.vcf.gz`
+            *   `results/{sample}.vcf.gz.tbi`
+            *   `results/collapsed.tsv`
+    *   **Task:** Variant calling on mitochondrial DNA (chrM) for 4 samples.
+    *   **Collapsed TSV:** `sample  chrom  pos  ref  alt  af`.
+
+2.  **Determine the Workflow:**
+
+    *   **Step 1: Reference Indexing.**
+        *   Need to index `data/ref/chrM.fa` for BWA and Samtools.
+        *   Output: `data/ref/chrM.fa.bwt`, `data/ref/chrM.fa.ann`, etc. (or `.amb`, `.pac`, `.sa` depending on BWA version, usually `.amb` for 0.7.17+). Let's check standard BWA 0.7.18 output. It generates `.bwt`, `.pac`, `.ann`, `.amb`.
+        *   *Constraint Check:* Idempotency. Check if index exists.
+
+    *   **Step 2: Alignment.**
+        *   Tool: `bwa mem`.
+        *   Input: `data/raw/{sample}_1.fq.gz`, `data/raw/{sample}_2.fq.gz`, `data/ref/chrM.fa`.
+        *   Output: SAM -> BAM (sorted).
+        *   *Constraint Check:* Idempotency. Check if `results/{sample}.bam` exists.
+
+    *   **Step 3: BAM Indexing.**
+        *   Tool: `samtools index`.
+        *   Input: `results/{sample}.bam`.
+        *   Output: `results/{sample}.bam.bai`.
+        *   *Constraint Check:* Idempotency. Check if index exists.
+
+    *   **Step 4: Variant Calling.**
+        *   Tool: `lofreq call-parallel` or `bcftools mpileup` + `bcftools call`.
+        *   The prompt lists `lofreq`. `lofreq call-parallel` is good for multithreading.
+        *   Input: `results/{sample}.bam`, `data/ref/chrM.fa`.
+        *   Output: VCF.
+        *   *Constraint Check:* Idempotency. Check if `results/{sample}.vcf.gz` exists.
+
+    *   **Step 5: VCF Indexing.**
+        *   Tool: `tabix`.
+        *   Input: `results/{sample}.vcf.gz`.
+        *   Output: `results/{sample}.vcf.gz.tbi`.
+        *   *Constraint Check:* Idempotency. Check if index exists.
+
+    *   **Step 6: Collapsing and Formatting.**
+        *   Need to combine all 4 VCFs into one TSV.
+        *   Columns: `sample  chrom  pos  ref  alt  af`.
+        *   Tool: `bcftools query` or `bcftools view` + `awk`.
+        *   `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\n'` is the standard way to get AF.
+        *   Need to add the sample name. `bcftools view` can add INFO tags, but `bcftools query` doesn't easily inject the sample name into the output format string without some shell manipulation.
+        *   Better approach: Iterate over samples, extract VCF, add sample column, append to a file.
+        *   Or use `bcftools concat` (but that keeps VCF structure) then `bcftools query`.
+        *   Let's stick to a loop for simplicity and clarity in bash.
+        *   `bcftools view -Oz -o results/{sample}.vcf.gz results/{sample}.bam` (Wait, `lofreq` usually outputs VCF directly).
+        *   Let's use `bcftools query` to get the data.
+        *   Command: `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\n' results/{sample}.vcf.gz` -> This gives the columns. We need to prepend the sample name.
+        *   Loop: `for sample in ...; do bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\n' results/${sample}.vcf.gz | sed "s/^/${sample}\t/"; done > results/collapsed.tsv`.
+        *   *Constraint Check:* Idempotency. Check if `results/collapsed.tsv` exists.
+
+3.  **Refining the Workflow (Idempotency & Tool Usage):**
+
+    *   **Ref Index:** `bwa index data/ref/chrM.fa`. Check for `.amb` file.
+    *   **Alignment:** `bwa mem -t 4 data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools view -b - | samtools sort -o results/${sample}.bam -`. Check for `results/${sample}.bam`.
+    *   **BAM Index:** `samtools index results/${sample}.bam`. Check for `.bai`.
+    *   **VCF:** `lofreq call-parallel -f data/ref/chrM.fa -o results/${sample}.vcf.gz -m lofreq -C 50 -q 20 -Q 20 -t 4 results/${sample}.bam`. Check for `results/${sample}.vcf.gz`.
+        *   *Note:* `lofreq` options `-m lofreq` (default), `-C 50` (min base quality), `-q 20` (min mapping quality), `-Q 20` (min base quality). These are reasonable defaults.
+    *   **VCF Index:** `tabix -p vcf results/${sample}.vcf.gz`. Check for `.tbi`.
+    *   **Collapsing:**
+        *   `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\n' results/${sample}.vcf.gz`
+        *   Prepend sample name.
+        *   Append to `results/collapsed.tsv`.
+        *   Check if `results/collapsed.tsv` exists. If it does, check if it has content? Or just check existence. If it exists, skip.
+
+4.  **Drafting the Script:**
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # Directories
+    RAW_DIR="data/raw"
+    REF_DIR="data/ref"
+    OUT_DIR="results"
+
+    # Create output dir if missing (idempotent check usually implies checking existence, but mkdir -p is safe)
+    mkdir -p "$OUT_DIR"
+
+    # 1. Reference Indexing
+    REF_FA="$REF_DIR/chrM.fa"
+    REF_BWA="$REF_FA.bwt" # Check for bwa index files
+    if [ ! -f "$REF_BWA" ]; then
+        bwa index "$REF_FA"
+    fi
+
+    # Samples
+    SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+    # 2. Alignment
+    for sample in "${SAMPLES[@]}"; do
+        BAM="$OUT_DIR/${sample}.bam"
+        if [ ! -f "$BAM" ]; then
+            bwa mem -t 4 "$REF_FA" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz" | \
+            samtools view -b - | \
+            samtools sort -o "$BAM" -
+            samtools index "$BAM"
+        fi
+    done
+
+    # 3. Variant Calling
+    for sample in "${SAMPLES[@]}"; do
+        VCF="$OUT_DIR/${sample}.vcf.gz"
+        if [ ! -f "$VCF" ]; then
+            lofreq call-parallel -f "$REF_FA" -o "$VCF" -m lofreq -C 50 -q 20 -Q 20 -t 4 "$OUT_DIR/${sample}.bam"
+            tabix -p vcf "$VCF"
+        fi
+    done
+
+    # 4. Collapsing
+    COLLAPSED="$OUT_DIR/collapsed.tsv"
+    if [ ! -f "$COLLAPSED" ]; then
+        > "$COLLAPSED" # Clear or create empty
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\n' "$OUT_DIR/${sample}.vcf.gz" | \
+            sed "s/^/${sample}\t/" >> "$COLLAPSED"
+        done
+    fi
+    ```
+
+5.  **Reviewing Constraints & Edge Cases:**
+
+    *   *Constraint:* "Do not hardcode any path outside the current directory." -> Used `data/raw`, `data/ref`, `results`. Correct.
+    *   *Constraint:* "Do not invoke conda, pip, apt..." -> Correct.
+    *   *Constraint:* "Total wall-clock must be under 600 seconds at THREADS=4." -> BWA and Lofreq are fast. 4 samples * small amplicon (16k bp) is trivial. This will easily pass.
+    *   *Constraint:* "Do not write to stderr/stdout beyond what tools naturally emit." -> The script uses `echo`? No. It uses `> "$COLLAPSED"` which is standard redirection. It uses `sed` which outputs to stdout. It uses `bcftools query` which outputs to stdout. The script itself doesn't print status messages. This is compliant.
+    *   *Constraint:* "First line... Second line..." -> Checked.
+    *   *Tool Inventory:* `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`, `java` (not used), `SnpSift` (not used), `snpEff` (not used), `fastqc` (not used), `seqkit` (not used), `snakemake` (not used), `shellcheck` (not used). Correct.
+    *   *Output Format:* `results/{sample}.bam`, `.bai`, `.vcf.gz`, `.tbi`, `collapsed.tsv`. Checked.
+    *   *Collapsed TSV:* `sample  chrom  pos  ref  alt  af`. Checked.
+
+    *   *Refinement on Reference Indexing:* BWA 0.7.18 creates `.amb`, `.ann`, `.bwt`, `.pac`, `.sa`. Checking for `.bwt` is a safe bet for existence.
+    *   *Refinement on Lofreq:* `lofreq call-parallel` requires a reference fasta and a BAM. It outputs VCF. It needs `-t` for threads.
+    *   *Refinement on Collapsing:* `bcftools query` output format `%CHROM\t%POS\t%REF\t%ALT\t%AF\n` is correct for the columns requested (chrom, pos, ref, alt, af). The sample name needs to be prepended. `sed "s/^/${sample}\t/"` works.
+
+6.  **Final Code Structure:**
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    RAW="data/raw"
+    REF="data/ref"
+    OUT="results"
+
+    mkdir -p "$OUT"
+
+    # Index reference
+    REF_FA="$REF/chrM.fa"
+    if [ ! -f "${REF_FA}.bwt" ]; then
+        bwa index "$REF_FA"
+    fi
+
+    SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+    # Align
+    for s in "${SAMPLES[@]}"; do
+        BAM="$OUT/${s}.bam"
+        if [ ! -f "$BAM" ]; then
+            bwa mem -t 4 "$REF_FA" "$RAW/${s}_1.fq.gz" "$RAW/${s}_2.fq.gz" | \
+            samtools view -b - | \
+            samtools sort -o "$BAM" -
+            samtools index "$BAM"
+        fi
+    done
+
+    # Call variants
+    for s in "${SAMPLES[@]}"; do
+        VCF="$OUT/${s}.vcf.gz"
+        if [ ! -f "$VCF" ]; then
+            lofreq call-parallel -f "$REF_FA" -o "$VCF" -m lofreq -C 50 -q 20 -Q 20 -t 4 "$OUT/${s}.bam"
+            tabix -p vcf "$VCF"
+        fi
+    done
+
+    # Collapse
+    COLLAPSED="$OUT/collapsed.tsv"
+    if [ ! -f "$COLLAPSED" ]; then
+        > "$COLLAPSED"
+        for s in "${SAMPLES[@]}"; do
+            bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\n' "$OUT/${s}.vcf.gz" | \
+            sed "s/^/${s}\t/" >> "$COLLAPSED"
+        done
+    fi
+    ```
+
+    *Self-Correction on `set -euo pipefail`*: If `bcftools query` returns no lines (empty VCF), it might exit 1 depending on strictness, but usually `bcftools query` is fine. However, `set -e` might stop the script if a command fails. The `if [ ! -f ... ]` checks prevent running commands on non-existent files, which is good.
+
+    *One detail:* `lofreq call-parallel` might complain if the BAM is not indexed, but we index it immediately after sorting. The order of operations is correct.
+
+    *One detail on `bcftools query` format:* `%AF` is the allele frequency. In a mitochondrial context, usually, this is the frequency of the ALT allele relative to the total reads covering the site (or REF+ALT). The prompt asks for `af`. `bcftools query` `%AF` is the standard representation.
+
+    *One detail on `sed`:* `sed "s/^/${s}\t/"` adds the sample name followed by a tab. The header needs to be added.
+    The prompt says "Final outputs... collapsed.tsv". It implies the file should have a header.
+    I should add a header generation step or ensure the first line is the header.
+    Since I'm appending, I need to write the header first.
+    `echo -e "sample\tchrom\tpos\tref\talt\taf" > "$COLLAPSED"`
+    Then loop and append.
+
+    *Revised Collapsing Section:*
+    ```bash
+    COLLAPSED="$OUT/collapsed.tsv"
+    if [ ! -f "$COLLAPSED" ]; then
+        echo -e "sample\tchrom\tpos\tref\talt\taf" > "$COLLAPSED"
+        for s in "${SAMPLES[@]}"; do
+            bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\n' "$OUT/${s}.vcf.gz" | \
+            sed "s/^/${s}\t/" >> "$COLLAPSED"
+        done
+    fi
+    ```
+
+    *Check `set -euo pipefail` behavior with `echo -e`*: `echo` is a shell builtin, usually safe. `printf` is safer.
+    `printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"`
+
+    *Check `lofreq` command syntax:*
+    `lofreq call-parallel -f ref.fa -o out.vcf.gz -m lofreq -C 50 -q 20 -Q 20 -t 4 input.bam`
+    This looks correct for version 2.1.5.
+
+    *Check `bwa mem` syntax:*
+    `bwa mem -t 4 ref.fa R1.fq.gz R2.fq.gz`
+    Correct.
+
+    *Check `samtools sort` syntax:*
+    `samtools sort -o output.bam -`
+    Correct.
+
+    *Check `samtools index` syntax:*
+    `samtools index output.bam`
+    Correct.
+
+    *Check `tabix` syntax:*
+    `tabix -p vcf output.vcf.gz`
+    Correct.
+
+    *Check `bcftools query` syntax:*
+    `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\n' input.vcf.gz`
+    Correct.
+
+    *Check `sed` syntax:*
+    `sed "s/^/${s}\t/"`
+    Correct.
+
+    *Final check on paths:*
+    `data/raw/`, `data/ref/`, `results/`.
+    No `/home`, `/tmp`, absolute paths.
+    Correct.
+
+    *Final check on idempotency:*
+    The script checks for the existence of the final output file (`results/collapsed.tsv`) and intermediate files (`results/{sample}.bam`, `results/{sample}.vcf.gz`) before running the heavy lifting.
+    If `results/collapsed.tsv` exists, it skips the loop.
+    If `results/{sample}.bam` exists, it skips alignment.
+    If `results/{sample}.vcf.gz` exists, it skips calling.
+    Correct.
+
+    *One minor optimization:* `lofreq` might be faster if we use `--ploidy 1` for mitochondrial DNA, but the default is usually fine. The prompt doesn't specify ploidy, but mtDNA is haploid. However, `lofreq` usually handles heteroplasmy (multiple alleles) well. I'll stick to defaults to keep it simple and robust unless performance is critical (it's not, <600s is easy).
+
+    *Wait, `lofreq` version 2.1.5:*
+    `lofreq call-parallel` is the standard command.
+    `-C` is min base quality.
+    `-q` is min mapping quality.
+    `-Q` is min base quality.
+    These are standard.
+
+    *One edge case:* What if `bcftools query` returns nothing? The script will just append an empty line for that sample. That's acceptable behavior for a collapsed table.
+
+    *Header:* The prompt asks for columns `sample  chrom  pos  ref  alt  af`. I will add the header line.
+
+    *Script structure:*
+    1. Setup vars.
+    2. Index ref.
+    3. Loop samples -> Align -> Index BAM.
+    4. Loop samples -> Call VCF -> Index VCF.
+    5. Collate.
+
+    Looks solid.

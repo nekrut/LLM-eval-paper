@@ -1,0 +1,178 @@
+We need to produce a self-contained bash script that does per-sample variant calling on 4 paired-end MiSeq amplicon samples mapped to chrM reference. Output results/{sample}.bam, .bai, .vcf.gz, .vcf.gz.tbi, and collapsed.tsv.
+
+Requirements:
+
+- Idempotent: rerunning should exit 0 without redoing work or erroring if outputs already exist.
+- Use only tools listed: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. We can use awk, grep etc as standard.
+
+We need to map reads with bwa mem (paired). Then sort and index bam. Then call variants with lofreq or bcftools? The plan says recommended: bwa → samtools → lofreq → bcftools. So we will use lofreq for variant calling, then bcftools view to compress and index.
+
+We also need collapsed.tsv summarizing per sample variant allele frequency (af). We can extract from VCF INFO AF or from Lofreq's AF field? Lofreq outputs VCF with INFO fields: AF=... maybe. Let's check typical lofreq output: It includes INFO fields like AF, QUAL, DP, etc. We'll parse.
+
+We need to produce collapsed.tsv with columns sample chrom pos ref alt af. For each variant across all samples, we need a row per sample? The description says "collapsed table" but not aggregated across samples; likely one row per sample-variant combination. So just combine all VCFs into one TSV.
+
+Implementation steps:
+
+1. Create results directory if not exist.
+2. Index reference if not already indexed: bwa index chrM.fa (but we need to check if .bwt etc exist). We'll check for chrM.fa.bwt or .sa; but easier: if ! [ -f data/ref/chrM.fa.bwt ]; then bwa index data/ref/chrM.fa ; fi
+
+3. For each sample in list, check if results/{sample}.bam exists; if yes skip mapping and variant calling? But we need to ensure all outputs exist. So for each sample:
+
+- If results/{sample}.bam not present, run mapping: bwa mem -t $THREADS data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools view -bS - > results/${sample}.bam
+
+But we need sorted BAM. So better to pipe into samtools sort:
+
+bwa mem ... | samtools sort -o results/${sample}.sorted.bam
+
+Then rename to .bam? We can output directly to .bam and then index.
+
+Simpler: bwa mem ... | samtools view -Sb - | samtools sort -o results/${sample}.bam
+
+But we need sorted BAM. So final file is .bam (sorted). Then index with samtools index results/${sample}.bam
+
+If bam already exists, skip mapping.
+
+4. Variant calling:
+
+- If results/{sample}.vcf.gz not present, run lofreq call: lofreq call -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+
+But we need to compress and index VCF: bcftools view -O z -o results/${sample}.vcf.gz results/${sample}.vcf ; tabix -p vcf results/${sample}.vcf.gz
+
+We can also skip intermediate .vcf if not needed. But lofreq outputs uncompressed VCF by default? It writes to file; we can pipe to bcftools view -O z.
+
+So: lofreq call -f data/ref/chrM.fa -o - results/${sample}.bam | bcftools view -O z -o results/${sample}.vcf.gz
+
+Then tabix index.
+
+If vcf.gz already exists, skip variant calling.
+
+5. Collapsed table:
+
+- If results/collapsed.tsv not present, generate by concatenating all VCFs and extracting fields.
+
+We can use awk to parse header lines starting with '#CHROM', then for each record line (not starting with '#'), extract sample name from file path? We need sample column: we know which sample the VCF belongs to. So we can loop over samples, cat results/${sample}.vcf.gz | tabix -p vcf -  ??? Actually .vcf.gz is compressed; we can use zcat or bcftools view -H etc.
+
+Simpler: for each sample, use bcftools query to extract fields:
+
+bcftools query -f '%SAMPLE\t%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz
+
+But we need sample name; bcftools query can output the sample column as %SAMPLE? Actually VCF may have multiple samples but here only one sample per file. The header line contains sample names; but we can just use sample variable.
+
+So: echo -e "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv
+
+Then for each sample, run bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz | awk -v s=$sample 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+
+But we need to include sample column first. So:
+
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' file | awk -v s=$sample 'BEGIN{OFS="\t"}{print s,$0}' >> collapsed.tsv
+
+Add header earlier.
+
+Edge: AF may be missing; but we can still output empty field.
+
+Also need to ensure tabix index exists for bcftools query? Not necessary if using bcftools view. But bcftools query works on compressed VCF with index.
+
+Ok.
+
+We also need to set THREADS=4 maybe via env var or constant.
+
+We must not use echo for user-facing prose; but we can use echo for progress? The instruction says "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." So we should avoid echo. But we may need to output nothing. We can just run commands silently.
+
+But bcftools query will produce output; that's fine.
+
+We must ensure script is idempotent: if outputs exist, skip steps.
+
+Implementation:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+
+# create results dir
+mkdir -p results
+
+# index reference if needed
+if ! [ -f data/ref/chrM.fa.bwt ]; then
+    bwa index data/ref/chrM.fa
+fi
+
+samples=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+for sample in "${samples[@]}"; do
+    bam=results/${sample}.bam
+    bai=results/${sample}.bam.bai
+    vcf_gz=results/${sample}.vcf.gz
+    vcf_tbi=results/${sample}.vcf.gz.tbi
+
+    # mapping
+    if ! [ -f "$bam" ]; then
+        bwa mem -t $THREADS data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+            samtools view -bS - | samtools sort -o "$bam"
+    fi
+
+    # index bam
+    if ! [ -f "$bai" ]; then
+        samtools index "$bam"
+    fi
+
+    # variant calling
+    if ! [ -f "$vcf_gz" ]; then
+        lofreq call -f data/ref/chrM.fa -o - "$bam" | \
+            bcftools view -O z -o "$vcf_gz"
+        tabix -p vcf "$vcf_gz"
+    fi
+done
+
+# collapsed table
+collapsed=results/collapsed.tsv
+if ! [ -f "$collapsed" ]; then
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > "$collapsed"
+    for sample in "${samples[@]}"; do
+        vcf_gz=results/${sample}.vcf.gz
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' "$vcf_gz" | \
+            awk -v s="$sample" 'BEGIN{OFS="\t"}{print s,$0}' >> "$collapsed"
+    done
+fi
+
+exit 0
+
+Check idempotency: if bam exists, skip mapping. But we also need to ensure that if bam exists but not sorted? We assume it's sorted because we used samtools sort. If someone had unsorted bam, they'd still be considered done; but that's fine.
+
+Also we should check for .bam.bai existence before indexing; but if bam exists and bai missing, index will run.
+
+Variant calling: skip if vcf.gz exists.
+
+Collapsed table: skip if collapsed.tsv exists.
+
+We also need to ensure that bcftools query works on compressed VCF. It requires index? Actually bcftools query can read unindexed VCF if not using -H? But we have index from tabix. So fine.
+
+Potential issue: lofreq call may produce header lines with '#CHROM' etc; bcftools view will compress and keep header. Good.
+
+We need to ensure that bcftools query prints AF field; but some variants may have multiple ALT alleles; AF may be comma-separated. That's okay.
+
+Edge: The collapsed.tsv should include sample, chrom, pos, ref, alt, af. We output as above.
+
+Also we might want to use tabix -p vcf for index; bcftools view will produce .tbi automatically? Actually bcftools view -O z writes gzipped VCF but does not create index. So we need tabix.
+
+Ok.
+
+We also need to ensure that the script uses only tools from inventory: bwa, samtools, lofreq, bcftools, tabix. We used awk (builtin). That's fine.
+
+Also we didn't use seqkit or snpEff etc; that's okay.
+
+Make sure no echo statements except maybe for header of collapsed.tsv using printf. That prints to file not stdout? It writes to file but still goes through stdout? Actually printf writes to stdout, but redirected to file via >. So it's fine.
+
+We need to ensure script doesn't produce output to console beyond tool outputs. The commands will produce progress messages from samtools etc; that's acceptable.
+
+Let's double-check that we didn't use any other tools: We used 'printf', 'awk', 'bcftools', 'tabix', 'bwa', 'samtools', 'lofreq'. All are allowed.
+
+We also used 'mkdir -p' which is built-in. Good.
+
+Now, ensure script uses relative paths only. Yes.
+
+Edge: The reference index file names: bwa index creates .bwt, .pac, .ann, .amb, .sa. We check for .bwt; that's fine.
+
+Also we need to set THREADS=4 as per requirement of wall-clock under 600 seconds. Good.
+
+Now produce final script.

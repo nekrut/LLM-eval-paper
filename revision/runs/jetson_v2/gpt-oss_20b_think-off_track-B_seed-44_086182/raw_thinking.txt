@@ -1,0 +1,221 @@
+We need to produce a bash script that does per-sample variant calling on 4 paired-end MiSeq amplicon samples mapped to human mitochondrial reference chrM.fa. Output: results/{sample}.bam, .bai, .vcf.gz, .vcf.gz.tbi, and collapsed.tsv summarizing variants across all samples with columns sample chrom pos ref alt af.
+
+We must be idempotent: if outputs exist, skip. Use only tools listed. No echo for user prose. Only natural tool output to stdout/stderr. Should not write anything else. Must use set -euo pipefail.
+
+We need to map reads using bwa mem, sort with samtools sort, index with samtools index. Then variant calling: we can use lofreq call or bcftools mpileup? Since amplicon data small, but we want allele frequency (af). Lofreq is good for low-frequency variants. Use lofreq --call-variants? Actually lofreq has command "lofreq call" to produce VCF with AF. We'll need to supply reference and BAM.
+
+We also need collapsed.tsv: combine per-sample VCFs into a table of sample, chrom, pos, ref, alt, af. We can use bcftools query or tabix? Since VCFs are gzipped and indexed. Use bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[%AF]\n' . But we need per-sample column: sample name. So we can loop over samples, extract fields, prefix with sample.
+
+We also need to index reference: bwa index? Actually for mapping we need bwa index of chrM.fa. We should check if results/ref/chrM.fa.bwt exists; but the reference is in data/ref/chrM.fa. We'll create a local copy or use directly. Bwa index will produce .bwt, .pac, .ann, .amb, .sa files. We can store them under data/ref/. But we need to avoid reindexing if already present.
+
+Also need to run fastqc? Not required by output but maybe optional; but not necessary for final outputs. The task only requires variant calling and collapsed table. So skip QC.
+
+We must use only tools listed: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, seqkit, fastqc, snakemake, shellcheck, java. We can use seqkit to list files? But we can just use bash globbing.
+
+We need to ensure script is idempotent: if results/{sample}.bam exists and .bai exists, skip mapping; if VCF exists and tbi exists, skip variant calling; if collapsed.tsv exists, maybe skip final step. But we should still produce collapsed.tsv if missing or if any sample's VCF changed? For simplicity, we can check if collapsed.tsv exists; if yes, exit 0.
+
+But the requirement: "rerunning on a populated results/ directory must exit 0 without redoing work or erroring." So script should detect all outputs exist and skip. But also if some outputs missing, it should produce them. So we need to implement logic accordingly.
+
+Simplest: For each sample, check if BAM exists; if not, run mapping pipeline. Then check VCF exists; if not, call variants. After processing all samples, check collapsed.tsv; if not exist, generate from VCFs.
+
+Also ensure that if any step fails due to missing reference index, we create it first.
+
+We need to use only tools listed: seqkit can be used for listing files but not necessary.
+
+We'll write script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# define directories
+RAW_DIR="data/raw"
+REF_DIR="data/ref"
+OUT_DIR="results"
+
+mkdir -p "$OUT_DIR"
+
+# reference file
+REF_FASTA="$REF_DIR/chrM.fa"
+
+# check bwa index files exist; if not, create
+if ! ls "${REF_FASTA}.bwt" 1>/dev/null 2>&1; then
+    bwa index "$REF_FASTA"
+fi
+
+# list samples: we can parse filenames. Use pattern *_1.fq.gz to get sample names.
+SAMPLES=()
+for f in "$RAW_DIR"/*_1.fq.gz; do
+    base=$(basename "$f")
+    sample=${base%_1.fq.gz}
+    SAMPLES+=("$sample")
+done
+
+# mapping function
+map_sample() {
+    local sample=$1
+    local r1="$RAW_DIR/${sample}_1.fq.gz"
+    local r2="$RAW_DIR/${sample}_2.fq.gz"
+    local bam="${OUT_DIR}/${sample}.bam"
+
+    if [[ -f "$bam" && -f "${bam}.bai" ]]; then
+        return 0
+    fi
+
+    # bwa mem -> samtools sort -> output bam
+    bwa mem -t 4 "$REF_FASTA" "$r1" "$r2" | \
+        samtools view -Sb - | \
+        samtools sort -o "$bam"
+
+    samtools index "$bam"
+}
+
+# variant calling function
+call_variants() {
+    local sample=$1
+    local bam="${OUT_DIR}/${sample}.bam"
+    local vcf_gz="${OUT_DIR}/${sample}.vcf.gz"
+
+    if [[ -f "$vcf_gz" && -f "${vcf_gz}.tbi" ]]; then
+        return 0
+    fi
+
+    # lofreq call with reference and bam, output gzipped VCF
+    lofreq call -f "$REF_FASTA" -o "$vcf_gz" "$bam"
+
+    tabix -p vcf "$vcf_gz"
+}
+
+# process each sample
+for s in "${SAMPLES[@]}"; do
+    map_sample "$s"
+    call_variants "$s"
+done
+
+# generate collapsed.tsv if not exist
+COLLAPSED="$OUT_DIR/collapsed.tsv"
+if [[ ! -f "$COLLAPSED" ]]; then
+    # header
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"
+
+    for s in "${SAMPLES[@]}"; do
+        vcf="${OUT_DIR}/${s}.vcf.gz"
+        # use bcftools query to extract fields; AF may be missing? lofreq includes AF field.
+        # Format: sample\tchrom\tpos\tref\talt\taf\n
+        bcftools query -f '%SAMPLE%\t%CHROM%\t%POS%\t%REF%\t%ALT%\t[%AF]\n' "$vcf" >> "$COLLAPSED"
+    done
+fi
+
+exit 0
+
+But we need to ensure that bcftools query uses %SAMPLE%? In VCF, sample column is the first column after INFO. But we want sample name from file; easier: use echo $s before each line.
+
+We can just output sample name manually:
+
+while read -r chrom pos ref alt af; do
+    printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$s" "$chrom" "$pos" "$ref" "$alt" "$af"
+done < <(bcftools query -f '%CHROM%\t%POS%\t%REF%\t%ALT%\t[%AF]\n' "$vcf")
+
+But bcftools query can output multiple alt lines. We'll just use that.
+
+Simplify: Use bcftools query to produce fields and then prefix sample name using awk:
+
+bcftools query -f '%CHROM%\t%POS%\t%REF%\t%ALT%\t[%AF]\n' "$vcf" | awk -v s="$s" '{print s"\t"$0}' >> "$COLLAPSED"
+
+But we need to ensure that AF field is present; if not, maybe empty. That's fine.
+
+Also we must use only tools listed: bcftools, tabix, lofreq, bwa, samtools. awk is built-in? It's part of coreutils but allowed? Not in TOOL_INVENTORY but likely available. But requirement says "Use only tools listed in TOOL_INVENTORY." That might mean we cannot rely on other external commands like awk or grep. However awk is usually present; but to be safe, maybe use bcftools query with format string that includes sample name: We can set %SAMPLE%? In VCF header, the sample column names are defined in header line. But we want to insert sample name from file. We could use bcftools annotate? But easier is to use while read loop with bash built-in read and printf; that's fine.
+
+We need to avoid using echo for user-facing prose; but printing header lines is part of output, not user-facing. It's okay.
+
+But we used printf which prints to stdout; it's allowed.
+
+Also we used awk; maybe not allowed. Let's avoid awk by using while read loop:
+
+while IFS=$'\t' read -r chrom pos ref alt af; do
+    printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$s" "$chrom" "$pos" "$ref" "$alt" "$af"
+done < <(bcftools query -f '%CHROM%\t%POS%\t%REF%\t%ALT%\t[%AF]\n' "$vcf")
+
+This uses process substitution, which is bash built-in. Good.
+
+Also we used tabix to index VCF; that's allowed.
+
+We need to ensure that lofreq call outputs gzipped VCF? Lofreq by default writes uncompressed VCF unless -o .vcf.gz? Actually lofreq call can output compressed if file ends with .gz? Let's check: In lofreq 2.1.5, the command "lofreq call" will produce a VCF; if output filename ends with .gz it will compress automatically using bgzip. So we used .vcf.gz extension; good.
+
+Also need to index with tabix -p vcf.
+
+We also need to ensure that samtools view -Sb - reads from stdin and outputs BAM; then sort writes to bam file. We used samtools view -Sb - | samtools sort -o "$bam". That is fine.
+
+But we didn't specify -@ 4 for samtools? Not necessary but okay.
+
+Also we used bwa mem -t 4; good.
+
+We need to ensure that the script uses only tools listed: bwa, samtools, bcftools, tabix, lofreq. We also used printf and read loops which are built-in shell commands, not external tools. So fine.
+
+Now idempotence: If results directory already has all outputs, script will exit 0 after generating collapsed.tsv if missing? Actually if collapsed.tsv exists, we skip generation; but we still run mapping and variant calling for each sample because we check existence of BAM and VCF. But if they exist, the functions return early. So no redoing work.
+
+But we might want to skip entire script if all outputs exist: We can add at top:
+
+# If collapsed.tsv exists, exit 0
+if [[ -f "$OUT_DIR/collapsed.tsv" ]]; then
+    exit 0
+fi
+
+But that would skip mapping/variant calling even if some sample missing. But requirement says "rerunning on a populated results/ directory must exit 0 without redoing work or erroring." So if all outputs exist, we can exit early. But if some outputs missing, we need to process them. We can't just check collapsed.tsv existence; because maybe collapsed.tsv exists but some sample's VCF missing? That would be inconsistent. But likely not.
+
+Simpler: Keep as is; it will skip each step if file exists. So no redoing work. Good.
+
+Now ensure script uses only tools listed and no other external commands like seqkit, SnpSift, snpEff etc. We didn't use them. That's fine.
+
+But we used tabix -p vcf; that's allowed.
+
+We also used bcftools query; allowed.
+
+We need to ensure that the reference index files are created: bwa index will create .bwt, .pac, .ann, .amb, .sa. We'll check for .bwt existence. Good.
+
+Now we must ensure script is idempotent and not produce errors if outputs exist. The functions return early if file exists; but we also need to check that the BAM index exists (.bai). We did that.
+
+For VCF, we check both .vcf.gz and .tbi. Good.
+
+Now collapsed.tsv generation: we use bcftools query on each VCF; if VCF missing or empty, loop will produce nothing. But we only run after all samples processed.
+
+Edge case: If a sample's VCF has no variants, bcftools query returns nothing; then collapsed.tsv may have fewer lines. That's fine.
+
+Now ensure script uses set -euo pipefail; good.
+
+We need to ensure that the script does not print anything else. We used printf for header and printing lines; that's okay as part of output file creation. But we didn't use echo for user messages. Good.
+
+But we also used "printf" which writes to stdout? Actually we redirect to file: > "$COLLAPSED". So prints go into file, not console. That's fine.
+
+Now ensure that script uses only tools listed; we used printf and read loops, but those are built-in shell commands, not external tools. Should be okay.
+
+But we also used "printf" which is a builtin? In bash, printf is builtin. Good.
+
+We used "while IFS=$'\t' read -r chrom pos ref alt af; do ... done < <(bcftools query ...)" This uses process substitution and while loop; fine.
+
+Now ensure that script uses only tools listed: we didn't use seqkit or others. Good.
+
+Now final step: produce collapsed.tsv with header sample chrom pos ref alt af. We used printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED". Good.
+
+Now we need to ensure that the script uses correct path for reference; we set REF_FASTA="$REF_DIR/chrM.fa".
+
+Now we need to ensure that mapping step uses -t 4 threads. We used bwa mem -t 4. Good.
+
+But we didn't use samtools view -@ 4; but not necessary.
+
+Now we need to ensure that the script is idempotent: if BAM exists and .bai exists, skip mapping. But what if BAM exists but index missing? Our check ensures both exist; if only BAM exists but no index, it will run mapping again (which may overwrite). That's fine.
+
+Similarly for VCF.
+
+Now we need to ensure that the script uses correct naming: results/{sample}.bam etc. We used OUT_DIR variable.
+
+Now we need to ensure that collapsed.tsv is created under results/; yes.
+
+Now we need to ensure that all outputs are gzipped and indexed as required: .vcf.gz and .tbi. We did tabix -p vcf "$vcf_gz". Good.
+
+Now we need to ensure that the script uses only tools listed; we used "bwa", "samtools", "lofreq", "tabix", "bcftools". All are in TOOL_INVENTORY.
+
+We didn't use any other external commands. Good.
+
+Now we need to output only the script, no markdown fences or commentary. So final answer: just the script lines.
+
+Let's produce final script accordingly.

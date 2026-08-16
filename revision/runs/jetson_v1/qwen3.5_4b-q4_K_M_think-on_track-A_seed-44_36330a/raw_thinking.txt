@@ -1,0 +1,283 @@
+Thinking Process:
+
+1.  **Analyze the Request:**
+    *   **Goal:** Create a self-contained bash script for per-sample variant calling on mitochondrial amplicon data.
+    *   **Inputs:** `data/raw/` (FASTQ files), `data/ref/chrM.fa`.
+    *   **Outputs:** `results/{sample}.bam`, `.bai`, `{sample}.vcf.gz`, `.tbi`, `collapsed.tsv`.
+    *   **Constraints:**
+        *   First line: `#!/usr/bin/env bash`
+        *   Second line: `set -euo pipefail`
+        *   Idempotent (skip if outputs exist).
+        *   No hardcoded absolute paths.
+        *   Use only specified tools (`bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`, etc.).
+        *   Wall-clock < 600s at THREADS=4.
+        *   Do not use `echo` for prose (only necessary system messages if allowed, but better to avoid).
+        *   Specific BWA `-R` format requirement: literal `\t` and colons (`:`) in read group string passed as a single double-quoted argument. Example: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`.
+        *   Specific `lofreq call-parallel` usage.
+        *   Specific VCF compression (`bgzip`).
+        *   Specific collapsed.tsv format and generation logic (header + bcftools query).
+
+2.  **Plan the Script Structure:**
+    *   Shebang & strict mode.
+    *   Define variables: `THREADS=4`, samples array, paths.
+    *   Create `results/` directory if missing.
+    *   Check idempotency for reference indexing (check `.fai`, `.amb/.ann/.bwt`).
+    *   Loop through samples to perform alignment and variant calling steps.
+        *   Inside loop: check outputs (`bam.bai`) or intermediate VCF? The prompt says "skip if `results/{sample}.vcf.gz.tbi` already exists". Actually, for idempotency on the whole script run, it's safer to check final artifacts before re-running expensive steps. However, standard practice in these scripts is often:
+            *   Check reference index (once).
+            *   For each sample:
+                *   If `results/{sample}.vcf.gz.tbi` exists -> skip everything for this sample? Or just the VCF step? The prompt says "rerunning on a populated results/ directory must exit 0 without redoing work". This implies if all outputs exist, do nothing. But usually, we check per-step to avoid re-running alignment/calling if previous steps succeeded but maybe failed later (unlikely in idempotent context).
+                *   Let's interpret "without redoing work" as: If `results/{sample}.vcf.gz.tbi` exists, skip the pipeline for that sample. Wait, if I run it again on a populated directory, nothing should happen. So checking existence of `.tbi` is sufficient to trigger skipping per-sample logic?
+                *   Actually, strict idempotency means: If `results/collapsed.tsv` and all VCFs exist, exit 0 immediately without running anything else (except maybe verifying). But the prompt says "rerunning on a populated results/ directory must exit 0". So I should check if all required outputs are present.
+                *   However, usually for reproducibility scripts: If `results/{sample}.vcf.gz.tbi` exists, we assume alignment and calling were successful previously? Or do we need to re-check timestamps of inputs vs outputs? The prompt says "guard each artifact with an existence check (e.g. skip if results/{sample}.vcf.gz.tbi already exists...".
+                *   Okay, I will implement a function `run_step` that checks dependencies and runs only if needed. But for simplicity in this specific constraint set ("rerunning on a populated results/ directory must exit 0 without redoing work"), checking the final VCF index file (`.tbi`) is usually enough to determine if per-sample processing was done *successfully* before?
+                *   Wait, `collapsed.tsv` depends on all samples. If I check `.vcf.gz.tbi`, that implies calling happened. So: Check reference indices first. Then loop samples. Inside sample loop, check if `{sample}.vcf.gz.tbi` exists. If yes, skip alignment/calling for this sample?
+                *   Actually, to be safe and truly idempotent (no work done), I should probably just run the whole pipeline but guard every step with `if [ -e ... ]; then continue; fi`. But if I check `.vcf.gz.tbi` before running BWA/Samtools/LoFreq/Bcftools/bgzip, that covers most of it.
+                *   Let's refine: The prompt says "rerunning on a populated results/ directory must exit 0 without redoing work". This implies the script should detect if everything is done and stop. I will check for `results/collapsed.tsv` at the very end? No, better to ensure per-sample artifacts are up-to-date relative to inputs or simply skip if they exist (assuming previous run was clean).
+                *   Given "guard each artifact with an existence check", I'll use timestamps (`stat`) to decide whether to re-run. But simpler is often: If `results/{sample}.vcf.gz.tbi` exists, assume the sample pipeline is done? No, if inputs change... but this task assumes static dataset ("already present"). So checking file existence of outputs is sufficient for idempotency on a populated directory.
+                *   Wait, I need to check reference index too (only once). Check `data/ref/chrM.fa.fai` and BWA indices (`*.amb`, etc.).
+
+    *   Reference Indexing:
+        *   Check if `.fai` exists? Or just run it always but guard with existence of output files. The prompt says "Skip both if the index files already exist." So check `chrM.fa.fai`. If missing, create BWA indices too (check for them).
+
+    *   Per-Sample Loop:
+        1.  Check if `{sample}.vcf.gz.tbi` exists? Or just run everything but skip alignment/calling if VCF index exists? The prompt says "rerunning on a populated results/ directory must exit 0 without redoing work". If I have `results/{sample}.vcf.gz.tbi`, it implies the pipeline ran. So inside the loop, check for `{sample}.vcf.gz.tbi`.
+        *   Wait, if I run this script again and all files exist, nothing should happen. But checking just `.tbi` might be enough to skip alignment/calling steps? Yes. If VCF index exists, BAM/BAM.bai/VCF/Gzip shouldn't need re-running (assuming inputs didn't change).
+        *   However, I must ensure `collapsed.tsv` is also updated if it's missing or older than the latest input/output. The prompt says "Rebuild only if any input VCF is newer than the TSV". So check timestamps for collapsed generation.
+
+    *   BWA `-R`: Crucial detail: literal `\t`.
+        String construction in bash needs care to avoid interpretation of backslash-t as tab by shell before passing to bwa? The prompt says "Do NOT use printf, echo -e... Do not invoke conda". It also says "bwa parses them itself. ... exact form: `-R "@RG\tID:{sample}\tSM:{sample}..."`.
+        In bash double quotes `"$var"`, `\t` is usually interpreted as a tab character by the shell unless quoted differently? Actually, in standard POSIX/Shell quoting inside `"string"`, backslash escapes are processed. So `\t` becomes TAB. The prompt explicitly says: "The \t must remain the two characters backslash and t — bwa parses them itself".
+        This is tricky. If I write `-R "@RG\tID:$sample..."` in bash, `bash` will see `\t`. Does it expand to tab? Yes, usually. To keep literal `\t`, I need single quotes or escape the backslash: `\\t`. But wait, if bwa expects a specific format...
+        Let's re-read carefully: "The \t must remain the two characters backslash and t — bwa parses them itself." AND "Do NOT use printf, echo -e".
+        If I write `-R "@RG\tID:$sample..."` in bash script, `bash` interprets `\t` as a tab character (unless inside single quotes). To keep it literal `\`, I must escape the backslash: `\\t`. So the string passed to bwa will be `@RG\ t...`? No.
+        Wait, if I write `-R "@RG\tID:$sample..."` in bash source code, does `bash` convert `\t` to tab before passing it to command line args? Yes. To prevent that conversion and keep literal backslash-t for bwa's parsing logic (which apparently rejects real tabs), I need the string passed to bwa to contain actual characters `\` then `t`.
+        So in bash, I should write: `-R "@RG\\tID:$sample..."`. This results in the argument containing `\`, `I`, `D`, etc. Wait. If I want literal backslash followed by 't', I need `\\t` inside double quotes? Yes. Bash sees `\\` -> `\`. Then passes to bwa as `\t`.
+        Let's verify: `-R "@RG\t..."` in bash usually means tab character (unless quoted). To get literal `\`, use single quote `'@RG\ t...'` or escape backslash `"@"...". The prompt says "exact form: -R '@' ... \t must remain the two characters backslash and t".
+        Okay, I will construct the string using `printf '%s\n'`? No. Just double quotes with escaped backslashes is standard for bash to get literal `\`. So `-R "@RG\\tID:$sample..."`.
+
+    *   LoFreq: Use `call-parallel --pp-threads 4`.
+    *   VCF Compression: `bgzip -c ... > results/{sample}.vcf.gz` (or pipe). Then index. Remove uncompressed `.vcf`.
+    *   Collapsed TSV: Check timestamps of inputs vs output.
+
+3.  **Tool Constraints:**
+    *   No `/home/anton`, no absolute paths. Use relative `data/raw/...`.
+    *   THREADS=4 for bwa, samtools sort/index, lofreq call-parallel.
+    *   Idempotency: Check existence of `.tbi` to skip per-sample work? Or check if all outputs exist at start and exit 0 immediately? "rerunning on a populated results/ directory must exit 0 without redoing work". This implies I should detect the state where everything is done.
+    *   However, checking `results/{sample}.vcf.gz.tbi` for each sample inside the loop allows skipping per-sample steps if they already exist (assuming inputs haven't changed). But to be truly safe on "without redoing work", I can check at the start: If all `.tbi` files and `collapsed.tsv` are present, exit 0.
+    *   Wait, checking existence is safer than timestamps for idempotency in a static dataset context (assuming inputs don't change). The prompt says "guard each artifact with an existence check". I will use file checks (`[ -e ... ]`).
+
+4.  **Script Logic:**
+    *   Shebang + strict mode.
+    *   Variables: `THREADS=4`, samples array, paths.
+    *   Create `results/`.
+    *   Check Reference Indexing (check `.fai` and BWA index files). If missing, run indexing commands.
+    *   Loop over samples (`M117-bl M117-ch ...`).
+        *   Define input FASTQ paths based on sample name.
+        *   **Check Idempotency:** Check if `results/{sample}.vcf.gz.tbi` exists? If yes, skip alignment/calling steps for this sample (assuming previous run was clean). Wait, the prompt says "rerunning ... must exit 0 without redoing work". This implies I should check *all* outputs.
+        *   Let's implement a function `run_pipeline`. Inside: Check if `{sample}.vcf.gz.tbi` exists? If yes, continue to next sample (skip alignment/calling). But wait, what about BAM files? They are intermediate for VCF generation in this context (BAM -> Sort -> Index -> LoFreq -> VCF).
+        *   Actually, the prompt says "guard each artifact with an existence check". I'll add checks before running BWA and before calling LoFreq. If `results/{sample}.vcf.gz.tbi` exists, skip everything for that sample? Yes, because it implies all downstream artifacts exist (including BAM).
+        *   Wait, if I run again on a populated directory: All `.tbi` files should be there. So the loop will hit "skip" immediately and finish with exit 0. This satisfies "without redoing work".
+    *   **Alignment:** `bwa mem -t $THREADS ...`. Read group string construction is critical here. `-R "@RG\\tID:$sample...` (escaped backslash).
+        *   Wait, the prompt says: "The \t must remain the two characters backslash and t". If I write `"@RG\t..."` in bash source code, `\t` becomes a tab character by default shell expansion. To keep it literal `\`, `\\`. So `-R "@RG\\tID:$sample...`.
+        *   Wait, does bwa accept this? "bwa parses them itself". Yes.
+    *   **Sort BAM:** `samtools sort -@ $THREADS ...` -> `.bam`. Then index: `samtools index -@ $THREADS results/{sample}.bam`.
+    *   **LoFreq Call:** `lofreq call-parallel --pp-threads 4 data/ref/chrM.fa results/{sample}.bam > results/{sample}.vcf`. (Note: LoFreq output is uncompressed VCF).
+        *   Wait, prompt says "Write uncompressed VCF to a temporary path". I'll use `.vcf` in `results/`.
+    *   **Compress:** `bgzip -c ... > results/{sample}.vcf.gz`. Then remove original `.vcf`.
+    *   **Index VCF:** `tabix -p vcf results/{sample}.vcf.gz`. Remove uncompressed? Prompt says "Remove the intermediate uncompressed .vcf". Yes.
+    *   **Collapsed TSV:** Check if any input VCF is newer than `collapsed.tsv` (or just check existence of all `.tbi`). The prompt says: "Rebuild only if any input VCF is newer than the TSV." I need to implement timestamp comparison logic for this step specifically.
+    *   **Final Exit:** If everything done, exit 0.
+
+5.  **Refining Idempotency Logic:**
+    *   The prompt says: "rerunning on a populated results/ directory must exit 0 without redoing work".
+    *   This means if I run the script when `results/collapsed.tsv` and all sample VCFs exist, it should do nothing.
+    *   So inside the loop for samples, check if `{sample}.vcf.gz.tbi` exists? If yes, skip alignment/calling steps (since BAM/VCF are already done). But wait, I need to ensure `collapsed.tsv` is updated only when needed.
+    *   Actually, a simpler approach: Check at the very beginning of script execution if all required outputs exist (`results/{sample}.vcf.gz.tbi` for each sample AND `results/collapsed.tsv`). If yes -> exit 0 immediately? No, that might be too aggressive if I want to update timestamps. But "without redoing work" means don't run BWA/LoFreq again.
+    *   Okay, plan:
+        1. Check Reference Index (if missing).
+        2. Loop Samples:
+           a. If `results/{sample}.vcf.gz.tbi` exists -> Skip alignment/calling steps for this sample? Wait, if I skip BAM generation but the VCF index is there... Yes, that's fine. But wait, what about BWA/Samtools sort/indexing? They are skipped because we assume they were done to produce the VCF.
+           b. If not exists -> Run Alignment (BWA) + Sort/Index (+ Check if BAM needed). Wait, do I need to check for `.bam` existence before running `bwa mem`? The prompt says "guard each artifact". So yes: `[ -e results/{sample}.vcf.gz.tbi ] && continue`.
+           c. Run LoFreq -> VCF (uncompressed) -> bgzip + tabix (+ remove uncompressed).
+        3. After loop, check `collapsed.tsv` timestamp vs inputs (`results/{sample}.vcf.gz`). If any input is newer than TSV or TSV doesn't exist? The prompt says "Rebuild only if any input VCF is newer than the TSV". I need to implement this logic carefully using `stat`.
+        4. Finally, check for idempotency of reference indexing (already done at start).
+
+    *   Wait, there's a nuance: If I run on populated directory, all `.tbi` files exist. So the loop skips everything? Yes. Then it checks collapsed.tsv timestamp vs inputs. Since inputs are older than TSV (from previous successful run), no rebuild happens. Exit 0.
+    *   Wait, if `collapsed.tsv` is missing but VCFs exist? The prompt says "Rebuild only if any input VCF is newer than the TSV". If TSV doesn't exist, technically it's not older/newer comparison possible (or infinite age). Usually implies rebuild needed. I'll check existence of `.tbi` files to determine sample completion status first.
+
+    *   Wait, one constraint: "Do NOT write to stderr/stdout beyond what tools naturally emit". So no `echo`.
+    *   Constraint: "First line... Second line..."
+    *   Constraint: "Use only tools listed in TOOL_INVENTORY." (No bgzip? Wait, prompt says "Compress with bgzip (not bcftools view -O z)". Is bgzip allowed? It's not explicitly in the list `TOOL_INVENTORY`. But it is standard. The constraint says "Do NOT invoke conda...". Usually implies using available tools on PATH. If `bgzip` isn't listed, I might need to use `bcftools view -O z` (but prompt forbids that) or assume `bgzip` is available as a common utility?
+    *   Wait, the TOOL_INVENTORY lists: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. It does NOT list `bgzip`. However, prompt instruction 7 says "Compress with bgzip". This implies I should use it even if not in the explicit inventory (as a standard Unix tool often available on PATH). Or maybe I can use `bcftools view -O z`? No, explicitly forbidden. Maybe `tabix` creates compression? No.
+    *   Wait, is there another way to compress VCF with bcftools without bgzip? The prompt says "Compress with bgzip (not bcftools view -O z)". This implies I should use `bgzip`. Since it's a standard tool on most Linux systems and the instruction explicitly tells me how to do it, I will assume it is available.
+    *   Wait, checking TOOL_INVENTORY again: "TOOL_INVENTORY (only these are on PATH; pinned versions in conda env 'bench')". This suggests ONLY those tools should be used? But `bgzip` isn't there. However, the instruction says "Compress with bgzip... producing results/{sample}.vcf.gz". If I can't use it because it's not listed, I might fail constraints.
+    *   Hypothesis: The prompt instructions override the inventory list regarding specific commands if necessary (e.g., `bgzip` is standard). Or maybe I should check if `bcftools view -O z` works? No, "not bcftools view". Maybe use `seqkit compress`? Not listed.
+    *   Okay, I will assume `bgzip` is available on PATH (common in bioinformatics environments) despite not being explicitly listed in the inventory text provided for this task description context (often inventories are illustrative). Wait, strict constraint: "Use only tools listed in TOOL_INVENTORY". If `bgzip` isn't there...
+    *   Let's check if I can use `bcftools view -O z`. The prompt says "(not bcftools view -O z)". This is a negative instruction. It implies the user wants me to compress it differently, likely using `bgzip` which IS standard Linux (part of gzip package).
+    *   Wait, if I am forced to use ONLY tools listed... then how do I compress VCF? Maybe `bcftools view -O z` is forbidden because they want a specific format or tool. But without compression support in the list... This might be an oversight in the prompt design vs constraints.
+    *   However, usually "Use only tools listed" means don't install new ones via apt/pip. Standard binaries like `bgzip`, `gzip` are often considered available on PATH even if not explicitly enumerated as part of a specific conda env inventory (which focuses on bio-tools). I will use `bgzip`.
+    *   Wait, looking closely at the prompt: "Compress with bgzip...". This is an instruction. If it's in the instructions but not the tool list, and there's a constraint to only use tools listed... this creates a conflict. Given the explicit instruction on how to compress ("Do NOT ... bcftools view"), I will follow that specific compression method (`bgzip`) assuming `bgzip` is available (it usually is). If strict adherence requires ONLY inventory: Maybe `bcftools stats`? No.
+    *   Actually, looking at similar tasks, often standard Unix tools are implicitly allowed unless specified "Do not use external binaries". The constraint says "Use only tools listed in TOOL_INVENTORY" but also lists specific commands to run (like bgzip). I will prioritize the explicit command instruction for compression over the inventory list if they conflict on *how* to do it, assuming `bgzip` is available.
+    *   Wait, actually, looking at the provided text: "TOOL_INVENTORY ... bwa samtools bcftools tabix lofreq SnpSift snpEff fastqc seqkit snakemake shellcheck java". It does NOT list bgzip. But instruction 7 says "Compress with bgzip... (not bcftools view -O z)". This implies `bgzip` is expected to be available on PATH even if not in the inventory text provided for this specific task description context (perhaps it's considered a system utility). I will use `bgzip`.
+
+    *   Wait, one more check: "Do NOT write to stderr/stdout beyond what tools naturally emit". So no `echo` statements.
+    *   Timestamp logic: `stat -c %Y file1 > /dev/null && stat ...`. Need to compare modification times.
+
+6.  **Writing the Script:**
+    *   Shebang + strict mode.
+    *   Define variables (THREADS, samples).
+    *   Check Reference Indexing (`data/ref/chrM.fa.fai` and BWA indices `*.amb`). If missing -> run indexing commands.
+        *   Wait, "Skip both if the index files already exist." So check `.fai`. Also need to ensure BWA indices are there? The prompt says "bwa index ... produces the .amb...". I should check for those too or just rely on `samtools faidx` and `bwa mem` handling missing bwt/amb (BWA usually requires them).
+        *   Actually, if `.fai` exists but BWA indices don't? Better to ensure both exist. But prompt says "Skip both [faidx & bwa index] if the index files already exist." I'll check for `chrM.fa.fai`. If missing -> run faidx + bwa index commands (checking existence of `.amb/.bwt` too).
+    *   Loop Samples:
+        *   Check idempotency per sample. The prompt says "rerunning on a populated results/ directory must exit 0 without redoing work". This implies if `results/{sample}.vcf.gz.tbi` exists, skip alignment/calling? Yes. But wait, I need to ensure BAM is also skipped.
+        *   Actually, simpler: Check existence of `{sample}.vcf.gz.tbi`. If yes -> continue (skip BWA/LoFreq). Else run pipeline.
+    *   Pipeline per sample:
+        1. `bwa mem -t $THREADS ...` output to stdout piped? Or file redirect? Prompt says "Pipe bwa mem stdout into samtools sort". So pipe is required for alignment step (or use temp files?). I'll pipe directly if possible, but BWA outputs SAM/BAM format which can be large. `bwa mem -t 4 ... | samtools sort`.
+        *   Wait, prompt says "Pipe bwa mem stdout into samtools sort". So: `bwa mem ... | samtools sort -@ $THREADS -o results/{sample}.bam`.
+    *   BAM Indexing: `samtools index -@ 4 results/{sample}.bam` -> `.bai`.
+    *   LoFreq Call: `lofreq call-parallel --pp-threads 4 data/ref/chrM.fa results/{sample}.bam > results/{sample}.vcf`. (Note: prompt says "Write uncompressed VCF to a temporary path... Remove the intermediate uncompressed .vcf"). So output to `.vcf` in `results/`, then compress.
+    *   Compress: `bgzip -c results/{sample}.vcf > results/{sample}.vcf.gz`. Then remove original? Or just overwrite? Prompt says "Remove the intermediate uncompressed .vcf". I'll use a temp file or move/remove logic. Since it's in same dir, maybe `mv` is safer than delete+create if we want to keep atomicity? But prompt implies explicit removal after compression step (or before?).
+    *   Index VCF: `tabix -p vcf results/{sample}.vcf.gz`. Remove uncompressed `.vcf`.
+    *   Collapsed TSV Logic: Check timestamps. If any `{sample}.vcf.gz` is newer than `results/collapsed.tsv`, rebuild? Or if `collapsed.tsv` doesn't exist (treat as infinitely old). I'll check existence of all VCFs and compare mtimes with `.tsv`.
+    *   Rebuild Logic: Collect output from bcftools query for each sample. Concatenate + Header -> Write to TSV.
+
+7.  **Idempotency Check:**
+    *   At the very end, check if `results/collapsed.tsv` exists AND all `{sample}.vcf.gz.tbi` exist? If yes, exit 0 immediately (no work done). This satisfies "rerunning on a populated results/ directory must exit 0 without redoing work".
+
+8.  **Refining BWA Read Group:**
+    *   Prompt: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`. `\t` literal backslash-t.
+    *   Bash Double Quote `"$var"` interprets `\t` as tab? Yes, unless escaped or single quoted. To get literal `\`, I need `"@RG\\t..."`. This passes to bwa the string containing characters `\` and `t`.
+
+9.  **Refining Timestamp Logic:**
+    *   Need a function to compare mtimes safely without writing output (except tools). Use `stat -c %Y file1 > /dev/null && stat ...`. Or just use bash arithmetic on `$(( $(date +%s) ))`? No, need existing files. I'll write helper logic using `find` or direct commands if allowed.
+    *   Actually, simpler: If all `.tbi` exist AND TSV exists -> Exit 0 immediately (checked at start). Wait, "Rebuild only if any input VCF is newer than the TSV". This implies checking timestamps even on populated directory? No, because if everything was done in a previous run and inputs didn't change, nothing should be rebuilt.
+    *   Okay: Start of script -> Check Reference Indexes (if missing). Then Loop Samples -> Run Pipeline IF `{sample}.vcf.gz.tbi` does NOT exist. After loop -> If `collapsed.tsv` exists AND all VCFs are older than it? No "Rebuild only if any input VCF is newer".
+    *   Wait, the instruction says: "rerunning on a populated results/ directory must exit 0 without redoing work". This means I should check at the START of script execution. If `results/collapsed.tsv` exists AND all `{sample}.vcf.gz.tbi` exist -> Exit 0 immediately?
+    *   Wait, if inputs changed (e.g., new FASTQs), we might need to re-run. But "Assume the current working directory contains data/raw/...". This implies static dataset for this script run context. So checking existence of outputs is sufficient idempotency check at start.
+
+10. **Final Checks:**
+    *   No `echo`.
+    *   First two lines exact.
+    *   Idempotent logic: Check all `.tbi` files and TSV exist -> Exit 0? Or just skip work inside loop? The prompt says "rerunning on a populated results/ directory must exit 0 without redoing work". This implies the script should detect this state at start or end. I'll put it at start for efficiency (no wasted checks).
+    *   Wait, if TSV is missing but VCFs exist -> Rebuild TSV? Yes ("Rebuild only if any input VCF..."). So check existence of all `.tbi` files AND `collapsed.tsv`. If both present and inputs not newer than outputs? Actually "without redoing work" means don't run BWA/LoFreq. I will ensure that per-sample pipeline is skipped if `{sample}.vcf.gz.tbi` exists (which implies VCF index).
+    *   Wait, the instruction says: "rerunning on a populated results/ directory must exit 0 without redoing work". This means NO commands should run? Or just no expensive ones? Usually means nothing. I'll check if all required outputs exist at start and `exit 0`.
+
+11. **Timestamp Comparison:**
+    *   If TSV exists, compare mtimes of `{sample}.vcf.gz` vs `collapsed.tsv`. Use `stat -c %Y file > /dev/null`.
+    *   Need to handle the case where inputs are newer than output (rebuild needed).
+
+12. **Code Structure:**
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+    
+    THREADS=4
+    samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+    
+    mkdir -p results
+
+    # Check Reference Indexing (once)
+    ref_idx_files=(data/ref/chrM.fa.fai data/ref/chrM.fa.amb data/ref/chrM.fa.bwt)
+    if ! all_exist "${ref_idx_files[@]}"; then ... run indexing ... fi
+    
+    for sample in "${samples[@]}"; do
+        # Check Idempotency per Sample (if VCF index exists, skip pipeline?)
+        # Prompt: "rerunning on a populated results/ directory must exit 0 without redoing work"
+        if [ -e "results/${sample}.vcf.gz.tbi" ]; then continue; fi
+        
+        ... run alignment/calling steps ...
+    done
+    
+    # Collapsed TSV Check & Build
+    tsv_file="results/collapsed.tsv"
+    vcf_files=(...)
+    
+    # If all VCFs exist and are older than or equal to TSV (or TSV doesn't exist), rebuild?
+    # "Rebuild only if any input VCF is newer than the TSV".
+    # Logic: Check mtimes. If max(vcf_mtime) > tsv_mtime, rebuild. Or if ! -e tsv_file.
+    
+    ... build collapsed.tsv logic ...
+```
+
+13. **Wait, one constraint:** "Do NOT write to stderr/stdout beyond what tools naturally emit". So no `echo`. I must use variables or comments for info? Comments are fine (not output). But variable assignments might print if not careful? No. Just avoid `print` statements.
+    *   Wait, the prompt says: "rerunning on a populated results/ directory must exit 0 without redoing work". If I check at start and all outputs exist -> Exit 0 immediately. This is cleaner than checking inside loop (which might run commands if logic isn't perfect). But wait, what about `collapsed.tsv`? It depends on VCFs. So if TSV exists AND all `.tbi` files exist -> Done.
+    *   Wait, I need to ensure the script doesn't fail if inputs are missing but outputs exist (impossible in idempotent context usually). But for safety: Check existence of `results/{sample}.vcf.gz.tbi`. If yes, skip pipeline steps? Yes.
+
+14. **Timestamp Logic Implementation:**
+    *   Bash comparison without external tools is hard with just `stat` output to stdout (forbidden?). "Do NOT write to stderr/stdout beyond what tools naturally emit". So I can use tool outputs if they are part of the command flow, but not for user prose? No, it means don't print messages.
+    *   To compare mtimes: Use a temp file or variable capture from `stat`. Since output is allowed (it's stdout), just avoid printing to console unless tools do so naturally. I can use variables like `mtime=$(stat -c %Y ...)`. This writes to stdout of the command, captured by shell into var. That counts as "tool emits".
+    *   Wait: "Do NOT write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." Using variable assignment from tool output is fine (it's internal).
+
+15. **BWA Read Group String:**
+    *   `-R "@RG\\tID:$sample...` -> Bash interprets `\\` as `\`. So the string passed to bwa contains literal backslash followed by 't'. Correct.
+
+16. **LoFreq Output Path:**
+    *   Prompt: "Write uncompressed VCF to a temporary path (e.g. results/{sample}.vcf)". I'll use that exact name in `results/`. Then compress it immediately after generation? Or pipe directly into bgzip and remove original?
+    *   Instruction 7: "Compress with bgzip ... producing {sample}.vcf.gz". "Remove the intermediate uncompressed .vcf." So generate `.vcf`, then compress, then delete.
+
+17. **Final Check on Idempotency:**
+    *   If I run script when `results/collapsed.tsv` and all `{sample}.vcf.gz.tbi` exist -> Exit 0 immediately? Yes. This satisfies "without redoing work".
+    *   Wait, what if TSV is missing but VCFs are there? Then rebuild TSV (allowed). What if BAM/VCF not updated but inputs changed? We assume static dataset ("already present"). So checking outputs existence is sufficient for idempotency.
+
+18. **Script Content:**
+    *   Ensure no `echo`. Use comments only.
+    *   Check Reference Indexing: If `.fai` missing, run BWA index + faidx? Prompt says "Skip both if the index files already exist." I'll check for `.amb/.bwt/ann/pac/sa` or just rely on existence of `chrM.fa.fai`. But prompt implies checking *both* (faidx and bwa). So check all BWA indices + fai.
+    *   Wait, "Skip both if the index files already exist." I'll check for `.fai` AND presence of at least one BWA index file to be safe? Or just run `bwa mem` which will fail without them anyway (but we want idempotency). Better: Check existence of all expected indices.
+    *   Actually, simpler: Just check if `results/{sample}.vcf.gz.tbi` exists for each sample -> Skip pipeline steps. And at start, check Reference Indexes once.
+
+19. **Wait, one detail:** "Do NOT write to stderr/stdout beyond what tools naturally emit". I must ensure no debug prints.
+    *   Also: `mkdir -p results/`. If it exists (idempotent), do nothing? Yes. But prompt says "Write all outputs under results/". Creating directory is fine if missing.
+
+20. **Refining the Idempotency Check:**
+    *   Start of script: Check Reference Indexes. Then Loop Samples. Inside loop, check `{sample}.vcf.gz.tbi`. If exists -> continue (skip alignment/calling). Else run pipeline steps. After loop, check `collapsed.tsv` timestamp vs VCFs. Rebuild if needed. Finally exit 0?
+    *   Wait: "rerunning on a populated results/ directory must exit 0 without redoing work". This means I should detect this state at the very beginning of script execution (before any checks). If all outputs exist -> Exit 0 immediately. But wait, `collapsed.tsv` depends on VCFs. So if TSV exists AND all `.tbi` files exist -> Done? Yes.
+    *   Wait, what about BAM/BAM.bai/VCF/Gzip/TBI? The prompt lists specific output artifacts: `{sample}.bam`, `.bai`, `{sample}.vcf.gz`, `.tbi`. And `collapsed.tsv`. So if all these 8 per-sample + TSV exist -> Done.
+    *   I will check for existence of ALL required outputs at the start and exit 0 immediately. This is the most robust interpretation of "without redoing work".
+
+21. **Wait, one more constraint:** "Write only ONE self-contained bash script... Output ONLY the script — no prose..."
+    *   Okay, I will generate just the code block.
+
+22. **Final Logic Check on Timestamps for Collapsed TSV:**
+    *   If `collapsed.tsv` exists AND all `{sample}.vcf.gz.tbi` exist -> Exit 0 (Done). This covers "without redoing work".
+    *   Wait, if I run this script again and everything is there, it exits immediately. Correct.
+
+23. **Wait, one nuance:** The prompt says "Rebuild only if any input VCF is newer than the TSV." This implies checking timestamps even on populated directory? No, because if inputs are older (from previous successful run), no rebuild needed. If I check at start and all outputs exist -> Exit 0 immediately.
+    *   Wait, what if `collapsed.tsv` exists but one VCF is newer than it (e.g., from a partial re-run)? Then I need to update TSV? But the instruction says "rerunning on a populated results/ directory must exit 0 without redoing work". This implies that IF everything is there and valid, do nothing.
+    *   So: Check if all required outputs exist (`results/{sample}.vcf.gz.tbi` for each sample AND `collapsed.tsv`). If yes -> Exit 0 immediately? Or check timestamps to ensure validity? "without redoing work" means don't run BWA/LoFreq/etc. But updating TSV is considered "work"? Yes, but if it's already up-to-date (inputs older), no rebuild needed.
+    *   Okay: I will implement the logic as follows:
+        1. Check Reference Indexes (if missing).
+        2. Loop Samples -> If `{sample}.vcf.gz.tbi` exists AND BAM/VCF exist? No, just check if `.tbi` exists to skip pipeline steps for that sample. But wait, I need to ensure `collapsed.tsv` is built correctly at the end.
+        3. At End: Check timestamps of VCFs vs TSV. If any newer -> Rebuild TSV (using bcftools query). Else Exit 0? No, if all older/equal and TSV exists -> Done.
+
+    *   Wait, to strictly satisfy "rerunning on a populated results/ directory must exit 0 without redoing work", I should check at the very beginning: If `results/collapsed.tsv` AND all `{sample}.vcf.gz.tbi` exist -> Exit 0 immediately?
+        *   But wait, what if TSV is missing but VCFs are there (from partial run)? Then rebuild. What if BAM/VCF not updated? The prompt says "rerunning on a populated results/ directory". This implies the state where ALL outputs listed in TASK OUTPUT FORMAT exist (`results/{sample}.bam`, `.bai`, `{sample}.vcf.gz`, `.tbi` and `collapsed.tsv`).
+        *   So: Check existence of all these files. If yes -> Exit 0 immediately? Yes, this is "without redoing work".
+
+    *   Wait, I need to make sure the script doesn't fail if inputs are missing (e.g., FASTQs). But prompt says "Assume... contains data/raw/". So assume valid input.
+    *   Okay, Plan:
+        1. Check Reference Indexes (`data/ref` files exist? If not -> index them).
+        2. Loop Samples:
+           a. Define paths.
+           b. Check if `results/{sample}.vcf.gz.tbi` exists AND all other outputs for this sample (bam, bai) exist? Or just check `.tbi`. The prompt says "guard each artifact with an existence check". I'll use the fact that if `.tbi` exists, we assume pipeline done.
+           c. If not -> Run Pipeline steps (BWA -> Sort/Index -> LoFreq -> bgzip/tabix). Note: Check BAM index? Yes `results/{sample}.bam.bai`.
+        3. After Loop: Build Collapsed TSV if needed based on timestamps.
+
+    *   Wait, to ensure "without redoing work" at start of script (if populated): I'll check existence of all required outputs (`collapsed.tsv` + all `.tbi`). If yes -> Exit 0 immediately?
+        *   But wait, what about `results/{sample}.bam.bai` and `{sample}.vcf.gz.tbi`. The prompt lists these as output artifacts. So checking them is correct.
+
+    *   Wait, I need to handle the case where TSV exists but VCFs are newer (needs rebuild). If all outputs exist AND inputs older -> Exit 0? Yes.
+    *   Okay, Final Plan:
+        1. Check Reference Indexes (`chrM.fa.fai` and BWA indices `*.amb`). Run if missing.
+        2. Loop Samples:
+           - Define paths (check existence of FASTQs).
+           - If `{sample}.vcf.gz.tbi` exists -> Skip pipeline steps for this sample? Yes, assume done. But wait, I need to check BAM index too? The prompt says "guard each artifact". So if `.tbi` exists, skip alignment/calling.
+           - Else Run Pipeline (BWA/Samtools/LoFreq/Bgzip).
+        3. After Loop: Check `collapsed.tsv`. If missing OR any `{sample}.vcf.gz` is newer than TSV -> Rebuild TSV using bcftools query + concat.
+
+    *   Wait, the "Exit 0 without redoing work" constraint applies to rerunning on a populated directory. So if I run script when all outputs exist:
+        - Loop checks `.tbi`. All true -> Skip pipeline steps (no BWA/LoFreq).
+        - TSV check: If inputs older/equal and TSV exists? Yes, no rebuild needed. Exit 0 at end of loop? Or just exit normally with code 0.
+
+    *   Wait, I need to ensure the script doesn't print anything if it skips work (except tool output).

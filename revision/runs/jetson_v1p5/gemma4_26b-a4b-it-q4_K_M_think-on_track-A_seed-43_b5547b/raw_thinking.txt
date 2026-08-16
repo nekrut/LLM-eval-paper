@@ -1,0 +1,210 @@
+*   Goal: Per-sample variant calling on 4 paired-end MiSeq amplicon samples (human mtDNA).
+    *   Inputs: `data/raw/*.fq.gz`, `data/ref/chrM.fa`.
+    *   Outputs: `.bam`, `.bam.bai`, `.vcf.gz`, `.vcf.gz.tbi` for each sample, and a `results/collapsed.tsv`.
+    *   Tools available: `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`, `SnpSert`, `snpEff`, `fastqc`, `seqkit`, `snakemake`, `shellcheck`, `java`.
+    *   Constraints: Single self-contained bash script, no markdown, no prose, idempotent, 4 threads, under 600s.
+
+    *   `SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")`
+    *   Reference indexing: `bwa index data/ref/chrM.fa`, `samtools faidx data/ref/chrM.fa`.
+    *   Loop through samples:
+        *   Alignment: `bwa mem ... | samtools sort -o results/{sample}.bam -`
+        *   Indexing BAM: `samtools index results/{sample}.bam`
+        *   Variant calling: `lofreq call-parallel ... -o results/{sample}.vcf results/{sample}.bam`
+        *   Compression/Index VCF: `bgzip -f results/{sample}.vcf`, `tabix -p vcf results/{sample}.vcf.gz`. (Wait, `bgzip` is part of `htslib`/`samtools` usually, but the prompt says `tabix` is available and mentions `bgzip` in the plan. I'll use `samtools sort` or check if `bgzip` is implicitly there via `tabix` context. Actually, `lofreq call-parallel` often produces uncompressed VCF. The plan explicitly says `bgzip -f`. I will assume `bgzip` is available as part of the htslib suite provided).
+    *   Final step: Create `results/collapsed.tsv` by iterating through samples and using `bcftools query`.
+
+    *   Check if output files exist before running heavy steps (idempotency).
+    *   Use `set -euo pipefail`.
+    *   Ensure all paths are relative to CWD.
+
+    *   The plan says: `bgzip -f results/{sample}.vcf`. I'll use that.
+    *   `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' ... | awk ...`
+
+    *   `bwa index data/ref/chrM.fa` (only if `.bwt` doesn't exist).
+    *   `samtools faidx data/ref/crcM.fa` (only if `.fai` doesn't exist).
+    *   Loop:
+        *   If `results/{sample}.bam` exists, skip alignment.
+        *   If `results/{sample}.vcf.gz` exists, skip calling.
+    *   Final aggregation: Always overwrite/rebuild `collapsed.tsv` or check if it's complete. To be safe and idempotent, I'll rebuild the header and append.
+
+    *   `lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam`
+    *   Note: `lofreq` output might be uncompressed. The plan says `bgzip`.
+
+    *   The prompt asks for `results/collapsed.tsv` with columns `sample chrom pos ref alt af`.
+    *   `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz | awk -v s={sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv`
+
+    *   `bwa index`: 1 file
+    *   `samtools faidx`: 1 file
+    *   `bwa mem ... | samtools sort`: 1 bam, 1 bai
+    *   `lofreq call-parallel`: 1 vcf, 1 vcf.gz, 1 vcf.gz.tbi
+    *   `collapsed.tsv`: 1 file
+
+    Wait, `bgzip` is not explicitly in the `TOOL_INVENTORY`. However, `tabix` is. Usually, `samtools` or `htslib` provides `bgzip`. I will use `samtools exec` or just assume `bgzip` is available as it's standard with `tabix`. Actually, looking at the plan provided in the prompt, it *explicitly* uses `bgzip -f`. So I must include it.
+
+    Wait, one detail: `lofreq call-parallel` might produce a VCF that doesn't have an `AF` field in the INFO column if not specifically calculated or if using certain plugins. However, the task says "The collapsed.tsv must have columns... af". The plan uses `%INFO/AF`. I will follow the plan exactly.
+
+    *   `bwa index data/ref/chrM.fa`
+    *   `samtools faidx data/ref/chrM.fa`
+    *   Loop:
+        *   `bwa mem ... | samtools sort -o results/{sample}.bam -`
+        *   `samtools index results/{sample}.bam`
+        *   `lofreq call-parallel ... -o results/{sample}.vcf results/{sample}.bam`
+        *   `bgzip -f results/{sample}.vcf`
+        *   `tabix -p vcf results/{sample}.vcf.gz`
+    *   Final: `printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv`
+    *   Loop 2 (or same loop): `bcftools query ... >> results/collapsed.tsv`
+
+    Wait, the plan says "Per-sample alignment + sort (one pipeline)". I will implement it that way.
+
+    One more check: The plan for `collapsed.tsv` uses `awk -v s={sample}`. This is correct.
+
+    *   `bwa index`: Check if `.bwt` exists.
+    *   `samtools faidx`: Check if `.fai` exists.
+    *   Loop samples:
+        *   Check if `.bam` exists.
+        *   Check if `.vcf.gz` exists.
+
+    Wait, `lofreq call-parallel` might be slow. But the constraint is 600s for 4 samples. mtDNA is small (16kb). This should be very fast.
+
+    Let's refine the loop to ensure it doesn't redo work.
+    ```bash
+    for sample in "${SAMPLES[@]}"; do
+        if [[ ! -f "results/${sample}.bam" ]]; then
+            bwa mem ... | samtools sort ...
+            samtools index ...
+        fi
+        if [[ ! -f "results/${sample}.vcf.gz" ]]; then
+            lofreq call-parallel ...
+            bgzip -f results/${sample}.vcf
+            tabix -p vcf results/${sample}.vcf.gz
+        fi
+    done
+    ```
+
+    Wait, the `collapsed.tsv` needs to be rebuilt or appended. To ensure idempotency and correctness (if a sample was added later), I'll just rebuild it from all existing `.vcf.gz` files in `results/`.
+
+    Actually, the prompt says "The collapsed.tsv must have columns...".
+    I will:
+    1. Create header.
+    2. Loop through samples and if `.vcf.gz` exists, append to `collapsed.tsv`.
+
+    Wait, I'll check if `results/collapsed.tsv` already contains the sample to avoid duplicates? No, simpler: just overwrite it at the start of the script or rebuild it every time based on existing VCFs. Rebuilding is safer for idempotency.
+
+    ```bash
+    printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+    for sample in "${SAMPLES[@]}"; do
+        if [[ -f "results/${sample}.vcf.gz" ]]; then
+            bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" | \
+            awk -v s="$sample" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+        fi
+    done
+    ```
+
+    One detail: `lofreq call-parallel` output file `-o` is the base name. If I provide `results/{sample}.vcf`, it creates `results/{sample}.vcf`. Then `bgzip -f` turns it into `.vcf.gz`. This matches the plan.
+
+    Final check on tool names:
+    `bwa index` -> OK
+    `samtools faidx` -> OK
+    `bwa mem` -> OK
+    `samtools sort` -> OK
+    `samtools index` -> OK
+    `lofreq call-parallel` -> OK
+    `bgzip` (part of htslib/samtools) -> OK
+    `tabix` -> OK
+    `bcftools query` -> OK
+
+    Wait, `lofreq call-parallel` might not produce an `AF` field in the INFO column by default unless specified or if it's a specific version. However, I must follow the *Plan* provided in the prompt which uses `%INFO/AF`. If the plan says so, I do it.
+
+    One small thing: `bwa index` creates multiple files (`.amb`, `.ann`, `.bwt`, `.pac`, `.sa`). Checking for `.bwt` is a good way to see if indexing is done.
+
+    ```bash
+    #!/usr/bin/annotated bash (no, prompt says #!/usr/bin/env bash)
+    set -euo pipefail
+    THREADS=4
+    SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+    mkdir -p results
+
+    # 1. Reference indexing - BWA
+    if [[ ! -f "data/ref/chrM.fa.bwt" ]]; then
+        bwa index data/ref/chrM.fa
+    fi
+
+    # 2. Reference indexing - samtools faidx
+    if [[ ! -f "data/ref/chrM.fa.fai" ]]; then
+        samtools faidx data/ref/chrM.fa
+    fi
+
+    for sample in "${SAMPLES[@]}"; do
+        # 3. Alignment + Sort
+        if [[ ! -f "results/${sample}.bam" ]]; then
+            bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLIMGNA" \
+                data/ref/chrM.fa \
+                data/raw/${sample}_1.fq.gz \
+                data/raw/${sample}_2.fq.gz | \
+            samtools sort -@ "$THREADS" -o "results/${sample}.bam" -
+        fi
+
+        # 4. BAM index
+        if [[ ! -f "results/${sample}.bam.bai" ]]; then
+            samtools index -@ "$THREADS" "results/${sample}.bam"
+        fi
+
+        # 5. Variant calling - LoFreq
+        if [[ ! -f "results/${sample}.vcf.gz" ]]; then
+            lofreq call-parallel --pp-threads "$THREADS" -f data/ref/chrM.fa \
+                -o "results/${sample}.vcf" "results/${sample}.bam"
+            bgzip -f "results/${sample}.vcf"
+            tabix -p vcf "results/${sample}.vcf.gz"
+        fi
+    done
+
+    # 7. Collapsed TSV
+    printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+    for sample in "${SAMPLES[@]}"; do
+        if [[ -f "results/${sample}.vcf.gz" ]]; then
+            bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" | \
+            awk -v s="$sample" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+        fi
+    done
+    ```
+
+    Wait, the `bwa mem` command in my draft has a typo: `PL:ILLUMNA`. The plan says `PL:ILLUMINA`. Fixed.
+    Also, I used `$THREADS` inside the loop for bwa and samtools. The plan uses `4`. I'll use `4` or `$THREADS`.
+
+    One more check on `lofreq call-parallel`: The `-o` flag in `lofreq call-parallel` specifies the output file name. If it's `results/{sample}.vcf`, it will create that exact file.
+
+    Final check on constraints:
+    - No markdown fences.
+    - One self-annotated script.
+    - Idempotent.
+    - All tools from inventory.
+    - Output to `results/`.
+    - 4 threads.
+    - Wall clock < 600s (mtDNA is tiny, so this is easy).
+
+    Wait, the plan says: `bwa mem -t 4 ...`. I will use `4` directly or `$THREADS`. The prompt says `THREADS=4`.
+
+    One detail in `bcftools query`: If a variant doesn't have an `AF` field (which can happen if it's not filtered or if LoFreq didn't populate it), `bcftools` might skip the line or return empty. But I must follow the plan. The plan says `%INFO/AF`.
+
+    Final check on file paths:
+    `data/raw/{sample}_1.fq.gz` - Correct.
+    `data/ref/chrM.fa` - Correct.
+    `results/{sample}.bam` - Correct.
+
+    Wait, the plan for `bwa mem` uses `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`. I must use exactly that format (with curly braces replaced by sample name).
+
+    ```bash
+    bwa mem -t 4 -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ 4 -o results/${sample}.bam -
+    ```
+
+    One last check on `bgzip`. If it's not in the inventory, but `tabix` is, and the plan uses `bgzip`, I will use `bgzip`. In most bioinformatics environments, `bgzip` is part of the same package as `tabix`.
+
+    Wait, looking at the `lofreq call-parallel` command:
+    `lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam`
+    If I run this and it produces `results/M117-bl.vcf`, then `bgzip -f results/M117-bl.vcf` will produce `results/M117-bl.vcf.gz`. This is perfect.
+
+    Final check on the `collapsed.tsv`:
+    The plan: `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz | awk -v s={sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv`
+    This is exactly what I will write.
+
+    One small detail: `bwa index` can be slow if the genome is large, but for chrM (16kb), it's instantaneous.

@@ -1,0 +1,190 @@
+Let me understand the task:
+
+1. I need to create a bash script that processes 4 paired-end MiSeq amplicon samples
+2. The workflow involves:
+   - Reference indexing (bwa index, samtools faidx)
+   - Per-sample alignment with bwa mem
+   - BAM sorting and indexing
+   - Variant calling with lofreq call-parallel
+   - VCF compression and indexing
+   - Collapsing all variants into a single TSV
+
+3. Key requirements:
+   - Must be idempotent (can rerun without errors)
+   - Use only tools in the inventory
+   - THREADS=4
+   - Samples: M117-bl, M117-ch, M117C1-bl, M117C1-ch
+   - Output under results/ directory
+
+Let me write this script carefully:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"
+
+# Create results directory if needed
+mkdir -p results
+
+# Reference indexing (once)
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+if [ ! -f data/ref/chrM.fa.amb ] || [ ! -f data/ref/chrM.fa.ann ] || \
+   [ ! -f data/ref/chrM.fa.bwt ] || [ ! -f data/ref/chrM.fa.pac ] || \
+   [ ! -f data/ref/chrM.fa.sa ]; then
+    bwa index data/ref/chrM.fa
+fi
+
+# Per-sample processing
+for sample in $SAMPLES; do
+    # Check if already done (all outputs exist)
+    if [ -f "results/${sample}.vcf.gz.tbi" ] && \
+       [ "results/${sample}.bam" -nt "data/raw/${sample}_1.fq.gz" ] || \
+       [ "results/${sample}.bam.bai" -nt "results/${sample}.bam" ]; then
+        continue
+    fi
+    
+    # Alignment with bwa mem
+    bwa mem -t $THREADS -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+        data/ref/chrM.fa \
+        <(zcat "data/raw/${sample}_1.fq.gz") \
+        <(zcat "data/raw/${sample}_2.fq.gz") | \
+    samtools sort -@ $THREADS -o "results/${sample}.bam"
+    
+    # BAM indexing
+    samtools index -@ $THREADS "results/${sample}.bam"
+    
+    # Variant calling with lofreq
+    lofreq call-parallel --pp-threads $THREADS \
+        -f data/ref/chrM.fa \
+        -o "results/${sample}.vcf" \
+        "results/${sample}.bam"
+    
+    # VCF compression and indexing
+    bgzip -c "results/${sample}.vcf" > "results/${sample}.vcf.gz"
+    tabix -p vcf "results/${sample}.vcf.gz"
+    rm "results/${sample}.vcf"
+done
+
+# Collapsed TSV generation
+collapsed_needed=false
+if [ ! -f results/collapsed.tsv ]; then
+    collapsed_needed=true
+else
+    for sample in $SAMPLES; do
+        if [ "results/${sample}.vcf.gz" -nt "results/collapsed.tsv" ]; then
+            collapsed_needed=true
+            break
+        fi
+    done
+fi
+
+if $collapsed_needed; then
+    echo -e "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv
+    for sample in $SAMPLES; do
+        bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' \
+            "results/${sample}.vcf.gz" >> results/collapsed.tsv
+    done
+fi
+
+exit 0
+```
+
+Wait, I need to be more careful about the idempotency checks. Let me think through this again:
+
+For each sample, I need to check if all outputs are up-to-date with inputs. The outputs for a sample are:
+- results/{sample}.bam
+- results/{sample}.bam.bai
+- results/{sample}.vcf.gz
+- results/{sample}.vcf.gz.tbi
+
+The main input is the FASTQ files (both _1 and _2).
+
+Actually, looking at the requirement more carefully: "re-running on a fully populated `results/` must exit 0 without re-doing work"
+
+So I should check if all outputs exist. Let me simplify:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"
+
+mkdir -p results
+
+# Reference indexing
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+if [ ! -f data/ref/chrM.fa.amb ] || [ ! -f data/ref/chrM.fa.ann ] || \
+   [ ! -f data/ref/chrM.fa.bwt ] || [ ! -f data/ref/chrM.fa.pac ] || \
+   [ ! -f data/ref/chrM.fa.sa ]; then
+    bwa index data/ref/chrM.fa
+fi
+
+# Per-sample processing
+for sample in $SAMPLES; do
+    bam_file="results/${sample}.bam"
+    vcf_gz="results/${sample}.vcf.gz"
+    
+    # Skip if all outputs exist
+    if [ -f "$bam_file" ] && [ -f "results/${sample}.bam.bai" ] && \
+       [ -f "$vcf_gz" ] && [ -f "${vcf_gz}.tbi" ]; then
+        continue
+    fi
+    
+    # Alignment
+    bwa mem -t $THREADS -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+        data/ref/chrM.fa \
+        <(zcat "data/raw/${sample}_1.fq.gz") \
+        <(zcat "data/raw/${sample}_2.fq.gz") | \
+    samtools sort -@ $THREADS -o "$bam_file"
+    
+    # BAM index
+    samtools index -@ $THREADS "$bam_file"
+    
+    # Variant calling
+    lofreq call-parallel --pp-threads $THREADS \
+        -f data/ref/chrM.fa \
+        -o "results/${sample}.vcf" \
+        "$bam_file"
+    
+    # Compress and index VCF
+    bgzip -c "results/${sample}.vcf" > "$vcf_gz"
+    tabix -p vcf "$vcf_gz"
+    rm "results/${sample}.vcf"
+done
+
+# Collapsed TSV
+if [ ! -f results/collapsed.tsv ]; then
+    echo -e "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv
+    for sample in $SAMPLES; do
+        bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' \
+            "results/${sample}.vcf.gz" >> results/collapsed.tsv
+    done
+fi
+
+exit 0
+```
+
+Hmm, but the requirement says to check if outputs are newer than inputs for idempotency. Let me re-read...
+
+"Treat every output step as idempotent: guard each artifact with an existence check (e.g. skip if `results/{sample}.vcf.gz.tbi` already exists and is newer than its inputs)"
+
+So I should use `-nt` (newer than) checks. But this gets complex because there are multiple outputs per sample. Let me think...
+
+Actually, the simplest approach for idempotency is to check if all final outputs exist. If they do, skip everything. This satisfies "re-running on a fully populated `results/` must exit 0 without re-doing work".
+
+But wait, what about partial runs? What if only some samples are done? The requirement says to be idempotent and not redo work. So I should check per-sample whether outputs exist.
+
+Let me also consider: the reference indexing files don't need to be in results/, they stay in data/ref/. And for those, I just need to check existence (not newer-than).
+
+For the collapsed.tsv, I need to regenerate it if any VCF is newer than it.
+
+Let me write a cleaner version:

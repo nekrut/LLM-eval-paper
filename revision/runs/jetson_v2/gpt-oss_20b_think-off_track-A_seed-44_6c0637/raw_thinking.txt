@@ -1,0 +1,254 @@
+We need to produce a bash script that follows plan exactly. Must be idempotent: guard each step with file existence checks.
+
+We must use only tools listed: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. We don't need others.
+
+The script should produce results/{sample}.bam, .bai, .vcf.gz, .tbi, collapsed.tsv.
+
+We must use bgzip? The plan uses bgzip but not listed in TOOL_INVENTORY; but tabix is part of htslib and bgzip is usually part of samtools. But we can use "bgzip" from samtools or "samtools view -b"? Actually bgzip is part of htslib, but not explicitly listed. However we can use "bgzip" command because it's part of samtools distribution? Usually bgzip is a separate binary in the same package; but not sure if available. The plan uses bgzip. But tool inventory didn't list bgzip. We might need to use "samtools view -b"? Wait, for compressing VCF we can use "bgzip" from samtools or "gzip -c". But tabix requires bgzipped file. We could use "bgzip" if available; but not listed. However the plan uses bgzip. The environment may have it. Since it's part of htslib, likely present. But to be safe, we can use "samtools view -b"? No that's for BAM. For VCF compression, we need bgzip. We could use "bgzip" command; if not available, script fails. But given plan uses bgzip, assume it exists.
+
+Also need to guard step 6: check if .vcf.gz.tbi exists. If yes skip compress+tabix. But note that .vcf may still exist? The guard checks only .tbi. That's fine.
+
+We also need to ensure we don't use echo for user-facing prose; but we can use printf for header line, that's okay as it's part of tool output. But the instruction says "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." Using printf is allowed? It's still writing to stdout. But maybe they mean avoid printing progress messages. The header line is part of output file, not console. So we can use printf > results/collapsed.tsv.
+
+We must ensure script uses set -euo pipefail.
+
+Also need to create results dir.
+
+We also need to check for reference indexing: bwa index and samtools faidx.
+
+Guard for bwa index: [[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+
+Guard for samtools faidx: [[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+Now per sample loop:
+
+- Align + sort: guard on results/{sample}.bam. Use braces to wrap pipeline.
+
+[[ ! -f results/${sample}.bam ]] || ...? Actually we want if not exist then run. So [[ -f results/${sample}.bam ]] || { bwa mem ... | samtools sort ... ; }
+
+But careful: If .bam exists but .bai missing, we still need to index. But indexing guard will handle that.
+
+- Index BAM: guard on .bai.
+
+[[ -f results/${sample}.bam.bai ]] || samtools index -@ 4 results/${sample}.bam
+
+- Variant calling: guard on .vcf or .vcf.gz? The plan says check both. So [[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] || lofreq call-parallel ...
+
+But we need to use correct syntax for test: [[ -f file1 || -f file2 ]]. In bash, inside [[ ... ]] you can use -o or ||? Actually within [[ ... ]] you can use -o. But using || might be parsed as shell operator outside test. So better use:
+
+[[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] || lofreq call-parallel ...
+
+But inside [[ ... ]] we need to use -o: [[ -f file1 -o -f file2 ]]. But the plan uses ||; but we can adapt. Use:
+
+[[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] || lofreq call-parallel ...
+
+But that might be parsed incorrectly. Safer to use:
+
+if [[ ! -f results/${sample}.vcf && ! -f results/${sample}.vcf.gz ]]; then
+    lofreq ...
+fi
+
+But we want guard style: [[ -f file1 || -f file2 ]] || command.
+
+We can do: [[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] || { lofreq ... ; }
+
+But inside [[ ... ]] you cannot use ||. Actually you can use "||" outside the test, but then it will be parsed as shell operator after closing ]]. Eg:
+
+[[ -f file1 || -f file2 ]] || command
+
+This is valid: The first part is a test; if false, then run command. But inside [[ ... ]] we used || which might be considered as logical OR within the test? Wait, in bash, inside [[ ... ]] you can use "||" as an operator? I think it's not allowed; only -o or &&. Let's check: In [[ ... ]], you can use -a and -o for AND/OR. The "||" is a shell operator outside of the test. So writing [[ -f file1 || -f file2 ]] will parse as [[ -f file1 || -f file2 ]]. The "||" inside may be considered part of the test? Actually I think it's parsed as part of the test expression; but I'm not sure. Safer to use:
+
+[[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] || ...
+
+But to avoid confusion, we can use:
+
+if [[ ! -f results/${sample}.vcf && ! -f results/${sample}.vcf.gz ]]; then
+    lofreq call-parallel ...
+fi
+
+But that would not be guard style but still idempotent. It's fine.
+
+However the instruction says "Use only tools listed in TOOL_INVENTORY" and no other commands like 'if' are allowed? 'if' is shell built-in, so okay.
+
+We can use a simple if statement for variant calling guard.
+
+But we need to keep script minimal.
+
+Let's design:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Reference indexing
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+for sample in "${SAMPLES[@]}"; do
+    # Alignment and sort
+    [[ -f results/${sample}.bam ]] || {
+        bwa mem -t ${THREADS} -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ ${THREADS} -o results/${sample}.bam -
+    }
+
+    # BAM index
+    [[ -f results/${sample}.bam.bai ]] || samtools index -@ ${THREADS} results/${sample}.bam
+
+    # Variant calling with LoFreq
+    if ! [[ -f results/${sample}.vcf && -s results/${sample}.vcf ]]; then
+        # Check both .vcf and .vcf.gz? Actually we want to skip if either exists.
+        if [[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]]; then
+            :
+        else
+            lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+        fi
+    fi
+
+    # Compress and index VCF
+    [[ -f results/${sample}.vcf.gz.tbi ]] || {
+        bgzip -f results/${sample}.vcf
+        tabix -p vcf results/${sample}.vcf.gz
+    }
+done
+
+# Collapsed TSV
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+
+But we need to ensure variant calling guard is correct: We want to skip if either .vcf or .vcf.gz exists. So:
+
+if [[ ! -f results/${sample}.vcf && ! -f results/${sample}.vcf.gz ]]; then
+    lofreq call-parallel ...
+fi
+
+That's simpler.
+
+Also we need to ensure that after compression, the .vcf file is removed; but if .vcf existed earlier, we skip calling. But if .vcf exists and .vcf.gz missing, we still want to compress? The guard for compression checks .tbi only. So if .vcf exists (maybe from previous run) but .tbi missing, the compression step will run: bgzip -f results/${sample}.vcf; tabix ... This will produce .vcf.gz and .tbi. Good.
+
+But we need to ensure that after compression, .vcf file is removed. That's fine.
+
+Now variant calling guard: if .vcf or .vcf.gz exists, skip calling. But if .vcf.gz exists but .vcf missing (maybe from previous run), we still skip calling. Good.
+
+Edge case: If .vcf.gz exists but .tbi missing? That would be weird; but compression step will create both .gz and .tbi. So fine.
+
+Now we need to ensure that the script uses only tools listed. We used bgzip, which is part of samtools/htslib. It's not explicitly listed but likely present. But maybe we should use "samtools view -b" for compression? No. For VCF compression, we can use "bgzip". Let's assume it's available.
+
+We also used awk; that's fine (built-in). We used printf; okay.
+
+Now check the alignment command: bwa mem -t 4 -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ 4 -o results/${sample}.bam -
+
+We need to ensure that the backslashes are correct. In double quotes, we want literal \t. So we use "\\t" inside string? Wait: The plan says "Use the literal two characters `\t` (backslash + t) inside the double-quoted string." That means we should write "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA". In bash, within double quotes, \t is not special; it's just backslash and t. So writing "\t" will produce literal backslash + t? Actually in double quotes, backslash escapes certain characters like $, `, ", \, newline. But \t is not a recognized escape sequence, so the backslash remains. So we can write "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA". That will produce literal backslash t. Good.
+
+So we don't need to double-escape. So use:
+
+-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"
+
+Wait, if we write @RG\t..., the shell will interpret \t as just 't'? Actually in double quotes, backslash before t is not special; it remains backslash. So writing "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" should produce literal backslash + t. But we need to escape the backslashes? Let's test mentally: In bash, inside double quotes, a backslash before any character except $, `, ", \, newline is preserved. So "\t" becomes backslash + t. Good.
+
+Thus we can write:
+
+-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"
+
+No need to escape the backslashes. But if we use single quotes, then backslash would be literal too. But we need variable expansion, so double quotes needed.
+
+So final alignment command:
+
+bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ ${THREADS} -o results/${sample}.bam -
+
+Now we need to ensure that the guard for alignment uses braces correctly. We can write:
+
+[[ -f results/${sample}.bam ]] || {
+    bwa mem ... | samtools sort ...
+}
+
+But if .bam exists but .bai missing, indexing will run.
+
+Now variant calling guard: Use if statement as described.
+
+Let's craft final script accordingly.
+
+Also we need to ensure that the script uses "bgzip" command; but not listed. But maybe it's part of samtools. We can use "samtools view -h"? No. For VCF compression, we could use "bgzip" from htslib. It's likely available. We'll keep it.
+
+Now we also need to ensure that the script uses only tools in inventory: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. We used awk and printf; those are builtins.
+
+We didn't use SnpSift or snpEff etc. That's fine.
+
+Now we need to ensure that the script is idempotent: if results dir exists with all outputs, rerun should exit 0 without redoing work. Our guards will skip steps accordingly. The collapsed.tsv step always rebuilds; that's okay. It will overwrite header and append each sample's query. That may produce same file each run.
+
+Now we need to ensure that the script uses "set -euo pipefail" which ensures pipeline errors cause exit. But our guard braces might contain commands that fail if not needed? For example, if .bam exists but .bai missing, alignment step is skipped; indexing runs. Good.
+
+But what about variant calling guard: we used if [[ ! -f results/${sample}.vcf && ! -f results/${sample}.vcf.gz ]]; then ... fi. That will skip calling if either file exists. Good.
+
+Now compress+index guard: [[ -f results/${sample}.vcf.gz.tbi ]] || { bgzip -f results/${sample}.vcf; tabix -p vcf results/${sample}.vcf.gz ; }
+
+But if .vcf doesn't exist (maybe because we didn't run variant calling), then bgzip will error. But guard ensures that .tbi missing triggers compression, but if .vcf missing, it fails. However if .vcf missing and .vcf.gz missing, we should not attempt compress; but the guard would try to compress anyway. But this scenario only occurs if variant calling didn't run (maybe because .vcf.gz existed). But if .vcf.gz exists, then .tbi likely exists too. So guard won't trigger. If .vcf.gz missing and .vcf missing, we should not attempt compression; but that would mean variant calling hasn't run yet. But the guard will try to compress anyway, causing error. But this scenario only occurs if previous steps didn't produce .vcf or .vcf.gz. That could happen if variant calling step was skipped due to existing .vcf? Wait, if .vcf missing and .vcf.gz missing, then variant calling should have run earlier; but guard might skip because we used "if ! [[ -f results/${sample}.vcf && -s results/${sample}.vcf ]]; then ... fi" incorrectly. Let's design correctly.
+
+Better approach: For variant calling guard:
+
+if [[ ! -f results/${sample}.vcf && ! -f results/${sample}.vcf.gz ]]; then
+    lofreq call-parallel ...
+fi
+
+Thus if neither file exists, we run calling. After calling, .vcf will exist. Then compression step runs because .tbi missing; it compresses .vcf to .gz and indexes.
+
+If .vcf.gz already exists (maybe from previous run), then variant calling is skipped. Compression guard sees .tbi missing? But if .vcf.gz exists, .tbi should also exist. So guard won't trigger. Good.
+
+Edge case: If .vcf.gz exists but .tbi missing (unlikely). Then compression guard will try to compress .vcf which doesn't exist; error. But we can assume that if .vcf.gz exists, .tbi exists too because tabix would have been run earlier. So fine.
+
+Thus our variant calling guard is correct.
+
+Now final script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Reference indexing
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+for sample in "${SAMPLES[@]}"; do
+    # Alignment and sort
+    [[ -f results/${sample}.bam ]] || {
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ ${THREADS} -o results/${sample}.bam -
+    }
+
+    # BAM index
+    [[ -f results/${sample}.bam.bai ]] || samtools index -@ ${THREADS} results/${sample}.bam
+
+    # Variant calling with LoFreq
+    if [[ ! -f results/${sample}.vcf && ! -f results/${sample}.vcf.gz ]]; then
+        lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+    fi
+
+    # Compress and index VCF
+    [[ -f results/${sample}.vcf.gz.tbi ]] || {
+        bgzip -f results/${sample}.vcf
+        tabix -p vcf results/${sample}.vcf.gz
+    }
+done
+
+# Collapsed TSV
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+
+Check for missing tools: bgzip not listed but likely present. If not, we could use "samtools view -h"? No.
+
+Alternatively, we can compress using "bgzip" from samtools; it's part of htslib. We'll keep it.
+
+Now ensure no stray spaces or tabs causing issues.
+
+Also need to ensure that the script uses only tools in inventory: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. We used awk and printf; those are fine.
+
+Now final answer: output script only.

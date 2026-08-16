@@ -1,0 +1,448 @@
+We need to produce a bash script that follows instructions.
+
+Key constraints:
+
+- First line: #!/usr/bin/env bash
+- Second: set -euo pipefail
+
+- Use only tools listed in TOOL_INVENTORY.
+
+- Idempotent: check existence of outputs and timestamps relative to inputs. For each step, skip if output exists and newer than inputs.
+
+- We need to index reference once: check for .fai and bwa index files (.amb etc). We'll create a function maybe.
+
+- For per-sample steps: alignment, sorting, indexing, variant calling, compression, indexing, removal of uncompressed VCF. Each step should be guarded by existence checks.
+
+- Use THREADS=4.
+
+- We need to produce results/{sample}.bam and .bai etc.
+
+- For collapsed.tsv: check if any input VCF newer than TSV; else skip.
+
+- The script must not output anything except tool outputs. So no echo statements for progress.
+
+- Must be idempotent: re-running should exit 0 without doing work or erroring. That means we need to guard each step with checks, but also ensure that if some intermediate file missing, it will create. But if all final outputs exist and are newer than inputs, skip everything.
+
+But the script must still run through steps; but we can check at each step: if output exists and is newer than relevant input(s), skip. For example for BAM: if results/{sample}.bam exists and its modification time > both FASTQ files? Actually we need to compare with FASTQs. But also maybe reference index? But alignment uses reference, so if reference changes, but not likely.
+
+Simplify: For each sample:
+
+- If results/{sample}.bam.bai exists and is newer than {sample}.bam (but .bam may be older). But we might skip earlier steps if final outputs exist. We can check at the top of per-sample loop: if all expected files exist, skip entire sample.
+
+But we also need to ensure that if some intermediate missing but final present? That shouldn't happen; but we can just rely on existence checks for each step.
+
+Simpler approach:
+
+- For each sample, define variables.
+
+- Step 1: alignment+sort -> results/{sample}.bam. Check if file exists and newer than FASTQ files. If yes skip to next step else run.
+
+But we also need to ensure that .bam.bai exists; but if .bam is missing, we can't index. So we can check each step individually.
+
+- Step 2: indexing of BAM: if results/{sample}.bam.bai exists and newer than .bam, skip.
+
+- Step 3: variant calling: output .vcf. Check existence and timestamp relative to .bam? Actually lofreq uses bam; but also reference file. So check if .vcf exists and newer than .bam and reference index maybe. We'll just check .vcf exists and newer than .bam and reference.
+
+- Step 4: compression: results/{sample}.vcf.gz. Check existence and newer than .vcf? Actually we compress .vcf; so if .gz exists and newer than .vcf, skip. But also need to index .tbi. So check both.
+
+- Step 5: collapse.tsv: check if file exists and newer than all sample .vcf.gz files. If yes skip.
+
+Edge cases: If some intermediate missing but final present? That would be inconsistent; but we can still rely on existence checks for each step, so if .bam missing but .bam.bai exists, the script will attempt to index again? Actually if .bam missing but .bam.bai exists, indexing step will fail because input missing. But we might skip earlier steps incorrectly. So better to check per sample: if all final outputs exist and newer than inputs, skip entire sample; else run through steps sequentially with checks.
+
+Simpler: For each sample:
+
+- If results/{sample}.vcf.gz.tbi exists and is newer than both FASTQ files and reference index? Actually we need to ensure that all intermediate steps are up-to-date. But if .vcf.gz.tbi exists but .bam missing, then script will try to run alignment again because .bam doesn't exist; that's fine.
+
+Thus we can just check each step individually: e.g., for alignment+sort:
+
+```
+if [ ! -s results/${sample}.bam ] || [ "${results}/${sample}.bam" -ot "data/raw/${sample}_1.fq.gz" ] || [ "${results}/${sample}.bam" -ot "data/raw/${sample}_2.fq.gz" ]; then
+   # run alignment+sort
+fi
+```
+
+But we also need to check if .bam exists but older than FASTQs; then re-run.
+
+Similarly for indexing: if .bai missing or older than .bam, run samtools index.
+
+Variant calling: if .vcf missing or older than .bam, run lofreq call-parallel.
+
+Compression: if .vcf.gz missing or older than .vcf, compress. Also need to index .tbi; but we can check both.
+
+Collapse.tsv: if collapsed.tsv missing or older than any sample .vcf.gz, rebuild.
+
+Also reference indexing: check for chrM.fa.fai and bwa index files (.amb etc). We'll create a function to check existence of all required index files. For bwa index, the set includes .amb .ann .bwt .pac .sa. So we can check if any missing; if so run bwa index.
+
+Now implement script:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+# create results dir
+mkdir -p results
+
+# reference indexing
+REF="data/ref/chrM.fa"
+FAI="${REF}.fai"
+
+if [ ! -s "$FAI" ]; then
+    samtools faidx "$REF"
+fi
+
+# bwa index files list
+BWA_INDEX_FILES=("${REF}.amb" "${REF}.ann" "${REF}.bwt" "${REF}.pac" "${REF}.sa")
+need_bwa_index=false
+for f in "${BWA_INDEX_FILES[@]}"; do
+    if [ ! -s "$f" ]; then
+        need_bwa_index=true
+        break
+    fi
+done
+
+if $need_bwa_index; then
+    bwa index "$REF"
+fi
+
+# per-sample processing
+for sample in "${SAMPLES[@]}"; do
+    BAM="results/${sample}.bam"
+    BAI="results/${sample}.bam.bai"
+    VCF="results/${sample}.vcf"
+    VCFZ="results/${sample}.vcf.gz"
+    VCFZTBI="results/${sample}.vcf.gz.tbi"
+
+    FASTQ1="data/raw/${sample}_1.fq.gz"
+    FASTQ2="data/raw/${sample}_2.fq.gz"
+
+    # alignment + sort
+    if [ ! -s "$BAM" ] || [ "$BAM" -ot "$FASTQ1" ] || [ "$BAM" -ot "$FASTQ2" ]; then
+        bwa mem -t "$THREADS" -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+            "$REF" "$FASTQ1" "$FASTQ2" | samtools sort -@ "$THREADS" -o "$BAM"
+    fi
+
+    # BAM index
+    if [ ! -s "$BAI" ] || [ "$BAI" -ot "$BAM" ]; then
+        samtools index -@ "$THREADS" "$BAM"
+    fi
+
+    # variant calling
+    if [ ! -s "$VCF" ] || [ "$VCF" -ot "$BAM" ]; then
+        lofreq call-parallel --pp-threads "$THREADS" -f "$REF" -o "$VCF" "$BAM"
+    fi
+
+    # compress VCF
+    if [ ! -s "$VCFZ" ] || [ "$VCFZ" -ot "$VCF" ]; then
+        bgzip -c "$VCF" > "$VCFZ"
+        rm -f "$VCF"
+    fi
+
+    # index compressed VCF
+    if [ ! -s "$VCFZTBI" ] || [ "$VCFZTBI" -ot "$VCFZ" ]; then
+        tabix -p vcf "$VCFZ"
+    fi
+done
+
+# collapse.tsv
+COLLAPSED="results/collapsed.tsv"
+
+rebuild=false
+if [ ! -s "$COLLAPSED" ]; then
+    rebuild=true
+else
+    for sample in "${SAMPLES[@]}"; do
+        VCFZ="results/${sample}.vcf.gz"
+        if [ "$VCFZ" -ot "$COLLAPSED" ]; then
+            rebuild=true
+            break
+        fi
+    done
+fi
+
+if $rebuild; then
+    # header
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"
+    for sample in "${SAMPLES[@]}"; do
+        VCFZ="results/${sample}.vcf.gz"
+        bcftools query -f '${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$VCFZ" >> "$COLLAPSED"
+    done
+fi
+
+exit 0
+```
+
+But we need to ensure that the read group string uses literal backslash-t. In bash, inside double quotes, \t is interpreted as tab unless escaped? Actually in double-quoted strings, \t is not special; it's just a backslash and t. Wait: In Bash, within double quotes, backslashes are used for escaping certain characters: `\"`, `\\`, `$`, `` ` ``, newline. But `\t` is not recognized as tab; it remains literal backslash-t. So we can use `"@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"` and that will produce the string with actual backslashes? Let's test mentally: In double quotes, `\t` is not special; it's just a backslash followed by t. So it should be fine.
+
+But we need to ensure that the whole argument is passed as one string. We used:
+
+```
+-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"
+```
+
+Wait, we added double backslashes `\\t`. That would produce a literal backslash followed by t? Actually inside double quotes, to get a literal backslash you need to escape it with another backslash. So `"@RG\\tID..."` will produce `@RG\tID...` (backslash-t). But we might not need the extra escaping if we use single quotes: `'@RG\tID:'$sample'\tSM:'$sample'\tLB:'$sample'\tPL:ILLUMINA'`. That would preserve backslashes. Let's think.
+
+Simpler: Use single quotes around entire string, but we need to insert variable values; we can close and reopen quotes:
+
+```
+-R '@RG\tID:'"$sample"'\tSM:'"$sample"'\tLB:'"$sample"'\tPL:ILLUMINA'
+```
+
+This will produce the correct string with literal backslashes. That might be clearer.
+
+But we also need to ensure that `bwa mem` receives this as one argument; yes.
+
+Let's adjust accordingly:
+
+```
+-R '@RG\tID:'"$sample"'\tSM:'"$sample"'\tLB:'"$sample"'\tPL:ILLUMINA'
+```
+
+Now the script uses only allowed tools. We used bgzip, but not listed in TOOL_INVENTORY. Wait, bgzip is part of htslib; but not explicitly listed. The inventory lists tabix (htslib) and bcftools, samtools. But bgzip might be available as part of samtools or htslib? Usually bgzip is a separate binary from htslib. It's likely present in the environment because bcftools uses it. But it's not explicitly listed; but we can use `bgzip` if it's on PATH. The inventory didn't list it, but maybe it's considered part of tools. However to be safe, we could compress with `bcftools view -O z`. But instructions say "Compress with bgzip (not bcftools view -O z)". So we must use bgzip. Is bgzip available? Usually yes in htslib installation; but not listed. But maybe it's okay.
+
+But the instruction says: Use only tools listed in TOOL_INVENTORY. That list does not include bgzip. So using bgzip might violate constraints. We need to compress with `bgzip` but if not allowed, we could use `samtools view -O z`. Wait, samtools can compress VCF? Actually `samtools view -O z` is for BAM/CRAM; not for VCF. But bcftools can compress VCF: `bcftools view -Oz -o file.vcf.gz file.vcf`. That uses bcftools which is allowed. The instruction says "Compress with bgzip (not bcftools view -O z)". So they explicitly want bgzip, not bcftools. But bgzip might be part of htslib and maybe available; but it's not listed. However the inventory lists tabix (htslib). That implies that htslib is installed, which includes bgzip. But they didn't list it. The instruction says "Use only tools listed in TOOL_INVENTORY". So we cannot use bgzip if not listed. But maybe bgzip is considered part of samtools? Actually bgzip is separate binary but often included with htslib. But it's not listed.
+
+We could compress using `samtools view -O z` on VCF? That might not work because samtools expects BAM/CRAM. So we need to use bcftools for compression: `bcftools view -Oz -o file.vcf.gz file.vcf`. But instruction says "Compress with bgzip (not bcftools view -O z)". This is contradictory if we cannot use bgzip.
+
+Maybe the environment has bgzip available but not listed; but they said only tools in inventory. However maybe they omitted bgzip inadvertently, but it's part of htslib and likely present. But to be safe, we can compress using `bgzip` because it's a standard tool for VCF compression. Let's assume it's allowed.
+
+But if the environment doesn't have bgzip, script will fail. But given instructions, we should use bgzip.
+
+Also we need to ensure that bcftools query uses correct format string: `'${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`. In bash, single quotes prevent variable expansion; but we want `${sample}` expanded. So we can use double quotes or mix.
+
+We used:
+
+```
+bcftools query -f '${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$VCFZ"
+```
+
+But inside single quotes, ${sample} will not expand. We need to use double quotes for that part: `"${sample}\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\\n"`? Wait, bcftools query format string uses `%` placeholders; we want literal `${sample}` inserted as sample name. But we can just use `"$sample\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`. That will expand $sample and keep backslashes.
+
+But we need to escape tabs? Actually bcftools query expects format string with actual tab characters, not literal \t. So we should provide real tabs. But the instruction says "The `{sample}` literal is prepended via the format string so the sample name is attached per row." They didn't mention escaping; but we can use actual tabs.
+
+So we need to produce a format string like: `${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n`. We can construct it with double quotes and backslashes for literal tab? Wait, in bash, inside double quotes, `\t` is not special; it's just backslash-t. So we need to use actual tab characters. But we cannot easily embed a literal tab in the script without using `$'\t'` or echo -e. But we can use $'' quoting: `$'\t'`. That uses ANSI-C quoting, which might be allowed? It's part of bash; not a tool. So we can do:
+
+```
+FORMAT="${sample}$'\t'%CHROM$'\t'%POS$'\t'%REF$'\t'%ALT$'\t'%INFO/AF$'\n'
+bcftools query -f "$FORMAT" "$VCFZ"
+```
+
+But the instruction says "Do not use printf, echo -e, $'\t', or any mechanism that turns them into real tabs; bwa rejects real tabs with “the read group line contained literal <tab> characters”." That restriction is for the read group string. For bcftools query format string, we can use actual tabs because it's not a problem.
+
+But we need to produce a script without using $'\t' maybe? The instruction only forbids that for read group; but we might still use it elsewhere. But to be safe, we can avoid $'\t' and just embed literal tab characters in the string by pressing Tab key. That is allowed. So we can write:
+
+```
+FORMAT="${sample}	%CHROM	%POS	%REF	%ALT	%INFO/AF
+"
+bcftools query -f "$FORMAT" "$VCFZ"
+```
+
+But writing a literal tab inside script may be okay.
+
+Alternatively, we can use `printf` to generate the format string? But they said no echo or printf for user-facing prose; but using printf is allowed as part of script logic. But we might avoid complexity.
+
+Simpler: Use bcftools query with format string that includes sample name via `-s ${sample}`? Actually bcftools query has option `-s` to specify sample names, but not to prepend sample column. So we need to manually add sample name.
+
+We can just use:
+
+```
+bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$VCFZ"
+```
+
+But inside double quotes, `\t` will be literal backslash-t; we need actual tab. So we can embed a real tab: `${sample}` followed by a tab character. In script, we can write:
+
+```
+FORMAT="${sample}	%CHROM	%POS	%REF	%ALT	%INFO/AF
+"
+bcftools query -f "$FORMAT" "$VCFZ"
+```
+
+But writing literal tabs may be messy but doable.
+
+Alternatively, use `printf` to generate the string with actual tab characters:
+
+```
+FORMAT=$(printf "%s\t%%CHROM\t%%POS\t%%REF\t%%ALT\t%%INFO/AF\n" "$sample")
+bcftools query -f "$FORMAT" "$VCFZ"
+```
+
+But that uses printf; but it's not user-facing. It's fine.
+
+Let's adopt this approach: use `printf` to generate format string with actual tabs.
+
+Now, we need to ensure that the script does not output anything beyond tool outputs. The `printf` will produce nothing on stdout unless used incorrectly. But we are using it to set variable; that's okay.
+
+Also we need to ensure that bcftools query writes to stdout; we redirect to file.
+
+Now, check for idempotency: For each step, we use -ot to compare modification times. We also need to consider if the input files may be newer than outputs. That will trigger re-run.
+
+Edge case: If .bam exists but older than FASTQ, we run alignment again; that will overwrite .bam and produce new index etc. Good.
+
+Now, we need to ensure that we don't inadvertently create intermediate files like .vcf when compressing; we remove it after compression.
+
+Also for collapse.tsv: We check if any VCFZ is newer than collapsed.tsv; if so rebuild.
+
+But we also need to consider if collapsed.tsv exists but some sample's vcf.gz missing? That would be inconsistent. But we can just rebuild if any input missing or older.
+
+Now, we need to ensure that the script uses only allowed tools: bwa, samtools, bcftools, tabix, lofreq, seqkit, fastqc, snakemake, shellcheck, java, SnpSift, snpEff. We use bgzip; but not listed. But maybe it's okay.
+
+But we also used `printf` and `mkdir`, etc. Those are builtins or standard commands; allowed.
+
+Now, check for missing variables: In collapse step, we need to ensure that bcftools query uses correct format string with sample name. We'll use printf as described.
+
+Let's write the script accordingly:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+REF="data/ref/chrM.fa"
+FAI="${REF}.fai"
+
+if [ ! -s "$FAI" ]; then
+    samtools faidx "$REF"
+fi
+
+BWA_INDEX_FILES=("${REF}.amb" "${REF}.ann" "${REF}.bwt" "${REF}.pac" "${REF}.sa")
+need_bwa_index=false
+for f in "${BWA_INDEX_FILES[@]}"; do
+    if [ ! -s "$f" ]; then
+        need_bwa_index=true
+        break
+    fi
+done
+
+if $need_bwa_index; then
+    bwa index "$REF"
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    BAM="results/${sample}.bam"
+    BAI="results/${sample}.bam.bai"
+    VCF="results/${sample}.vcf"
+    VCFZ="results/${sample}.vcf.gz"
+    VCFZTBI="results/${sample}.vcf.gz.tbi"
+
+    FASTQ1="data/raw/${sample}_1.fq.gz"
+    FASTQ2="data/raw/${sample}_2.fq.gz"
+
+    if [ ! -s "$BAM" ] || [ "$BAM" -ot "$FASTQ1" ] || [ "$BAM" -ot "$FASTQ2" ]; then
+        bwa mem -t "$THREADS" -R '@RG\tID:'"$sample"'\tSM:'"$sample"'\tLB:'"$sample"'\tPL:ILLUMINA' \
+            "$REF" "$FASTQ1" "$FASTQ2" | samtools sort -@ "$THREADS" -o "$BAM"
+    fi
+
+    if [ ! -s "$BAI" ] || [ "$BAI" -ot "$BAM" ]; then
+        samtools index -@ "$THREADS" "$BAM"
+    fi
+
+    if [ ! -s "$VCF" ] || [ "$VCF" -ot "$BAM" ]; then
+        lofreq call-parallel --pp-threads "$THREADS" -f "$REF" -o "$VCF" "$BAM"
+    fi
+
+    if [ ! -s "$VCFZ" ] || [ "$VCFZ" -ot "$VCF" ]; then
+        bgzip -c "$VCF" > "$VCFZ"
+        rm -f "$VCF"
+    fi
+
+    if [ ! -s "$VCFZTBI" ] || [ "$VCFZTBI" -ot "$VCFZ" ]; then
+        tabix -p vcf "$VCFZ"
+    fi
+done
+
+COLLAPSED="results/collapsed.tsv"
+
+rebuild=false
+if [ ! -s "$COLLAPSED" ]; then
+    rebuild=true
+else
+    for sample in "${SAMPLES[@]}"; do
+        VCFZ="results/${sample}.vcf.gz"
+        if [ "$VCFZ" -ot "$COLLAPSED" ]; then
+            rebuild=true
+            break
+        fi
+    done
+fi
+
+if $rebuild; then
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"
+    for sample in "${SAMPLES[@]}"; do
+        VCFZ="results/${sample}.vcf.gz"
+        FORMAT=$(printf "%s\t%%CHROM\t%%POS\t%%REF\t%%ALT\t%%INFO/AF\n" "$sample")
+        bcftools query -f "$FORMAT" "$VCFZ" >> "$COLLAPSED"
+    done
+fi
+
+exit 0
+```
+
+Check for any missing commands: bgzip may not be allowed but we assume it's present.
+
+Also we used `printf` to generate format string; that's fine.
+
+Now, ensure that the script uses only tools in inventory. We used `bgzip`. Not listed. But maybe it's part of htslib and considered okay. If not, we could use `samtools view -O z` but that doesn't compress VCF. So we might need to use bcftools for compression: `bcftools view -Oz -o "$VCFZ" "$VCF"`; that's allowed. But instruction says "Compress with bgzip (not bcftools view -O z)". So they want bgzip.
+
+Thus we keep bgzip.
+
+Now, check that the script does not output anything beyond tool outputs. We use `printf` to write header and format string; but those are writing to files, not stdout. The only stdout is from tools: bwa mem, samtools sort, samtools index, lofreq call-parallel, bgzip, tabix, bcftools query. Those produce output as expected.
+
+We also used `rm -f "$VCF"` after compression; that writes nothing.
+
+Now, we need to ensure that the script is idempotent: if all outputs exist and are newer than inputs, it will skip everything. Let's analyze:
+
+- For each sample, alignment step: if BAM exists and newer than FASTQs, skip. Good.
+
+- Indexing: if BAI exists and newer than BAM, skip.
+
+- Variant calling: if VCF exists and newer than BAM, skip.
+
+- Compression: if VCFZ exists and newer than VCF, skip; else compress and remove VCF. If VCFZ older than VCF, will recompress.
+
+- Index compressed VCF: if VCFZTBI exists and newer than VCFZ, skip.
+
+- Collapse step: if collapsed.tsv missing or any VCFZ older than collapsed.tsv, rebuild. Else skip.
+
+Thus idempotent.
+
+Now, we need to ensure that the script uses only allowed tools; but we used `printf` which is built-in; that's fine.
+
+Also we used `mkdir -p results`; that's fine.
+
+We used `bgzip`. Might be okay.
+
+Now, check for potential issues: The read group string uses literal backslash-t. We used `'@RG\tID:'"$sample"'\tSM:'"$sample"'\tLB:'"$sample"'\tPL:ILLUMINA'`. That will produce a single argument with backslashes and t's. Good.
+
+Now, we need to ensure that the script is safe for re-running; e.g., if .bam exists but older than FASTQ, alignment step will run again and overwrite .bam. That may cause index to be outdated; but we then check BAI after alignment: if BAI newer than BAM? Actually after new alignment, BAI might still be older because we didn't update it yet; so indexing step will run.
+
+Now, we need to ensure that the script uses `-ot` correctly: In bash, `file1 -ot file2` returns true if file1 is older than file2. So we used `"$BAM" -ot "$FASTQ1"` etc. That checks if BAM older than FASTQ. Good.
+
+Now, check for potential missing variable expansions: In the collapse step, we use `FORMAT=$(printf "%s\t%%CHROM\t%%POS\t%%REF\t%%ALT\t%%INFO/AF\n" "$sample")`. This will produce a string like "M117-bl\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n". That is correct.
+
+Now, we need to ensure that bcftools query receives the format string with actual tabs. The `printf` uses `%s\t...` which prints sample name then a tab character. Good.
+
+Now, check for quoting: In bcftools query -f "$FORMAT" "$VCFZ", $FORMAT contains newline at end; but that's fine because bcftools expects format string terminated by newline? Actually the format string may include newline; it's okay. But we might want to remove trailing newline. However bcftools will treat newline as part of format string, which may produce an extra blank line after each record. That would be undesirable. We can avoid newline: use `printf "%s\t%%CHROM\t%%POS\t%%REF\t%%ALT\t%%INFO/AF" "$sample"` without newline. Then we add newline when writing to file? Actually bcftools query will output each record with the format string; if no newline, it may not separate lines properly. But bcftools expects a newline at end of format string to produce line breaks between records. According to bcftools query docs: The format string is printed for each record; you can include `\n` or actual newline. Usually we use `%s\n`. So we need newline.
+
+But if we include newline in the format string, bcftools will output a newline after each record. That's fine. But we also want to avoid an extra blank line at end? It might produce one blank line at end; but that's okay maybe. But we can trim trailing newline by using `printf` without newline and then add `\n` in the format string: `%s\t%CHROM...%INFO/AF\n`. So we need newline inside format string. That is fine.
+
+But if we use `printf "%s\t%%CHROM\t%%POS\t%%REF\t%%ALT\t%%INFO/AF\n" "$sample"` it will produce a string with newline at end. Good.
+
+Now, bcftools query -f "$FORMAT" "$VCFZ" >> "$COLLAPSED". That will append each record line to collapsed.tsv. The header is written earlier.
+
+Now, we need to ensure that the script uses `bgzip` correctly: `bgzip -c "$VCF" > "$VCFZ"` compresses and writes to file; then remove original VCF.
+
+But if bgzip fails, script will exit due to set -e. Good.
+
+Now, check for potential missing dependencies: We used `tabix`. That's in inventory. Good.
+
+Now, we need to ensure that the script uses only tools from inventory; but we used `printf`, `mkdir`, etc. Those are builtins or standard commands; allowed.
+
+Now, final step: produce script as output with no markdown fences, no commentary. Ensure first line is #!/usr/bin/env bash and second line set -euo pipefail.
+
+Let's produce final answer.

@@ -1,0 +1,152 @@
+We need to produce a bash script that does per-sample variant calling on paired-end MiSeq amplicon samples mapped to chrM (16569 bp). Outputs: results/{sample}.bam, .bai, .vcf.gz, .vctbi, and collapsed.tsv with columns sample chrom pos ref alt af.
+
+We have raw files per sample: sample_1. fq.gz, sample_2.fq.gz. Need to map reads to chrM using bwa mem (paired-end). Then samtools view > results/sample.bam, .bai. Then bcftools view -Oz > results/sample.vcf.gz and .tbi.
+
+Then need collapsed table: per sample variant counts aggregated across all samples? Probably sum AF per position across all samples? But they said "collapsed table" with columns sample chrom pos ref alt af. That suggests each row is a variant (position) with allele frequencies aggregated? Might be just list of variants from bcftools? Actually collapsed table likely contains unique positions and aggregated AF across all samples? Let's assume we need to produce a TSV where each line corresponds to a variant position, with sample name, chrom (chrM), pos, ref, alt, af. Since chr is always chrM, maybe just include sample.
+
+Simplify: Use bcftools view -f to get VCF, then use bcftools query? Or we can extract per-sample variants and aggregate using seqkit or custom awk.
+
+But must be idempotent; if results already exist, skip steps. So script should check existence of outputs before running.
+
+We need to ensure no hardcoded paths: only relative to cwd.
+
+Steps:
+
+1. Set up results dir (mkdir -p results). Idempotent.
+
+2. For each sample in data/raw/*.fq.gz? Actually samples are M117-..., we can loop over files with pattern *_bl_* and *_ch_*.
+
+Better: Determine sample name from first file's prefix without _1.
+
+We'll create array of samples = (M117-...).
+
+But easier: Use seqkit to list paired-end files? Or just manually define.
+
+Given only 4 samples, we can loop over each sample name variable.
+
+Let's assume script will have:
+
+samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+Loop over each sample.
+
+For each sample:
+- Input files: data/raw/${sample}_1.fq.gz, ${sample}_2.fq.gz
+- Use bwa mem -t 4 chrM.fa ${sample}_1.fq.gz ${sample}_2.fq.gz > tmp.bam
+- samtools view -b -@4 tmp.bam -o results/${sample}.bam
+- samtools index results/${sample}.bam
+
+- bcftools view -Oz results/${sample}.bam > results/${sample}.vcf.gz
+- bcftools index results/${sample}.vcf.gz
+
+Now collapsed table: Need to aggregate variant counts across all samples. Use bcftools query? Or use seqkit.
+
+Simplify: Use bcftools query -f '{{CHROM}} {{POS}} {{REF}} {{ALT}}' results/*.vcf.gz | sort -k2,3n > variants.tsv
+
+But need af column aggregated per position across samples. Could compute AF using bcftools view -F? Or use seqkit's variant_aggregate.
+
+seqkit can produce a TSV with allele frequencies: seqkit variant_aggregate -i results/*.vcf.gz -o collapsed.tsv -c sample chrom pos ref alt af
+
+But need to ensure header.
+
+Let's design:
+
+seqkit variant_aggregate -i results/*.vcf.gz -o results/collapsed.tsv -c sample chrom pos ref alt af -h
+
+Check if output exists; skip if exists.
+
+Also need to ensure chr is always chrM, but okay.
+
+Now script must be idempotent: check existence of each output before creating.
+
+Implementation:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p results
+
+samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+for sample in "${samples[@]}"; do
+    # skip if bam already exists
+    [[ -f "results/${sample}.bam" ]] && continue
+
+    # map reads
+    bwa mem -t 4 data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz > tmp.bam
+    samtools view -b -@4 tmp.bam -o results/${sample}.bam
+    samtools index results/${sample}.bam
+
+    # create vcf.gz
+    bcftools view -Oz results/${sample}.bam > results/${sample}.vcf.gz
+    bcftools index results/${sample}.vcf.gz
+
+done
+
+# aggregated collapsed table
+if [[ ! -f "results/collapsed.tsv" ]]; then
+    seqkit variant_aggregate -i results/*.vcf.gz -o results/collapsed.tsv -c sample chrom pos ref alt af -h
+fi
+
+Now check idempotency: if bam exists, skip mapping. If vcf already made, skip.
+
+But need to ensure that if only some samples processed earlier, still produce collapsed table? The script will aggregate all .vcf.gz present; if missing due to earlier runs maybe not. But requirement is rerunning on populated results must exit 0 without redoing work or erroring. So if bam exists, skip mapping; vcf may be created from bam; but if bam exists and vcf missing? That shouldn't happen because we create vcf after bam. If script runs again later, bam exists, vcf may already exist (since we create it). But our loop creates vcf only if bam doesn't exist. So if earlier run created both, second run will skip mapping and vcf creation? Actually vcf creation is not inside loop; it's after loop using seqkit which reads *.vcf.gz. If vcf already exists, seqkit may still output new aggregated table? It might produce same file overwritten. That's okay.
+
+But we need to ensure that if bam exists but vcf missing (unlikely), script will create vcf via loop? No, because loop only creates vcf from bam; if bam exists, it skips mapping and does not create vcf. So vcf may be missing. That's a problem.
+
+Better: In loop, after creating bam, always create vcf regardless of existence? But idempotent means don't redo work. If vcf already exists, we shouldn't recreate. So need to check if vcf exists before creating.
+
+Thus modify:
+
+for sample ...; do
+    [[ -f "results/${sample}.bam" ]] && continue
+
+    bwa mem ...
+    samtools view ...
+
+    # create vcf only if not exist
+    [[ ! -f "results/${sample}.vcf.gz" ]] && {
+        bcftools view -Oz results/${sample}.bam > results/${sample}.vcf.gz
+        bcftools index results/${sample}.vcf.gz
+    }
+done
+
+Now collapsed table uses all .vcf.gz present.
+
+Also need to ensure seqkit output header: -h.
+
+Now script must not use echo etc. Only tools natural output.
+
+Check that we don't write to stderr beyond tool outputs; fine.
+
+Now final script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p results
+
+samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+for sample in "${samples[@]}"; do
+    [[ -f "results/${sample}.bam" ]] && continue
+
+    bwa mem -t 4 data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz > tmp.bam
+    samtools view -b -@4 tmp.bam -o results/${sample}.bam
+    samtools index results/${sample}.bam
+
+    [[ ! -f "results/${sample}.vcf.gz" ]] && {
+        bcftools view -Oz results/${sample}.bam > results/${sample}.vcf.gz
+        bcftools index results/${sample}.vcf.gz
+    }
+done
+
+if [[ ! -f "results/collapsed.tsv" ]]; then
+    seqkit variant_aggregate -i results/*.vcf.gz -o results/collapsed.tsv -c sample chrom pos ref alt af -h
+fi
+
+Now ensure no hardcoded paths beyond cwd: data/..., results/, etc. Good.
+
+Check that we use tmp.bam file; it's local, fine.
+
+Now produce script only.

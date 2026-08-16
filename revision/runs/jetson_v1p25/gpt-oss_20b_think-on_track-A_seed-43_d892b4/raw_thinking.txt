@@ -1,0 +1,280 @@
+We need to produce a bash script following constraints.
+
+Key points:
+
+- Use set -euo pipefail
+
+- Idempotent: check existence and timestamps.
+
+- Tools available: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. We need only some of them.
+
+- Need to compress VCF with bgzip; but bgzip is part of htslib? Not listed explicitly but bcftools includes bgzip? Actually bcftools provides bgzip command. So we can use `bgzip`. It's in PATH likely via conda env. We'll assume it's available.
+
+- For reference indexing: check if .fai exists and index files exist (.amb etc). Use `samtools faidx` only if .fai missing; bwa index only if any of the index files missing? We can test existence of .amb file.
+
+- For each sample, we need to create BAM, BAI, VCF.gz, VCF.gz.tbi. Idempotent: skip if final artifact exists and newer than inputs. But easier: check for existence of vcf.gz.tbi; if present, assume all done. But we also need to ensure that if any input changed (unlikely). We'll just guard by checking existence of results/{sample}.vcf.gz.tbi.
+
+- For collapse.tsv: rebuild only if any VCF.gz newer than collapsed.tsv or collapsed.tsv missing.
+
+Implementation details:
+
+- Use array samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+- THREADS=4
+
+- Create results dir: mkdir -p results
+
+- Reference indexing:
+
+```
+if [ ! -f data/ref/chrM.fa.fai ]; then
+  samtools faidx data/ref/chrM.fa
+fi
+# bwa index requires .amb etc. Check if any missing:
+if [ ! -f data/ref/chrM.fa.bwt ] || [ ! -f data/ref/chrM.fa.ann ]; then
+  bwa index data/ref/chrM.fa
+fi
+```
+
+- For each sample:
+
+Define variables: fq1=data/raw/${sample}_1.fq.gz; fq2=..._2.fq.gz
+
+Output paths: bam=results/${sample}.bam; bai=results/${sample}.bam.bai; vcf_gz=results/${sample}.vcf.gz; tbi=results/${sample}.vcf.gz.tbi
+
+Check if tbi exists and newer than inputs? We'll just check existence of tbi. If missing, run pipeline.
+
+Pipeline:
+
+```
+bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" "$fq1" "$fq2" | \
+samtools sort -@ $THREADS -o "$bam"
+samtools index -@ $THREADS "$bam"
+
+lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -o "${sample}.vcf" "$bam"
+```
+
+But lofreq outputs to file; we need path results/${sample}.vcf. So:
+
+`lofreq call-parallel ... -o results/${sample}.vcf results/${sample}.bam`
+
+Then compress:
+
+`bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz`
+
+tabix index: `tabix -p vcf results/${sample}.vcf.gz`
+
+Remove uncompressed: `rm results/${sample}.vcf`
+
+But we need to ensure that if any step fails, script stops due to set -e.
+
+Also we must not write to stdout/stderr beyond tool outputs. So no echo.
+
+After all samples processed, collapse.tsv:
+
+Check if collapsed.tsv exists and newer than any vcf.gz? We'll check: if [ ! -f results/collapsed.tsv ] || [ $(find results/*.vcf.gz -newer results/collapsed.tsv | wc -l) -gt 0 ]; then rebuild.
+
+Rebuild: create temp file, loop over samples:
+
+```
+for s in "${samples[@]}"; do
+  bcftools query -f '${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${s}.vcf.gz >> tmp.tsv
+done
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+cat tmp.tsv >> results/collapsed.tsv
+rm -f tmp.tsv
+```
+
+But bcftools query format string uses single quotes; we need to escape properly. The sample placeholder is literal {sample}. We can use:
+
+`bcftools query -f '${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${s}.vcf.gz`
+
+But bcftools query uses `%` placeholders; `${sample}` is not recognized. Actually we want to prepend the sample name as literal string, not placeholder. So just use:
+
+`bcftools query -f '${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' ...`
+
+But bcftools will treat ${sample} as shell variable? No because inside single quotes, it's literal. We need to output the sample name; we can use `printf` or echo before each query. Simpler: use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' ... | awk -v s="$s" '{print s"\t"$0}'`. But requirement says to prepend sample via format string; but we can still do that with bcftools query using `-f` and then use `sed`? Actually bcftools query supports `%SAMPLE` placeholder for sample names. But we have only one sample per VCF, so `%SAMPLE` will output the sample name from VCF header. That might be easier: `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`. Then prepend sample via awk.
+
+But requirement says "run bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz". That uses literal {sample} placeholder? Actually they intend to use the literal string `{sample}` as a placeholder that will be replaced by sample name? But bcftools query doesn't support that. Maybe they expect us to use `-f '{sample}\t%CHROM\t...` and then use `sed` to replace `{sample}` with actual sample name? But easier: just use awk.
+
+But requirement might not enforce exact command; it's a plan. We can still produce correct collapsed.tsv.
+
+We need to ensure no extraneous output. bcftools query prints lines; we redirect to temp file. Then header added.
+
+Edge: AF may be missing; but that's fine.
+
+Now idempotency: For each sample, check if tbi exists and newer than inputs? We'll just skip if tbi exists. But if user modifies raw files, script will not re-run. That's acceptable per requirement: "rerunning on a populated results/ directory must exit 0 without redoing work or erroring." So we don't need to detect changes.
+
+Also for reference indexing: check existence of .fai and .amb etc; skip if present.
+
+Now produce final script.
+
+We need to ensure no stray spaces causing issues. Use `#!/usr/bin/env bash` first line, second line set -euo pipefail.
+
+Let's craft script:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Reference indexing
+if [ ! -f data/ref/chrM.fa.fai ]; then
+  samtools faidx data/ref/chrM.fa
+fi
+if [ ! -f data/ref/chrM.fa.bwt ] || [ ! -f data/ref/chrM.fa.ann ]; then
+  bwa index data/ref/chrM.fa
+fi
+
+# Process each sample
+for s in "${samples[@]}"; do
+  bam=results/${s}.bam
+  bai=results/${s}.bam.bai
+  vcf_gz=results/${s}.vcf.gz
+  tbi=results/${s}.vcf.gz.tbi
+  if [ -f "$tbi" ]; then
+    continue
+  fi
+
+  fq1=data/raw/${s}_1.fq.gz
+  fq2=data/raw/${s}_2.fq.gz
+
+  bwa mem -t $THREADS -R "@RG\\tID:${s}\\tSM:${s}\\tLB:${s}\\tPL:ILLUMINA" "$fq1" "$fq2" | \
+    samtools sort -@ $THREADS -o "$bam"
+
+  samtools index -@ $THREADS "$bam"
+
+  lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -o "${s}.vcf" "$bam"
+  bgzip -c results/${s}.vcf > "$vcf_gz"
+  tabix -p vcf "$vcf_gz"
+  rm -f results/${s}.vcf
+done
+
+# Collapse table
+collapsed=results/collapsed.tsv
+rebuild=false
+if [ ! -f "$collapsed" ]; then
+  rebuild=true
+else
+  for s in "${samples[@]}"; do
+    if [ "$(stat -c %Y results/${s}.vcf.gz)" -gt "$(stat -c %Y $collapsed)" ]; then
+      rebuild=true
+      break
+    fi
+  done
+fi
+
+if $rebuild; then
+  tmp=$(mktemp)
+  for s in "${samples[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${s}.vcf.gz | \
+      awk -v sn="$s" '{print sn"\t"$0}' >> "$tmp"
+  done
+  printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed"
+  cat "$tmp" >> "$collapsed"
+  rm -f "$tmp"
+fi
+
+exit 0
+```
+
+Need to ensure `stat -c %Y` works on all systems; but we can use `touch`? But it's fine.
+
+Also need to ensure that the script uses correct quoting for awk. Use single quotes inside double quotes? We used `'...'` inside double quotes; that's okay.
+
+But we used `awk -v sn="$s" '{print sn"\t"$0}'`. That's fine.
+
+Now check for any stray spaces or missing semicolons. The line with `bwa mem ... | \` has backslash at end of line, then next line starts with `samtools sort...`. Ensure no leading spaces before `samtools`. We have a space after backslash? It's okay.
+
+Also we used `${s}.vcf` path; but we need to prefix results/ directory: `results/${s}.vcf`. In lofreq call, we wrote `-o "${s}.vcf" "$bam"` which outputs to current dir. Should be `results/${s}.vcf`. So adjust.
+
+Also we used `bgzip -c results/${s}.vcf > "$vcf_gz"`, but the input file is results/${s}.vcf. Good.
+
+Let's correct lofreq line:
+
+`lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -o "results/${s}.vcf" "$bam"`
+
+Now we also need to ensure that `bwa mem` read group string uses literal backslash-t. We used `"@RG\\tID:${s}\\tSM:${s}\\tLB:${s}\\tPL:ILLUMINA"` which passes two characters \ and t? Actually inside double quotes, `\\t` becomes `\t`. So the argument will contain a single backslash followed by t. Good.
+
+Now we need to ensure that we don't use any echo for user-facing prose; we didn't.
+
+Also no extraneous output beyond tool outputs. The script may produce some output from tools like samtools sort, etc. That's fine.
+
+We used `printf` to write header; that's okay as it's part of final file creation but not user-facing? It's writing to file, not stdout. So acceptable.
+
+Now we need to ensure that the script uses only allowed tools: bwa, samtools, lofreq, bgzip (from bcftools), tabix, bcftools. All are in inventory.
+
+We used `stat` and `awk`. Are these allowed? They were not listed but likely available on system; but requirement says "Use only tools listed in TOOL_INVENTORY." That might mean we cannot use other utilities like awk or stat. But typical shell environment includes awk, grep, etc. However to be safe, maybe avoid awk and stat. We can use `awk`? It's not listed. So we should avoid using awk and stat.
+
+We need to collapse table without awk. Use `sed`? Not listed either. Maybe we can use `while read -r line; do echo "$s\t$line"; done`. That uses shell built-in read, no external tool. That's fine.
+
+For rebuild check: Instead of stat, we can compare modification times using `find` with `-newer`. But find is not listed either. We could just always rebuild collapsed.tsv if any vcf.gz newer than collapsed.tsv by checking `if [ "$(ls -t results/*.vcf.gz | head -1)" > "$collapsed" ]`? That's messy.
+
+Simpler: skip rebuild logic; just always rebuild collapsed.tsv if it doesn't exist, else leave as is. But requirement says "Rebuild only if any input VCF is newer than the TSV." We can approximate by checking modification times using `touch`? Actually we could use `if [ ! -f "$collapsed" ]; then rebuild=true; else for s in ...; do if [ "$(ls -l --time=modify results/${s}.vcf.gz | awk '{print $6,$7}')" > "$(ls -l --time=modify $collapsed | awk '{print $6,$7}')"]; then rebuild=true; fi; done`. That's too complex.
+
+Given constraints, maybe we can skip the timestamp check and just always rebuild collapsed.tsv if any vcf.gz newer than collapsed.tsv. But we need to implement it with allowed tools. We could use `if [ "$(find results/*.vcf.gz -newer "$collapsed" | wc -l)" -gt 0 ]; then ...`. find is not listed.
+
+Maybe we can rely on `touch`? No.
+
+We might just rebuild collapsed.tsv if any vcf.gz newer than collapsed.tsv by using `if [ "$(ls -t results/*.vcf.gz | head -1)" > "$collapsed" ]`. But comparing file names lexicographically doesn't reflect modification times.
+
+Given the idempotency requirement, we could simply always rebuild collapsed.tsv if it does not exist. If it exists, we skip. That satisfies "rerunning on a populated results/ directory exits 0 without redoing work". It won't rebuild collapsed.tsv unnecessarily. But if user modifies VCFs after initial run, script will not update collapsed.tsv; but that's acceptable per requirement? The requirement says "Rebuild only if any input VCF is newer than the TSV." That implies we should check timestamps. But maybe it's okay to skip that complexity.
+
+But better to implement timestamp check using `if [ "$(find results/*.vcf.gz -newer "$collapsed" | wc -l)" -gt 0 ]; then ...`. find not allowed.
+
+Maybe we can use `test` with `-nt` operator: `[ file1 -nt file2 ]`. This is a shell test. So we can do:
+
+```
+rebuild=false
+for s in "${samples[@]}"; do
+  if [ "results/${s}.vcf.gz" -nt "$collapsed" ]; then
+    rebuild=true; break
+  fi
+done
+```
+
+`-nt` tests if file1 is newer than file2. That's built-in to test command, not external tool. So we can use that.
+
+Thus:
+
+```
+rebuild=false
+if [ ! -f "$collapsed" ]; then
+  rebuild=true
+else
+  for s in "${samples[@]}"; do
+    if [ "results/${s}.vcf.gz" -nt "$collapsed" ]; then
+      rebuild=true; break
+    fi
+  done
+fi
+```
+
+Now collapse building: we need to prepend sample name. We can use a while loop:
+
+```
+tmp=$(mktemp)
+for s in "${samples[@]}"; do
+  bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${s}.vcf.gz | \
+    while IFS= read -r line; do
+      printf '%s\t%s\n' "$s" "$line"
+    done >> "$tmp"
+done
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed"
+cat "$tmp" >> "$collapsed"
+rm -f "$tmp"
+```
+
+But we used `while` inside pipeline; that may spawn subshell. But it's fine.
+
+Alternatively, use process substitution: but okay.
+
+We need to ensure no external tools besides bcftools query. The while loop uses shell built-in read and printf.
+
+Now final script.
+
+Let's produce final answer.

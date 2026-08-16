@@ -1,0 +1,164 @@
+We need to produce a self-contained bash script that follows constraints.
+
+Constraints:
+
+- First line: #!/usr/bin/env bash
+- Second line: set -euo pipefail
+
+- Assume current working directory contains data/raw/ and data/ref/. The reference file chrM.fa is decompressed already. Need to index with bwa and samtools faidx if not present.
+
+- Write outputs under results/.
+
+- Idempotent: rerunning on a populated results/ must exit 0 without redoing work or erroring. So we need to check for existence of outputs before performing steps, skip if exist.
+
+- Use only tools listed in TOOL_INVENTORY; no conda, pip etc.
+
+- Total wall-clock under 600 seconds at THREADS=4. Should be fine.
+
+- Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose. So we cannot use echo except maybe for debugging? But they said "Do not write to stderr/stdout beyond what tools naturally emit". That means no echo or printf that prints messages. However, the script may produce output from commands like bwa mem etc. That's okay.
+
+- We need to produce final outputs: results/{sample}.bam, .bai, .vcf.gz, .tbi, and collapsed.tsv with header sample chrom pos ref alt af.
+
+- Use bcftools query to extract fields; but we also need AF field from INFO/AF. LoFreq output may have AF? Let's check typical LoFreq VCF: It includes INFO/AF maybe. But we can rely on that.
+
+- We need to compress vcf with bgzip, but bgzip is part of htslib (samtools). However tool inventory lists tabix but not bgzip explicitly; but bgzip is usually in samtools or htslib. The inventory didn't list bgzip separately, but it's part of samtools. So we can use bgzip.
+
+- Use tabix to index.
+
+- For collapsed.tsv: header line and then append lines per sample.
+
+- Idempotent: We need to check if results/{sample}.bam exists; if so skip alignment etc. But also need to ensure that if some steps missing, script will still run them. So we can use conditional checks for each output file.
+
+- For reference indexing: bwa index and samtools faidx produce .bwt, .pac, .ann, .amb, .sa files for bwa; and .fai for samtools. We should check if those exist before running.
+
+- Use THREADS=4 variable.
+
+- Use SAMPLES array.
+
+- Avoid echo or printf except maybe to write collapsed.tsv header? But that would produce output to stdout (printf writes to stdout). They said "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." Writing the header line is part of output file, but using printf will print to stdout unless redirected. We can redirect to file: printf '...' > results/collapsed.tsv . That prints nothing to stdout because it's redirected. So that's okay.
+
+- Similarly bcftools query output should be appended via >>.
+
+- Use awk -v s=... to prefix sample column.
+
+- For LoFreq call-parallel, we need to specify --pp-threads 4 and -f reference, -o vcf file path. Then compress.
+
+- We must ensure that if results/{sample}.vcf.gz exists, skip calling LoFreq? But maybe we should check for existence of .vcf.gz; if present skip steps 5-7 for that sample.
+
+- For collapsed.tsv: need to generate header only once. So we can create file with header before loop or after loop but ensure idempotent: If results/collapsed.tsv exists, we might want to skip writing header and appending? But if script reruns on populated results/ should exit 0 without redoing work or erroring. That means if all outputs exist, script should just exit. So we can check at top: if all expected files exist for all samples and collapsed.tsv exists, then exit 0.
+
+- But easier: For each sample, check if bam file exists; if not perform steps. After loop, generate collapsed.tsv only if it doesn't exist? But if collapsed.tsv exists but maybe missing some lines? But idempotent requirement says rerunning on a populated results/ directory must exit 0 without redoing work or erroring. So we can just skip generating collapsed.tsv if it already exists.
+
+- However, what if collapsed.tsv exists but not up-to-date? Not needed; assume it's correct.
+
+- Implementation: At start, create results dir.
+
+- Reference indexing: Check for existence of data/ref/chrM.fa.bwt (bwa index output). If missing run bwa index. Similarly check for .fai file for samtools faidx.
+
+- For each sample:
+
+  - bam_path=results/${sample}.bam
+  - bai_path=${bam_path}.bai
+  - vcf_gz=results/${sample}.vcf.gz
+
+  - if [ ! -s "$bam_path" ]; then run alignment and sort; else skip.
+  - After that, check if index exists: if [ ! -s "${bai_path}" ]; then samtools index -@ $THREADS "$bam_path"; fi
+  - If vcf_gz missing: call LoFreq, bgzip, tabix.
+
+- After loop, create collapsed.tsv only if not exist. But we need to append per sample lines; but if file exists we skip entire step.
+
+- Use bcftools query to extract fields: %CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n
+
+- For each sample, run bcftools query and pipe into awk to add sample column. Append to collapsed.tsv.
+
+- Ensure that bcftools query will produce lines; if no variants maybe empty? But still fine.
+
+- Use set -euo pipefail ensures script stops on errors.
+
+- We must not use echo for user-facing prose, but we can use printf for header and redirect.
+
+- Avoid using any other commands outside inventory. All used: bwa, samtools, lofreq, bgzip, tabix, bcftools, awk, seqkit? Not needed.
+
+- Use seqkit maybe to check file existence? Not necessary.
+
+- Ensure script uses relative paths only.
+
+- Use $THREADS variable defined at top.
+
+Let's craft the script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+# Reference indexing
+if [ ! -f data/ref/chrM.fa.bwt ]; then
+    bwa index data/ref/chrM.fa
+fi
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+# Process each sample
+for sample in "${SAMPLES[@]}"; do
+    bam=results/${sample}.bam
+    bai=${bam}.bai
+    vcf_gz=results/${sample}.vcf.gz
+
+    # Alignment and sort if BAM missing
+    if [ ! -s "$bam" ]; then
+        bwa mem -t $THREADS -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            data/ref/chrM.fa \
+            data/raw/${sample}_1.fq.gz \
+            data/raw/${sample}_2.fq.gz | \
+        samtools sort -@ $THREADS -o "$bam" -
+    fi
+
+    # Index BAM if missing
+    if [ ! -s "$bai" ]; then
+        samtools index -@ $THREADS "$bam"
+    fi
+
+    # Variant calling if VCF gz missing
+    if [ ! -s "$vcf_gz" ]; then
+        lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -o results/${sample}.vcf "$bam"
+        bgzip -f results/${sample}.vcf
+        tabix -p vcf results/${sample}.vcf.gz
+    fi
+done
+
+# Collapsed table
+collapsed=results/collapsed.tsv
+if [ ! -s "$collapsed" ]; then
+    printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed"
+    for sample in "${SAMPLES[@]}"; do
+        vcf_gz=results/${sample}.vcf.gz
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$vcf_gz" | \
+            awk -v s="$sample" 'BEGIN{OFS="\t"}{print s,$0}' >> "$collapsed"
+    done
+fi
+
+exit 0
+
+Check for any missing commands: bgzip is part of samtools; but we didn't load it. But it's available as bgzip. Good.
+
+We used printf to write header, but redirected to file so no stdout output.
+
+All good.
+
+But need to ensure that bcftools query uses correct format string; if INFO/AF not present maybe empty. But fine.
+
+Also check that lofreq call-parallel outputs .vcf file path we specified: results/${sample}.vcf. We then bgzip it, producing .vcf.gz and removing original? bgzip -f will overwrite existing .vcf.gz but keep .vcf? Actually bgzip compresses the input file to .gz and deletes the original by default? Let's check: bgzip <file> produces <file>.gz and removes original. So after bgzip, results/${sample}.vcf is removed, leaving .vcf.gz.
+
+Thus tabix indexing works.
+
+All good.
+
+Edge: If collapsed.tsv exists but some samples missing lines due to earlier runs? But idempotent requirement says if all outputs exist, exit 0. We check for existence of collapsed.tsv; if present we skip generating it. That may leave stale data if previous run had fewer samples. But that's okay given assumption that results/ is fully populated.
+
+Thus script meets constraints.
+
+Let's produce final answer: the script only.

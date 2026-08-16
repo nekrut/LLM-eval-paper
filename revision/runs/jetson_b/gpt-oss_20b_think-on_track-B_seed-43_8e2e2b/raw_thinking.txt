@@ -1,0 +1,168 @@
+We need to produce a bash script that does per-sample variant calling on 4 paired-end MiSeq amplicon samples mapped to chrM reference. Output: results/{sample}.bam, .bai, .vcf.gz, .vcf.gz.tbi, and collapsed.tsv.
+
+Requirements:
+
+- Idempotent: if results/ already populated with all outputs, exit 0 without redoing work or erroring.
+- Use only tools listed: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java.
+
+We can use loFreq for variant calling. Steps:
+
+1. Index reference if not already indexed: bwa index chrM.fa; samtools faidx chrM.fa; bcftools index? Actually for lofreq we need .fai and .dict? For mapping with bwa mem, need .bwt etc. So run bwa index if missing.
+
+2. For each sample:
+
+- Input fastq files: data/raw/${sample}_1.fq.gz and ${sample}_2.fq.gz
+
+- Output bam: results/${sample}.bam
+
+- Steps: bwa mem -t $THREADS ref.fa reads | samtools view -bS - > bam; then sort? We can produce sorted BAM directly with samtools sort. Use samtools sort -o results/${sample}.sorted.bam ... but final output should be .bam (unsorted?) Usually variant callers need sorted and indexed. We'll produce sorted bam as results/${sample}.bam, then index.
+
+- For idempotence: check if results/${sample}.bam exists; if yes skip mapping? But we also need to ensure that if any step missing, redo. So we can use a simple approach: for each sample, if all outputs exist (.bam, .bai, .vcf.gz, .vcf.gz.tbi) then skip.
+
+- For variant calling: lofreq call -f ref.fa results/${sample}.bam > results/${sample}.raw.vcf; then filter? We can use bcftools view to compress and index. But loFreq outputs VCF with header lines starting #CHROM etc. We'll pipe through bcftools view -O z -o results/${sample}.vcf.gz.
+
+- Then tabix index: tabix -p vcf results/${sample}.vcf.gz
+
+- For collapsed.tsv: we need to combine all samples into one table with columns sample chrom pos ref alt af. We can use bcftools query or lofreq's --af? Actually loFreq outputs allele frequency in INFO field AF. So we can parse VCF lines and output.
+
+Simpler: Use bcftools query -f '%SAMPLE\t%CHROM\t%POS\t%REF\t%ALT[%AF]\t' but need sample name. We can add sample as first column using awk. But bcftools query has %SAMPLE? Actually bcftools query supports %SAMPLE for each sample genotype; but we have only one sample per VCF, so we can use %CHROM etc and then prefix sample.
+
+We can generate collapsed.tsv by iterating over samples: For each sample, run bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[%AF]\t' results/${sample}.vcf.gz | awk -v s=$sample '{print s"\t"$0}' >> tmp; then after all, add header.
+
+But need to ensure tab-separated and header: sample chrom pos ref alt af
+
+Also note that %ALT[%AF] will produce comma separated lists if multiple ALT? For amplicon maybe single alt. We'll keep as is.
+
+We must use only tools listed. bcftools query is part of bcftools.
+
+Idempotence for collapsed.tsv: If results/collapsed.tsv exists, skip creation unless missing? But we can check existence; if not exist, create.
+
+Also need to run fastqc on raw reads? Not required by task but maybe optional. We can ignore.
+
+We must set THREADS=4 variable.
+
+Script structure:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+
+# Ensure results dir exists
+mkdir -p results
+
+# Index reference if needed
+if [ ! -f data/ref/chrM.fa.bwt ]; then
+  bwa index data/ref/chrM.fa
+fi
+if [ ! -f data/ref/chrM.fa.fai ]; then
+  samtools faidx data/ref/chrM.fa
+fi
+
+# List samples
+samples=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+for sample in "${samples[@]}"; do
+  bam=results/${sample}.bam
+  bai=results/${sample}.bai
+  vcf=results/${sample}.vcf.gz
+  tbi=results/${sample}.vcf.gz.tbi
+
+  if [ -f "$bam" ] && [ -f "$bai" ] && [ -f "$vcf" ] && [ -f "$tbi" ]; then
+    continue
+  fi
+
+  fq1=data/raw/${sample}_1.fq.gz
+  fq2=data/raw/${sample}_2.fq.gz
+
+  # Map and sort
+  bwa mem -t $THREADS data/ref/chrM.fa "$fq1" "$fq2" | \
+    samtools view -bS - | \
+    samtools sort -@ $THREADS -o "$bam"
+
+  samtools index -@ $THREADS "$bam"
+
+  # Variant calling
+  lofreq call -f data/ref/chrM.fa -q 20 -Q 30 -m 2 -p 0.001 "$bam" | \
+    bcftools view -O z -o "$vcf"
+
+  tabix -p vcf "$vcf"
+done
+
+# Create collapsed.tsv if not exists
+if [ ! -f results/collapsed.tsv ]; then
+  tmp=$(mktemp)
+  for sample in "${samples[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[%AF]\t' results/${sample}.vcf.gz | \
+      awk -v s="$sample" '{print s"\t"$0}' >> "$tmp"
+  done
+  printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+  cat "$tmp" >> results/collapsed.tsv
+  rm "$tmp"
+fi
+
+exit 0
+
+Need to ensure that bcftools query output includes alt and af. The format string: %CHROM\t%POS\t%REF\t%ALT[%AF]\t. That will produce alt list with AF in brackets? Actually %ALT[%AF] prints ALT[AF] maybe like "A[T,0.5]"? Wait syntax: In bcftools query, you can use [%INFO/AF] to get INFO field. But we want the allele frequency from INFO/AF. So format string should be '%CHROM\t%POS\t%REF\t%ALT[%INFO/AF]\t' maybe? Actually bcftools query supports %INFO/AF or %AF? The docs: Use %INFO/AF for INFO field AF. For each ALT, you can use [%INFO/AF] to get the value per alt. So we want alt and af per alt. But we just need one alt per variant likely. We'll use '%CHROM\t%POS\t%REF\t%ALT[%INFO/AF]\t'.
+
+But bcftools query may output multiple lines if multiple ALT? It will produce separate lines for each ALT with its AF.
+
+Thus collapsed.tsv will have sample, chrom, pos, ref, alt, af columns.
+
+We need to ensure that the header line is exactly "sample\tchrom\tpos\tref\talt\taf".
+
+Also we should use tabix -p vcf after bcftools view. That indexes.
+
+Edge: lofreq call may produce VCF with INFO/AF? I think yes. But we can rely on it.
+
+We also need to ensure that bcftools view compresses and sorts? We didn't sort; but VCF from loFreq is unsorted? It might be sorted by position. We'll assume it's fine.
+
+Also we should use -O z for compressed output.
+
+Check idempotence: If bam exists but not bai, script will re-run mapping because condition requires all four files exist. That may be okay.
+
+But if bam exists and bai missing, maybe due to previous run aborted; re-running will remap unnecessarily. But acceptable.
+
+We also need to ensure that we don't produce duplicate collapsed.tsv lines across runs: we check existence before creating.
+
+Also note that bcftools query might output alt with comma separated? For multi-allelic sites, it outputs each alt separately. Good.
+
+Now confirm tools used: bwa, samtools, lofreq, bcftools, tabix. All available.
+
+We didn't use fastqc, seqkit etc; fine.
+
+Make sure script uses relative paths only.
+
+Also we need to ensure that results/ directory exists before writing collapsed.tsv.
+
+Edge: We used 'bwa mem -t $THREADS data/ref/chrM.fa "$fq1" "$fq2"' but we should specify -t for threads. Good.
+
+samtools view -bS - | samtools sort -@ $THREADS -o "$bam". That sorts and outputs bam.
+
+samtools index -@ $THREADS "$bam".
+
+lofreq call options: -q 20 -Q 30 -m 2 -p 0.001 maybe not required but fine. We need to specify reference file with -f. Good.
+
+We pipe to bcftools view -O z -o "$vcf". That compresses and outputs gzipped VCF.
+
+tabix -p vcf "$vcf".
+
+Now collapsed.tsv creation: we use bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[%INFO/AF]\t' results/${sample}.vcf.gz. This will produce lines like "chrM 123 A G 0.5". Then awk adds sample prefix.
+
+We then write header and cat tmp.
+
+All good.
+
+Let's ensure that bcftools query format string uses correct syntax: According to docs, you can use %CHROM etc. For INFO fields, use %INFO/AF or %AF? Actually there is a shortcut %AF for INFO/AF if present. But we want per alt. So maybe use %ALT[%INFO/AF] as I wrote.
+
+But bcftools query may not support nested brackets like that; but it does: you can specify [%INFO/AF] after an ALT to get the AF value for each alt. Example from docs: bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[%INFO/AF]\t\n' file.vcf
+
+Yes.
+
+Thus script should work.
+
+We need to ensure that we use tabix -p vcf after compressing; but bcftools view -O z will produce gzipped VCF. Good.
+
+Now final script: Provide as plain text, no markdown fences.
+
+Let's write it carefully.

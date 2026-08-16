@@ -1,0 +1,270 @@
+We need to output a bash script meeting constraints:
+
+- First line: #!/usr/bin/env bash
+- Second line: set -euo pipefail
+- Must be self-contained, idempotent: if results/ exists and contains outputs? It should exit 0 without redoing work or erroring. So we can check if all required output files exist; if so, exit.
+
+- Use only tools listed. We'll use bwa mem for alignment (bwa is paired-end). Then samtools view -bS -o .bam, then sort? Actually bwa mem outputs SAM directly; we can pipe to samtools view -b -o .bam. Then index with samtools index.
+
+- Variant calling: lofreq calls variants on BAMs. Use lofreq call-parallel? But we need per-sample VCF.gz and TBI. lofreq produces VCF; then we can bgzip and tabix.
+
+- Collapsed.tsv: combine all samples' variant info (chrom pos ref alt af). Need to extract AF from VCF; maybe using bcftools query or awk. We'll produce a table with columns sample chrom pos ref alt af. For each sample, parse its VCF.gz (bgzipped) and output lines.
+
+- Must be idempotent: if results/ contains all required files, script should exit 0 without redoing work. So we can check for existence of collapsed.tsv maybe; but also need to ensure that if any missing, run steps. Simpler: at start, define a function to check if all outputs exist; if yes, exit 0.
+
+- Use only tools in inventory: bwa, samtools, lofreq, bcftools, tabix, awk (awk is part of coreutils, allowed). Also seqkit maybe not needed. We'll use bgzip from samtools? Actually we can use bgzip via "gzip -c" but not listed; but we can use "bgzip" is part of tabix package? Usually bgzip is separate but may be present. However we can use "bcftools view -Oz -o file.vcf.gz". That's okay.
+
+- Use lofreq for variant calling: lofreq call-parallel? Actually lofreq has "lofreq call" command; but it expects a BAM and reference. It outputs VCF. We'll use "lofreq call --bam<bam> --ref chrM.fa --output<out.vcf>" then bgzip and tabix.
+
+- Then collapse: we can loop over samples, extract fields using bcftools query -f '%CHROM %POS %REF %ALT [ADF]\n' maybe? Actually AF is allele frequency; lofreq VCF includes INFO field "AF". We can use bcftools query -i 'INFO/AF=.'? Let's think: we need per variant per sample, with allele frequency. In lofreq output, AF is in INFO field as a comma-separated list? Actually lofreq's VCF includes "AF" info field representing allele fraction. We can extract using bcftools query -f '%CHROM %POS %REF %ALT [INFO/AF]\n' but need to get per sample? The VCF contains per-sample genotype fields; AF is per variant, not per sample. So collapsed.tsv will have one row per variant per sample? Actually they want columns: sample chrom pos ref alt af. So for each sample we need its own rows; each variant appears once per sample (maybe multiple alleles). So we can extract from each sample's VCF: sample name, CHROM, POS, REF, ALT, AF. Use bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[AF]\n' but need to include sample column. Actually bcftools query can output fields and also sample names? The default output includes the sample column only if we use -s? Wait: bcftools query -f '%CHROM %POS %REF %ALT [GT]\n' prints per allele? But we want AF which is per variant, not per sample. So we can just output CHROM POS REF ALT AF and then prepend sample name manually.
+
+Simplify: For each sample VCF.gz, use "bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[AF]\n' file.vcf.gz" to get lines like "chrM    1000    A    AC  0.02". Then prepend sample name using awk: {print sample "\t" $0}. We'll store in a temporary file and then cat all together.
+
+- Collapsed.tsv must have header: sample chrom pos ref alt af
+
+So we can produce collapsed.tsv by concatenating per-sample processed lines, ensuring unique rows? Not required to deduplicate; just collapse across samples.
+
+Implementation steps:
+
+1. Ensure results/ exists; create if not.
+
+2. Define list of samples and their fastq pairs.
+
+3. For each sample:
+   - Check if result files exist: .bam, .bam.bai, .vcf.gz, .vcf.gz.tbi. If all exist, skip.
+   - Align: bwa mem -t 4 data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools view -b -o results/${sample}.bam
+   - Index: samtools index results/${sample}.bam (creates .bai)
+   - Variant calling: lofreq call --bam results/${sample}.bam --ref data/ref/chrM.fa --output results/${sample}.vcf
+   - Then bgzip: bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf (or use "bgzip" but we can use "bcftools view -Oz". Actually lofreq outputs VCF uncompressed; we can compress with "bgzip" but not listed. Use "bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf"
+   - Index: tabix -p vcf results/${sample}.vcf.gz (creates .tbi)
+   - Remove intermediate uncompressed VCF.
+
+4. After all samples processed, generate collapsed.tsv:
+   - Create a temporary file list of sample names.
+   - For each sample, use bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[AF]\n' results/${sample}.vcf.gz | awk -v s=${sample} '{print s "\t" $0}' >> results/collapsed_raw.tsv
+   - Then add header and sort/unique? Not required but maybe we can sort and uniq. Use "sort -k2,2 -k3,3n" etc. But not necessary.
+
+   - Finally, collapse: maybe we need to merge across samples and ensure unique rows per variant per sample; but they want collapsed.tsv with columns sample chrom pos ref alt af. Could have duplicate positions across samples; that's fine.
+
+   - We'll produce final file results/collapsed.tsv with header and content.
+
+5. Idempotency: At start, check if all required output files exist (list them). If they do, exit 0.
+
+Potential issues: lofreq may require additional parameters like --min-QUAL, but not needed.
+
+Also need to ensure we use only allowed tools; "bgzip" is not listed. But we can compress with "bcftools view -Oz". That's okay.
+
+We also need to use "tabix" for indexing VCF.gz; that's allowed.
+
+Now script specifics:
+
+- Use set -euo pipefail at line 2.
+
+- At top, define results_dir="results"
+
+- Ensure results dir exists: mkdir -p results
+
+- Define sample list: samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+- For each sample, define fastq1 and fastq2 paths.
+
+- Check if all outputs exist: maybe check if results/${sample}.bam.bai exists (index). If any missing, proceed.
+
+- Use bwa mem -t 4 -M? Actually for paired-end, use "bwa mem -t ${THREADS} data/ref/chrM.fa $fq1 $fq2". Use -M flag for Picard compatibility. We'll include -M.
+
+- Then pipe to samtools view -b -o results/${sample}.bam
+
+- Index with samtools index results/${sample}.bam (creates .bai)
+
+- Variant calling: lofreq call --bam results/${sample}.bam --ref data/ref/chrM.fa --output results/${sample}.vcf --threads 4? Actually lofreq has "--threads". We'll include.
+
+- Then compress: bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf
+
+- Index: tabix -p vcf results/${sample}.vcf.gz
+
+- Remove intermediate .vcf (optional)
+
+- After loop, generate collapsed.tsv:
+
+   - Create file results/collapsed.tsv.tmp
+
+   - Write header: echo -e "sample\tchrom\tpos\tref\talt\taf" > $tmp
+
+   - For each sample, run bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[AF]\n' results/${sample}.vcf.gz | awk -v s=${sample} '{print s "\t" $0}' >> $tmp
+
+   - Then sort and uniq? Not required but maybe to avoid duplicates. Use "sort -k2,2 -k3,3n" but not needed.
+
+   - Finally move to results/collapsed.tsv (overwrite).
+
+- Ensure script exits 0 if all done.
+
+Potential idempotency: At start, check if collapsed.tsv exists and all per-sample files exist; if yes, exit 0. That ensures no redo.
+
+Implementation details:
+
+- Use THREADS variable maybe set to 4 as recommended? Not required but we can use -t 4 for bwa and lofreq.
+
+- Use set -euo pipefail; but need to handle failures gracefully? The script will exit on error, which is okay.
+
+- Avoid echoing anything.
+
+Now craft script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Define variables
+THREADS=4
+REF=data/ref/chrM.fa
+RAW=data/raw
+RESULTS=results
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+# Create results directory if not exists
+mkdir -p "$RESULTS"
+
+# Function to check if all required files exist for a sample
+all_done() {
+    local sample=$1
+    local bam="$RESULTS/${sample}.bam"
+    local bai="${bam}.bai"
+    local vcfgz="${bam}.vcf.gz"
+    local tbi="${vcfgz}.tbi"
+    [[ -f "$bam" && -f "$bai" && -f "$vcfgz" && -f "$tbi" ]]
+}
+
+# If all samples are done, exit
+all_done_all=true
+for s in "${SAMPLES[@]}"; do
+    if ! all_done "$s"; then
+        all_done_all=false
+        break
+    fi
+done
+if $all_done_all; then
+    exit 0
+fi
+
+# Process each sample
+for sample in "${SAMPLES[@]}"; do
+    # Skip if already done
+    if all_done "$sample"; then
+        continue
+    fi
+
+    fastq1="${RAW}/${sample}_1.fq.gz"
+    fastq2="${RAW}/${sample}_2.fq.gz"
+    bam="${RESULTS}/${sample}.bam"
+
+    # Align with BWA MEM
+    bwa mem -t "$THREADS" -M "$REF" "$fastq1" "$fastq2" |
+        samtools view -b -o "$bam"
+
+    # Index BAM
+    samtools index "$bam"
+
+    # Variant calling with lofreq
+    lofreq call --bam "$bam" --ref "$REF" --output "${RESULTS}/${sample}.vcf" --threads "$THREADS"
+
+    # Compress VCF with bcftools
+    bcftools view -Oz -o "${RESULTS}/${sample}.vcf.gz" "${RESULTS}/${sample}.vcf"
+    tabix -p vcf "${RESULTS}/${sample}.vcf.gz"
+
+    # Remove intermediate uncompressed VCF
+    rm -f "${RESULTS}/${sample}.vcf"
+done
+
+# Generate collapsed.tsv
+collapse_file="${RESULTS}/collapsed.tsv.tmp"
+echo -e "sample\tchrom\tpos\tref\talt\taf" > "$collapse_file"
+
+for sample in "${SAMPLES[@]}"; do
+    vcfgz="${RESULTS}/${sample}.vcf.gz"
+    # Extract CHROM POS REF ALT AF and prepend sample name
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[AF]\n' "$vcfgz" |
+        awk -v s="$sample" '{print s "\t" $0}' >> "$collapse_file"
+done
+
+# Sort and make final (optional deduplication)
+sort -u "$collapse_file" > "${RESULTS}/collapsed.tsv"
+rm -f "$collapse_file"
+
+exit 0
+
+Check constraints: No echo for user-facing prose; we used echo only to write header line, which is required output. That's okay as it writes to file, not stdout.
+
+We used "awk" (coreutils) allowed.
+
+We used "bcftools query" which is part of bcftools.
+
+We used "tabix", "samtools index", "samtools view -b", "bwa mem", "lofreq call". All are in inventory.
+
+We used "rm -f" etc.
+
+We used "$THREADS=4". Not required but okay.
+
+Potential issue: lofreq call may produce VCF with header lines; bcftools query works on compressed VCF as well. Should be fine.
+
+Idempotency: At start we check if all per-sample files exist; if yes, exit 0. This ensures no redo. However we also generate collapsed.tsv at end regardless; but if all done, we exit before that. So script will not rewrite collapsed.tsv if already present. That's okay.
+
+But what if some samples are done but others not? The check "all_done_all" only exits if all samples are done. If some missing, we continue processing those missing; after processing, they will be done. At the end we generate collapsed.tsv (overwrites). This may redo collapse even if partially done; but that's okay because it's cheap. However idempotency requirement: "rerunning on a populated results/ directory must exit 0 without redoing work or erroring." If some files are missing, the script will not exit early and will redo work for missing ones, which is fine. But if all files are present (including collapsed.tsv), we exit early, so no extra work. That's okay.
+
+But what about collapsed.tsv generation? If all samples done but collapsed.tsv missing, our early exit would prevent generating it, violating requirement that final outputs include collapsed.tsv. However the requirement says "Final outputs (per sample, plus one collapsed table)". So if we exit early when all per-sample files exist, collapsed.tsv may be missing; but the script should produce it as part of final outputs. The idempotency condition: "Rerunning on a populated results/ directory must exit 0 without redoing work or erroring." If results/ already contains all required files (including collapsed.tsv), then we should exit 0 without redoing work. So we need to check for existence of collapsed.tsv as well. Simpler: check if all required output files exist (list them). Let's compute list:
+
+- For each sample: .bam, .bam.bai, .vcf.gz, .vcf.gz.tbi
+- Plus results/collapsed.tsv
+
+We can test existence of all these; if all present, exit 0.
+
+Implement check at start:
+
+required=("$RESULTS/${sample}.bam" "$RESULTS/${sample}.bam.bai" "$RESULTS/${sample}.vcf.gz" "$RESULTS/${sample}.vcf.gz.tbi")
+plus collapsed file.
+
+Simplify: after defining samples, build an array of all required files and check if all exist. If yes, exit 0.
+
+Implementation:
+
+required=()
+for s in "${SAMPLES[@]}"; do
+    required+=("$RESULTS/${s}.bam")
+    required+=("$RESULTS/${s}.bam.bai")
+    required+=("$RESULTS/${s}.vcf.gz")
+    required+=("$RESULTS/${s}.vcf.gz.tbi")
+done
+required+=("$RESULTS/collapsed.tsv")
+
+if all files exist, exit 0.
+
+We'll implement a loop:
+
+all_exist=true
+for f in "${required[@]}"; do
+    if [[ ! -f "$f" ]]; then
+        all_exist=false
+        break
+    fi
+done
+if $all_exist; then
+    exit 0
+fi
+
+That satisfies idempotency.
+
+Now adjust script accordingly.
+
+Also need to ensure we don't use any prohibited tools. "awk" is okay. "sort", "rm", "mkdir", "echo" are fine.
+
+We used "bcftools view -Oz". That's allowed.
+
+We used "tabix -p vcf". Allowed.
+
+Now final script must be exactly one bash script, no markdown fences, no extra commentary.
+
+Let's craft final script with proper quoting and handling.
+
+Potential edge: bwa mem may output to stdout; we pipe to samtools view -b. That works.
+
+Make sure to use "$THREADS" variable for lofreq call --threads.
+
+Now produce final script.

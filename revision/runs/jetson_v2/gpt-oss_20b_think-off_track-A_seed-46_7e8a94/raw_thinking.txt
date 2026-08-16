@@ -1,0 +1,223 @@
+We need to produce a bash script following constraints.
+
+Let's craft script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+Define constants: THREADS=4; SAMPLES array.
+
+Create results dir.
+
+Reference indexing steps with guards.
+
+Per-sample loop: alignment+sort, index, variant calling, compression+tabix. Use guard for each final output.
+
+Need to use bgzip? The tool inventory includes tabix but not bgzip explicitly. But bgzip is part of htslib and usually available as bgzip command. Not listed in TOOL_INVENTORY; but we can use "bgzip" because it's part of samtools/htslib. However only tools listed are allowed: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. bgzip is not in list. But we can use "samtools view -b" etc? Wait for compression of VCF: We could use "bgzip" but it's part of htslib; maybe allowed implicitly because tabix is included. The instruction says only tools listed in TOOL_INVENTORY may be invoked. bgzip not listed, so cannot use it.
+
+Alternative: Use bcftools view -O z to compress? bcftools can output compressed VCF directly with -Oz. But we need to produce .vcf.gz and index. We could do:
+
+bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf
+
+But that would require reading uncompressed vcf. We can pipe from lofreq call-parallel output directly? LoFreq outputs VCF; we can pipe to bcftools view -O z -o ... . But the plan says use bgzip. But we can modify: after calling, compress with "bgzip" but not allowed. Let's check if bcftools can compress in place? We could do:
+
+bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf
+
+Then remove original .vcf.
+
+But the guard expects final output .vcf.gz.tbi. So we need to index with tabix after compression.
+
+We also need to ensure idempotency: if .vcf.gz.tbi exists, skip compressing and indexing. But we still may have stale .vcf file; but that's okay because guard will skip if .vcf.gz.tbi exists. However we might want to delete .vcf if it exists? Not necessary.
+
+But the plan says step 6: bgzip -f results/{sample}.vcf ; tabix ... So we can adapt to bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf. But that will produce .vcf.gz and keep original .vcf; we might want to delete .vcf after compression? Not required.
+
+But guard: [[ -f results/{sample}.vcf.gz.tbi ]] || { bcftools view -Oz -o results/{sample}.vcf.gz results/${sample}.vcf && tabix -p vcf results/${sample}.vcf.gz ; }
+
+This will produce .vcf.gz and index.
+
+But we need to ensure that if .vcf.gz exists but not indexed, guard triggers. If .vcf.gz.tbi exists, skip.
+
+Also we may want to remove .vcf after compression? Not necessary.
+
+Now collapsed.tsv: header line with printf; then per sample bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk ... >> results/collapsed.tsv
+
+Need to ensure that bcftools query works on compressed VCF.
+
+Now we need to guard each step. For alignment+sort: final output results/{sample}.bam. Use guard: [[ -f results/${sample}.bam ]] || { bwa mem ... | samtools sort -@ $THREADS -o results/${sample}.bam - ; }
+
+But we also need to index .bam.bai after sorting; guard on that.
+
+Variant calling: final output results/${sample}.vcf. Guard: [[ -f results/${sample}.vcf ]] || lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+
+But we also need to guard on .vcf.gz.tbi? Actually step 6 will compress and index. So variant calling guard should check if .vcf exists or .vcf.gz exists? The plan says: [[ -f results/{sample}.vcf || -f results/{sample}.vcf.gz ]] || lofreq call-parallel ... This ensures that if compressed file already exists, we skip calling.
+
+But we need to ensure that the guard is correct syntax: [[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] ; but inside double brackets, '||' works as logical OR. So fine.
+
+Now compress+index guard: [[ -f results/${sample}.vcf.gz.tbi ]] || { bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf && tabix -p vcf results/${sample}.vcf.gz ; }
+
+But we need to ensure that if .vcf.gz exists but not indexed, guard triggers. Good.
+
+Now collapsed.tsv: always rebuild.
+
+Edge cases: The script must be idempotent; re-running should exit 0 without redoing work or erroring. Our guards will skip steps if outputs exist. But we also need to handle case where some intermediate files missing due to previous run incomplete? For example, if .bam exists but .bai missing, our guard for index will create it. Good.
+
+But what about .vcf.gz.tbi missing but .vcf.gz present: guard triggers compress+index; bcftools view -Oz will produce new .vcf.gz (overwriting) and then tabix indexes. That is fine.
+
+Now we need to ensure that the script uses only tools listed. We used bwa, samtools, lofreq, bcftools, tabix. All are in inventory. Good.
+
+We also used printf, awk, etc; those are standard shell utilities allowed.
+
+Now we must not use echo for user-facing prose. We don't use echo.
+
+Now we need to ensure that the script uses backslash t inside double quotes for -R string: "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA". In bash, \t will be interpreted as literal backslash and t? Actually within double quotes, \t is not special; it's just backslash followed by t. So that's fine.
+
+But we need to ensure that the string is passed correctly to bwa mem. The plan says use literal two characters \t inside double-quoted string. Good.
+
+Now we must be careful about variable expansion: In double quotes, ${sample} will expand. But we also have backslashes; they remain as backslash t. So final string will be something like "@RG\tID:M117-bl\tSM:M117-bl\tLB:M117-bl\tPL:ILLUMINA". Good.
+
+Now we need to ensure that the script uses $THREADS variable for samtools sort and index, and lofreq call-parallel --pp-threads $THREADS. Good.
+
+Now we must create results dir before loop.
+
+Now we must guard reference indexing steps:
+
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+Now we need to ensure that the script uses relative paths. Good.
+
+Now we must not write to stderr/stdout beyond what tools naturally emit; no echo or printf for user-facing prose. But we do use printf to create header line of collapsed.tsv, which writes to stdout? Actually printf writes to stdout by default; but we redirect with > results/collapsed.tsv. That will produce output to file, not to console. So it's fine.
+
+Now we need to ensure that the script uses correct quoting for bcftools query format string: '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'. Use single quotes around it; inside there are \t and \n which will be interpreted by bcftools. Good.
+
+Now we need to use awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+
+But note that $0 contains the line from bcftools query, which already has tabs and newline at end. The print will add sample tab before it; but we need to ensure no double newline. The default awk prints each record with OFS between fields and adds a newline after each record. Since $0 includes trailing newline? Actually when reading input lines, awk strips the trailing newline from each record. So $0 is line without newline. Then print s,$0 will produce sample TAB rest-of-line, then newline. Good.
+
+Now we need to ensure that bcftools query output may have multiple alt alleles separated by commas; that's fine.
+
+Now we need to ensure that bcftools query works on compressed VCF: yes.
+
+Now we need to ensure that tabix indexes .vcf.gz file; we use tabix -p vcf results/${sample}.vcf.gz
+
+Now we must ensure that the script uses correct variable expansions inside braces. For example, in guard for variant calling: [[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] ; but double brackets treat '||' as logical OR; but we need to use parentheses? Actually within [[ ... ]] you can use && and ||. So it's fine.
+
+Now we must ensure that the script uses correct quoting for bcftools query: bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz
+
+Now we need to ensure that the script uses 'bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf' but bcftools may complain if .vcf file missing; but guard ensures it exists.
+
+Now we must consider that bcftools view will produce compressed VCF with header lines starting with '#', etc. Good.
+
+Now we need to ensure that the script uses 'samtools sort -@ $THREADS -o results/${sample}.bam -' reading from stdin. That is correct.
+
+Now we need to ensure that the script uses 'samtools index -@ $THREADS results/${sample}.bam' to produce .bai file.
+
+Now we must ensure that the script uses 'lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam'.
+
+But lofreq may require reference index (.fai) and maybe .amb etc. But we have them.
+
+Now we need to ensure that the script uses 'lofreq call-parallel' which outputs VCF; but we might want to compress with bcftools view -Oz. Good.
+
+Now we need to ensure that the script uses 'tabix -p vcf results/${sample}.vcf.gz'.
+
+Now we need to ensure that the script uses 'printf' for header line: printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+
+But this writes to file; but we might want to use '>' to overwrite. Good.
+
+Now we must ensure that the script uses no stray spaces or tabs that may cause issues.
+
+Now we need to produce final script with all lines.
+
+Let's craft:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Reference indexing
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+for sample in "${SAMPLES[@]}"; do
+    # Alignment and sort
+    [[ -f results/${sample}.bam ]] || {
+        bwa mem -t $THREADS -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ $THREADS -o results/${sample}.bam -
+    }
+
+    # BAM index
+    [[ -f results/${sample}.bam.bai ]] || samtools index -@ $THREADS results/${sample}.bam
+
+    # Variant calling
+    [[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] || lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+
+    # Compress and index VCF
+    [[ -f results/${sample}.vcf.gz.tbi ]] || {
+        bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf
+        tabix -p vcf results/${sample}.vcf.gz
+    }
+done
+
+# Collapsed TSV
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+
+Now check for any missing tools: bcftools view is part of bcftools; yes.
+
+But we used 'bcftools view' which may require '-Oz' to output compressed VCF. Good.
+
+Now we need to ensure that the script uses only allowed tools: bwa, samtools, lofreq, bcftools, tabix. We also use awk and printf; those are standard.
+
+Now check for potential issues:
+
+- The guard for variant calling uses [[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] ; but inside double brackets, '||' is logical OR. But we need to ensure that the expression is parsed correctly: [[ -f file1 || -f file2 ]]. That works.
+
+- The guard for compress+index uses [[ -f results/${sample}.vcf.gz.tbi ]] || { ... } ; good.
+
+- In bcftools query, we use %INFO/AF; but if AF field not present? LoFreq may output INFO/AF. Good.
+
+Now check that the script will exit 0 after finishing. It should.
+
+Now ensure that no stray spaces cause issues: The 'bwa mem -t $THREADS -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ $THREADS -o results/${sample}.bam -' is fine.
+
+Now we need to ensure that the script uses 'samtools index -@ $THREADS results/${sample}.bam'; this will produce .bai file.
+
+Now check for idempotency: If results/ already contains all outputs, each guard will skip. The collapsed.tsv step always rebuilds; but that's okay.
+
+Now final script is ready.
+
+But we need to ensure that the script uses 'bcftools view -Oz' which may require specifying output format; but bcftools view -Oz -o file.vcf.gz input.vcf should work.
+
+Now we also need to consider that bcftools view will produce .vcf.gz and keep original .vcf. That's fine.
+
+Now we might want to delete the uncompressed .vcf after compression? Not necessary.
+
+Now check for potential missing dependencies: 'tabix' is part of htslib; but we have it in inventory.
+
+Now ensure that we didn't use any other tools like bgzip or gzip. Good.
+
+Now final script ready.
+
+But we need to double-check the quoting inside bcftools query: The format string uses %CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n; inside single quotes, \t and \n are passed as literal backslash t and backslash n. bcftools will interpret them accordingly. Good.
+
+Now we need to ensure that the script uses 'awk -v s=${sample} ...' ; but sample variable may contain hyphen; that's fine. In awk, $0 includes line without newline; print s,$0 prints with OFS tab between s and rest of line. That yields sample<TAB>rest-of-line. Good.
+
+Now we need to ensure that the script uses 'printf' for header: printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv ; this writes header line to file; no newline after? Actually \n will produce newline at end. Good.
+
+Now final script is ready.
+
+But we need to ensure that the script uses 'bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf' inside guard block; but bcftools may output compressed file and keep original .vcf. That's fine.
+
+Now we should also consider that if .vcf.gz.tbi exists but .vcf.gz missing, the guard will skip compress+index; but then collapsed.tsv query will fail because .vcf.gz missing. But this scenario cannot happen because compress+index step would have created .vcf.gz and index together. So it's fine.
+
+Now we need to ensure that the script uses 'tabix -p vcf results/${sample}.vcf.gz' which indexes compressed VCF; good.
+
+Now final script ready.
+
+Let's produce final answer: just the script lines.

@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+REF=data/ref/chrM.fa
+RAW=data/raw
+OUTDIR=results
+
+mkdir -p "$OUTDIR"
+
+# ---- Reference indexing (once) -------------------------------------------------
+if [[ ! -f "$REF.fai" ]]; then
+  samtools faidx "$REF"
+fi
+if [[ ! -f "$REF.bwt" ]]; then
+  bwa index "$REF"
+fi
+
+# ---- Helper to decide if a target needs regeneration ---------------------------
+needs_update() {
+  local tgt="$1"
+  shift
+  for src in "$@"; do
+    if [[ ! -e "$tgt" || "$src" -nt "$tgt" ]]; then
+      return 0   # true: update needed
+    fi
+  done
+  return 1   # false: up‑to‑date
+}
+
+# ---- Per‑sample processing ------------------------------------------------------
+for sample in "${SAMPLES[@]}"; do
+  BAM="$OUTDIR/${sample}.bam"
+  BAI="$OUTDIR/${sample}.bam.bai"
+  VCF="$OUTDIR/${sample}.vcf.gz"
+  VTBI="$OUTDIR/${sample}.vcf.gz.tbi"
+
+  # ---- Alignment & sorting ----------------------------------------------------
+  if needs_update "$BAM" \
+      "$RAW/${sample}_1.fq.gz" "$RAW/${sample}_2.fq.gz" \
+      "$REF.bwt" "$REF.fa"; then
+    bwa mem -t "$THREADS" \
+        -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+        "$REF" \
+        "$RAW/${sample}_1.fq.gz" "$RAW/${sample}_2.fq.gz" |
+    samtools sort -@ "$THREADS" -o "$BAM"
+  fi
+
+  # ---- Index BAM --------------------------------------------------------------
+  if needs_update "$BAI" "$BAM"; then
+    samtools index -@ "$THREADS" "$BAM"
+  fi
+
+  # ---- Variant calling with lofreq --------------------------------------------
+  VCF_UNCOMPRESSED="$OUTDIR/${sample}.vcf"
+  if needs_update "$VCF_UNCOMPRESSED" "$BAM" "$REF"; then
+    lofreq call-parallel --pp-threads "$THREADS" -f "$REF" -o "$VCF_UNCOMPRESSED" "$BAM"
+  fi
+
+  # ---- Compress & index VCF ---------------------------------------------------
+  if needs_update "$VTBI" "$VCF_UNCOMPRESSED"; then
+    bgzip -c "$VCF_UNCOMPRESSED" > "$VCF"
+    tabix -p vcf "$VCF"
+    rm "$VCF_UNCOMPRESSED"
+  fi
+done
+
+# ---- Collapse step -------------------------------------------------------------
+COLLAPSED="$OUTDIR/collapsed.tsv"
+if needs_update "$COLLAPSED" "${SAMPLES[@]/%/.vcf.gz}"; then
+  {
+    echo -e "sample\tchrom\tpos\tref\talt\taf"
+    for sample in "${SAMPLES[@]}"; do
+      VCF="$OUTDIR/${sample}.vcf.gz"
+      bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$VCF" |
+        awk -v s="$sample" '{print s "\t" $0}'
+    done
+  } > "$COLLAPSED"
+fi
+
+# Script ends successfully; no further output.

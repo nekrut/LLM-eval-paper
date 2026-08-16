@@ -1,0 +1,101 @@
+*   Task: Per-sample variant calling on 4 paired-end MiSeq amplicon samples mapped to human mitochondrial reference (chrM).
+    *   Samples: `M117-bl`, `M117-ch`, `M117C1-bl`, `M117C1-ch`.
+    *   Reference: `data/ref/chrM.fa` (decompressed, not indexed).
+    *   Inputs: `data/raw/{sample}_1.fq.gz`, `data/raw/{sample}_2.fq.gz`.
+    *   Outputs: `results/{sample}.bam`, `results/{sample}.bam.bai`, `results/{sample}.vcf.gz`, `results/{sample}.vcf.gz.tbi`, `results/collapsed.tsv`.
+    *   Tools: `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`, `bgzip` (implied by tabix/bcftools usually, but the prompt says use tools in TOOL_INVENTORY; wait, `bgzip` is not explicitly listed in TOOL_INVENTORY, but `tabix` and `bcftools` are. Usually `bgzip` comes with htslib/samtools/bcftools. Let's check if I can use `bcftools view -Oz`).
+    *   Wait, the prompt says: "Compress with `bgzip` (not `bcftools view -O z`)". But `bgzip` is not in the TOOL_INVENTORY list? Let me re-read.
+    *   TOOL_INVENTORY lists: `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`, `SnpSift`, `snpEff`, `fastqc`, `seqkit`, `snakemake`, `shellcheck`, `java`.
+    *   Actually, `bgzip` is part of the htslib suite which provides `samtools`, `bcftools`, and `tabix`. In most conda environments, if you have `tabix`, you have `bgzip`. I will use `bgzip`.
+
+    *   `THREADS=4`
+    *   Samples: `M117-bl M117-ch M117C1-bl M117C1-ch`
+    *   Reference indexing (idempotent): `samtools faidx`, `bwa index`.
+    *   Alignment: `bwa mem -t 4 -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" ... | samtools sort -@ 4 -o results/{sample}.bam`
+    *   Indexing BAM: `samtools index -@ 4 results/{sample}.bam`.
+    *   Variant Calling: `lofreq call-parallel --pp-threads 4 --verbose --ref data/ref/chrM.fa --out results/{sample}.vcf results/{sample}.bam` (Note: prompt says `--sig` and `--bonf` can be omitted or used; I'll stick to the provided snippet logic).
+    *   Compression: `bgzip results/{sample}.vcf`.
+    *   Indexing VCF: `tabix -p vcf results/{sample}.vcf.gz`.
+    *   Collapsing: `bcftools query` for each sample, add header, save to `results/collapsed.tsv`.
+
+    *   Check if file exists before running command.
+    *   For the collapsed table, check if any input VCF is newer than the TSV or if TSV doesn't exist.
+
+    *   BWA read group: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`. The prompt specifically warns against using `printf` or `$'\t'`. It wants the literal string `\t`.
+    *   LoFreq call-parallel syntax: positional argument for BAM at the end.
+
+    *   Reference indexing:
+        ```bash
+        if [[ ! -f data/ref/chrM.fa.fai ]]; then samtools faidx data/ref/chrM.fa; fi
+        if [[ ! -f data/ref/chrM.fa.bwt ]]; then bwa index data/ref/chrM.fa; fi
+        ```
+    *   Per sample loop:
+        ```bash
+        for sample in $SAMPLES; do
+            # BAM
+            if [[ ! -f results/${sample}.bam ]]; then
+                bwa mem -t $THREADS -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+                    data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+                    samtools sort -@ $THREADS -o results/${sample}.bam
+            fi
+            # BAI
+            if [[ ! -f results/${sample}.bam.bai ]]; then
+                samtools index -@ $THREADS results/${sample}.bam
+            fi
+            # VCF (uncompressed)
+            # Note: LoFreq creates the file. To be idempotent, we check for the final .vcf.gz.tbi
+            if [[ ! -f results/${sample}.vcf.gz.tbi ]]; then
+                lofreq call-parallel --pp-threads $THREADS --verbose \
+                    --ref data/ref/chrM.fa --out results/${sample}.vcf \
+                    results/${sample}.bam
+                bgzip -f results/${sample}.vcf
+                tabix -p vcf results/${sample}.vcf.gz
+            fi
+        done
+        ```
+    *   Collapsed TSV:
+        ```bash
+        # Check if any VCF is newer than collapsed.tsv or if it doesn't exist
+        REBUILD=false
+        if [[ ! -f results/collapsed.tsv ]]; then
+            REBUILD=true
+        else
+            for sample in $SAMPLES; do
+                if [[ results/${sample}.vcf.gz -nt results/collapsed.tsv ]]; then
+                    REBUILD=true
+                    break
+                fi
+            done
+        fi
+
+        if [ "$REBUILD" = true ]; then
+            printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+            for sample in $SAMPLES; do
+                bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> results/collapsed.tsv
+            done
+        fi
+        ```
+
+    *   `set -euo pipefail`? Yes.
+    *   CWD `data/raw/`, `data/ref/`? Yes.
+    *   Outputs in `results/`? Yes.
+    *   Idempotent? Yes.
+    *   No hardcoded paths outside CWD? Yes.
+    *   Only tools from TOOL_INVENTORY? (bgzip is part of htslib, usually available with tabix).
+    *   Wall-clock < 600s at THREADS=4? Yes, mtDNA is tiny (16kb).
+    *   No prose/markdown? Yes.
+
+    Wait, the prompt says: "Compress with `bgzip` (not `bcftools view -O z`)". I must use `bgzip`. If it's not in the list but required by the plan, it's assumed to be available as part of the htslib/tabix package.
+
+    One detail on LoFreq: "The bare `--sig` and `--bonf` lines come from Galaxy-runtime-supplied values; you can omit them and use lofreq's defaults." I will omit them for simplicity unless they are critical. The prompt says "you can omit them".
+
+    Wait, the BWA read group string: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`.
+    The prompt is very specific: "The `\t` must remain the two characters backslash and `t` — bwa parses them itself. Do NOT use `printf`, `echo -e`, `$'\t'`, or any mechanism that turns them into real tabs".
+    So I will write exactly: `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`.
+
+    Final check on the collapsed.tsv header and format:
+    `sample  chrom  pos  ref  alt  af` (tab separated).
+    `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`.
+
+    Wait, the prompt says: "Rebuild only if any input VCF is newer than the TSV."
+    I will use a loop to check timestamps.

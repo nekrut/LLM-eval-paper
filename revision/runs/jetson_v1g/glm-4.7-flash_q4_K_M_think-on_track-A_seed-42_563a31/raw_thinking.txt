@@ -1,0 +1,280 @@
+1.  **Analyze the Request:**
+    *   **Goal:** Create a single, self-contained bash script for per-sample variant calling on mitochondrial DNA amplicons.
+    *   **Input:** `data/raw/` contains paired FASTQs for 4 samples. `data/ref/` contains `chrM.fa`.
+    *   **Output:** `results/{sample}.bam`, `results/{sample}.bam.bai`, `results/{sample}.vcf.gz`, `results/{sample}.vcf.gz.tbi`, `results/collapsed.tsv`.
+    *   **Constraints:**
+        *   Shebang: `#!/usr/bin/env bash`
+        *   Set: `set -euo pipefail`
+        *   Paths: Relative only. No absolute paths.
+        *   Idempotent: Must skip existing outputs.
+        *   Tools: `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`, `SnpSift`, `snpEff`, `fastqc`, `seqkit`, `snakemake`, `shellcheck`, `java`. (Note: Some tools like `SnpSift`, `snpEff`, `fastqc`, `seqkit`, `snakemake`, `shellcheck` are listed in the inventory but not strictly required by the specific workflow steps described in the "PLAN". I should stick to the tools explicitly used in the PLAN to avoid clutter, or include them if they are needed for the specific steps. The PLAN uses `bwa`, `samtools`, `lofreq`, `tabix`, `bcftools`. I will use only those to keep the script clean and focused, as the prompt says "Use only tools listed in TOOL_INVENTORY" and "follow the ordering and tool choices" in the PLAN).
+        *   Wall-clock: < 600s at THREADS=4.
+        *   No `echo` for user-facing prose.
+        *   Output: ONLY the script.
+
+2.  **Step-by-Step Implementation Plan:**
+
+    *   **Step 1: Setup & Globals**
+        *   Define `THREADS=4`.
+        *   Define sample list: `M117-bl M117-ch M117C1-bl M117C1-ch`.
+        *   Create `results/` directory (idempotent check: `mkdir -p results`).
+
+    *   **Step 2: Reference Indexing**
+        *   Check if `data/ref/chrM.fa.fai` and `data/ref/chrM.fa.bwt` (or similar index files) exist.
+        *   If not, run `samtools faidx data/ref/chrM.fa` and `bwa index data/ref/chrM.fa`.
+
+    *   **Step 3: Alignment (BWA MEM)**
+        *   Loop through samples.
+        *   Check if `results/{sample}.bam` exists.
+        *   If not, run `bwa mem -t $THREADS -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ $THREADS -o results/${sample}.bam`.
+
+    *   **Step 4: BAM Indexing**
+        *   Check if `results/{sample}.bam.bai` exists.
+        *   If not, run `samtools index -@ $THREADS results/${sample}.bam`.
+
+    *   **Step 5: Variant Calling (Lofreq)**
+        *   Check if `results/{sample}.vcf` exists (or `.vcf.gz`? The plan says `--out results/{sample}.vcf` then compresses it. I should check for the intermediate `.vcf` or the final `.vcf.gz`. The plan says "Rebuild only if any input VCF is newer than the TSV" in step 8, implying the intermediate `.vcf` is a valid intermediate. However, for idempotency, checking for the final `.vcf.gz` is safer, but lofreq writes to `.vcf` first. I will check for the existence of the intermediate `.vcf` to avoid re-running lofreq if it exists, or check for `.vcf.gz` and skip if it exists. Let's check for the intermediate `.vcf` as it's the direct output of lofreq).
+        *   If not, run `lofreq call-parallel --pp-threads $THREADS --verbose --ref data/ref/chrM.fa --out results/${sample}.vcf --sig --bonf results/${sample}.bam`. (Note: The plan says "omit them and use lofreq's defaults", but also says "The bare `--sig` and `--bonf` lines come from Galaxy-runtime-supplied values; you can omit them". I'll omit them to keep it simple, or include them if they are standard. The plan says "omit them". I will omit them).
+
+    *   **Step 6: VCF Compression & Indexing**
+        *   Check if `results/{sample}.vcf.gz` exists.
+        *   If not, run `bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz` and `tabix -p vcf results/${sample}.vcf.gz`.
+        *   Remove `results/${sample}.vcf`.
+
+    *   **Step 7: Collapsing (bcftools query)**
+        *   Check if `results/collapsed.tsv` exists.
+        *   If not, iterate over samples, run `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz`.
+        *   Concatenate outputs.
+        *   Prepend header `sample\tchrom\tpos\tref\talt\taf`.
+        *   Write to `results/collapsed.tsv`.
+
+3.  **Refining the Script Logic:**
+
+    *   *Idempotency Strategy:* The prompt asks for idempotency. The standard way in bash without a workflow manager is checking file existence.
+    *   *Reference Indexing:* `bwa index` creates `.amb`, `.ann`, `.bwt`, `.pac`, `.sa`. `samtools faidx` creates `.fai`. I'll check for `.fai` and `.bwt`.
+    *   *Alignment:* Check for `.bam`.
+    *   *BAM Index:* Check for `.bam.bai`.
+    *   *Lofreq:* Check for `.vcf`.
+    *   *VCF GZ:* Check for `.vcf.gz`.
+    *   *TSV:* Check for `collapsed.tsv`.
+
+4.  **Drafting the Code (Mental or Scratchpad):**
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    THREADS=4
+    SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"
+
+    # Create results dir
+    mkdir -p results
+
+    # 2. Reference Indexing
+    if [ ! -f data/ref/chrM.fa.fai ] || [ ! -f data/ref/chrM.fa.bwt ]; then
+        samtools faidx data/ref/chrM.fa
+        bwa index data/ref/chrM.fa
+    fi
+
+    # 3, 4, 5. Alignment, Sort, Index
+    for SAMPLE in $SAMPLES; do
+        # Check if BAM exists
+        if [ ! -f results/${SAMPLE}.bam ]; then
+            bwa mem -t $THREADS -R "@RG\tID:${SAMPLE}\tSM:${SAMPLE}\tLB:${SAMPLE}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${SAMPLE}_1.fq.gz data/raw/${SAMPLE}_2.fq.gz | samtools sort -@ $THREADS -o results/${SAMPLE}.bam
+        fi
+        # Check if BAM index exists
+        if [ ! -f results/${SAMPLE}.bam.bai ]; then
+            samtools index -@ $THREADS results/${SAMPLE}.bam
+        fi
+    done
+
+    # 6. Variant Calling
+    for SAMPLE in $SAMPLES; do
+        # Check if intermediate VCF exists
+        if [ ! -f results/${SAMPLE}.vcf ]; then
+            lofreq call-parallel --pp-threads $THREADS --verbose --ref data/ref/chrM.fa --out results/${SAMPLE}.vcf results/${SAMPLE}.bam
+        fi
+    done
+
+    # 7. Compression & Indexing
+    for SAMPLE in $SAMPLES; do
+        if [ ! -f results/${SAMPLE}.vcf.gz ]; then
+            bgzip -c results/${SAMPLE}.vcf > results/${SAMPLE}.vcf.gz
+            tabix -p vcf results/${SAMPLE}.vcf.gz
+            rm results/${SAMPLE}.vcf
+        fi
+    done
+
+    # 8. Collapsing
+    if [ ! -f results/collapsed.tsv ]; then
+        HEADER="sample\tchrom\tpos\tref\talt\taf"
+        > results/collapsed.tsv
+        for SAMPLE in $SAMPLES; do
+            bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${SAMPLE}.vcf.gz >> results/collapsed.tsv
+        done
+        echo -e "$HEADER" > results/collapsed.tsv
+    fi
+    ```
+
+5.  **Review against Constraints:**
+
+    *   *First line:* `#!/usr/bin/env bash` (Check)
+    *   *Second line:* `set -euo pipefail` (Check)
+    *   *Paths:* Relative only. `data/raw/`, `data/ref/`, `results/`. (Check)
+    *   *Tool Inventory:* Used `bwa`, `samtools`, `lofreq`, `bgzip`, `tabix`, `bcftools`. (Check)
+    *   *Plan details:*
+        *   `-R` format: `@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA`. (Check)
+        *   `lofreq` args: `--pp-threads 4 --verbose --ref data/ref/chrM.fa --out results/{sample}.vcf results/{sample}.bam`. (Check)
+        *   `bcftools query`: `'{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`. (Check)
+        *   Header prepending: `echo -e "$HEADER" > results/collapsed.tsv`. (Check)
+    *   *Idempotency:* Checks for file existence before running commands. (Check)
+    *   *No absolute paths:* (Check)
+    *   *No `echo` for user-facing prose:* The script uses `echo` only for the header line in the collapsing step, which is necessary to write the file. The prompt says "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." Writing the header to a file is necessary for the output format, not "user-facing prose". However, to be strictly safe, I can use `printf` for the header, but `echo -e` is standard for this. I will use `printf` to be cleaner and avoid potential issues with `-e` interpretation if the shell behaves oddly, though bash usually handles it. Actually, `printf '%s\n' "$HEADER"` is safer.
+
+6.  **Refining the Script:**
+
+    *   *Lofreq:* The plan mentions `--sig` and `--bonf` are optional. I will omit them.
+    *   *BWA Index:* `bwa index` creates multiple files. Checking for `.bwt` is a good check.
+    *   *Samtools Sort:* The plan says "Pipe `bwa mem` stdout into `samtools sort`". My draft does this.
+    *   *BAM Index:* `samtools index`.
+    *   *VCF:* `lofreq call-parallel`.
+    *   *Compression:* `bgzip -c`.
+    *   *Tabix:* `tabix -p vcf`.
+    *   *Cleanup:* Remove `.vcf` after compression.
+
+    *   *Collapsed TSV logic:*
+        The plan says "Prepend a single header line... Output is tab-separated, one variant per line, header on, written to `results/collapsed.tsv`."
+        My draft: `printf '%s\n' "$HEADER" > results/collapsed.tsv` then append. This works.
+
+    *   *Idempotency check:* The script must exit 0 if everything is done. `set -euo pipefail` ensures that if a command fails, it exits. If a file exists, the `if` block is skipped, so no error occurs.
+
+    *   *Wall-clock:* The tools are standard. 4 samples * amplicon size (small) is fast. < 600s is easily met.
+
+7.  **Final Code Structure:**
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    THREADS=4
+    SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"
+
+    mkdir -p results
+
+    # 2. Reference Indexing
+    if [ ! -f data/ref/chrM.fa.fai ] || [ ! -f data/ref/chrM.fa.bwt ]; then
+        samtools faidx data/ref/chrM.fa
+        bwa index data/ref/chrM.fa
+    fi
+
+    # 3, 4, 5. Alignment, Sort, Index
+    for SAMPLE in $SAMPLES; do
+        if [ ! -f results/${SAMPLE}.bam ]; then
+            bwa mem -t "$THREADS" -R "@RG\tID:${SAMPLE}\tSM:${SAMPLE}\tLB:${SAMPLE}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${SAMPLE}_1.fq.gz data/raw/${SAMPLE}_2.fq.gz | samtools sort -@ "$THREADS" -o results/${SAMPLE}.bam
+        fi
+        if [ ! -f results/${SAMPLE}.bam.bai ]; then
+            samtools index -@ "$THREADS" results/${SAMPLE}.bam
+        fi
+    done
+
+    # 6. Variant Calling
+    for SAMPLE in $SAMPLES; do
+        if [ ! -f results/${SAMPLE}.vcf ]; then
+            lofreq call-parallel --pp-threads "$THREADS" --verbose --ref data/ref/chrM.fa --out results/${SAMPLE}.vcf results/${SAMPLE}.bam
+        fi
+    done
+
+    # 7. Compression & Indexing
+    for SAMPLE in $SAMPLES; do
+        if [ ! -f results/${SAMPLE}.vcf.gz ]; then
+            bgzip -c results/${SAMPLE}.vcf > results/${SAMPLE}.vcf.gz
+            tabix -p vcf results/${SAMPLE}.vcf.gz
+            rm results/${SAMPLE}.vcf
+        fi
+    done
+
+    # 8. Collapsing
+    if [ ! -f results/collapsed.tsv ]; then
+        HEADER="sample\tchrom\tpos\tref\talt\taf"
+        printf '%s\n' "$HEADER" > results/collapsed.tsv
+        for SAMPLE in $SAMPLES; do
+            bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${SAMPLE}.vcf.gz >> results/collapsed.tsv
+        done
+    fi
+    ```
+
+    *Self-Correction on `set -euo pipefail` and `samtools sort`:*
+    `samtools sort` usually outputs to stdout if `-o` is not provided, but here `-o` is provided. It should be fine.
+    `lofreq call-parallel` output goes to file specified by `--out`.
+    `bcftools query` output goes to stdout, redirected to `>>`.
+
+    *Check on `lofreq` arguments:*
+    Plan: `lofreq call-parallel --pp-threads 4 --verbose --ref data/ref/chrM.fa --out results/{sample}.vcf --sig --bonf results/{sample}.bam`
+    I will use `--pp-threads "$THREADS"`.
+
+    *Check on `bwa mem` arguments:*
+    Plan: `bwa mem -t 4` with `-R`.
+    I will use `bwa mem -t "$THREADS"`.
+
+    *Check on `bcftools query` format:*
+    Plan: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`
+    Note: The `{sample}` in the format string is a literal string in bcftools query. It is *not* the shell variable. The shell variable expansion happens outside the format string in the command line. My draft does this correctly.
+
+    *Check on `bgzip`:*
+    Plan says "Compress with `bgzip` (not `bcftools view -O z`)". `bgzip -c` is correct.
+
+    *Check on `tabix`:*
+    Plan says "Index with `tabix -p vcf results/{sample}.vcf.gz`". Correct.
+
+    *Check on `rm`:*
+    Plan says "Remove the intermediate uncompressed `.vcf`". Correct.
+
+    *Check on `mkdir`:*
+    `mkdir -p results` is idempotent.
+
+    *Check on `set -e`:*
+    If `bcftools query` fails (e.g. file not found), script exits. If `lofreq` fails, script exits. This is desired behavior for a "workflow" script unless we want to continue on error. The prompt implies a strict workflow. `set -e` is appropriate.
+
+    *One detail:* The prompt says "Do not hardcode any path outside the current working directory." `data/ref/chrM.fa` and `data/raw/` are relative to cwd. `results/` is relative to cwd. This is compliant.
+
+    *One detail:* "Total wall-clock must be under 600 seconds at THREADS=4". With 4 samples and small amplicon data, this is trivial.
+
+    *One detail:* "Do not write to stderr/stdout beyond what tools naturally emit". I am not using `echo` for status messages. I am only writing the header to the file.
+
+    *One detail:* "First line must be: #!/usr/bin/env bash". "Second line must be: set -euo pipefail".
+
+    *One detail:* "Assume the current working directory contains data/raw/... and data/ref/...".
+
+    *One detail:* "Write all outputs under results/".
+
+    *One detail:* "Idempotent: rerunning... must exit 0 without redoing work".
+    My logic checks for file existence. If `results/collapsed.tsv` exists, the loop is skipped. If `results/{sample}.vcf.gz` exists, the compression step is skipped. If `results/{sample}.vcf` exists, lofreq is skipped. If `results/{sample}.bam` exists, alignment is skipped. If `results/{sample}.bam.bai` exists, indexing is skipped. If `data/ref/chrM.fa.fai` or `.bwt` exists, indexing is skipped.
+
+    This looks solid.
+
+    *Minor tweak:* `bwa index` creates `.amb`, `.ann`, `.bwt`, `.pac`, `.sa`. Checking for `.bwt` is sufficient.
+
+    *Minor tweak:* `samtools faidx` creates `.fai`. Checking for `.fai` is sufficient.
+
+    *Minor tweak:* `lofreq` might create a `.vcf` file. Checking for `.vcf` is sufficient.
+
+    *Minor tweak:* `bcftools query` might fail if the VCF is empty or malformed, but for amplicon data, it should be fine.
+
+    *Final check on the header line:*
+    `printf '%s\n' "$HEADER" > results/collapsed.tsv`
+    `HEADER="sample\tchrom\tpos\tref\talt\taf"`
+    This creates the file with the header.
+
+    *Final check on the loop:*
+    `for SAMPLE in $SAMPLES; do ... done`
+    This iterates over the space-separated list.
+
+    *Final check on `set -u`:*
+    If `SAMPLES` is empty, it errors. It won't be empty.
+    If `THREADS` is unset, it errors. It is set.
+
+    *Final check on `set -o pipefail`:*
+    `bwa mem ... | samtools sort ...`
+    If `samtools sort` fails, the pipe fails. Correct.
+
+    The script is ready.

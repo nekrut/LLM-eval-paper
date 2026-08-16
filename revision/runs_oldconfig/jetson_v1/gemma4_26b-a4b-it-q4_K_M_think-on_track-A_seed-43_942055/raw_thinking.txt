@@ -1,0 +1,235 @@
+*   Goal: Per-sample variant calling on 4 paired-end MiSeq amplicon samples (human mtDNA).
+    *   Inputs: `data/raw/*.fq.gz`, `data/ref/chrM.fa`.
+    *   Outputs: `results/{sample}.bam`, `results/{/sample}.bam.bai`, `results/{sample}.vcf.gz`, `results/{sample}.vcf.gz.tbi`, `results/collapsed.tsv`.
+    *   Tools: `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`.
+    *   Constraints: Single bash script, no prose, idempotent, 4 threads, specific read group format (`-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`), no absolute paths outside CWD.
+
+    1.  `THREADS=4`, `SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)`.
+    2.  Create `results/`.
+    3.  Index reference (`bwa index`, `samtools faidx`) if not present.
+    4.  Loop through samples:
+        a. Check if `.vcf.gz.tbi` exists and is newer than inputs (FASTQs).
+        b. Run `bcall-parallel` pipeline: `bwa mem` -> `samtools sort` -> `samtools index`.
+        c. Run `lofreq call-parallel` -> `bgzip` -> `tabix`.
+    5.  Generate `collapsed.tsv`:
+        a. Check if exists and newer than all `.vcf.gz`.
+        b. Use `bcftools query` to extract columns.
+        c. Concatenate and add header.
+
+    *   *Reference Indexing*:
+        ```bash
+        if [[ ! -f data/ref/chrM.fa.fai ]]; then samtools faidx data/ref/chrM.fa; fi
+        if [[ ! -f data/ref/chrM.fa.bwt ]]; then bwa index data/ref/chrM.fa; fi
+        ```
+
+    *   *Alignment and Variant Calling (Per Sample)*:
+        Input files: `data/raw/${sample}_1.fq.gz`, `data/raw/${sample}_2.fq.gz`.
+        Output files: `results/${sample}.bam`, `results/${sample}.vcf.gz`.
+        Check if `results/${sample}.vcf.gz.tbi` exists and is newer than input FASTQs.
+
+        ```bash
+        bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLIMG" \
+          "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" | \
+        samtools sort -@ "$THREADS" -o "results/${sample}.bam"
+
+        samtools index -@ "$THREADS" "results/${sample}.bam"
+
+        lofreq call-parallel --pp-threads "$THREADS" -f data/ref/chrM.fa "results/${sample}.bam" > "results/${sample}.vcf"
+        bgzip -c "results/${sample}.vcf" > "results/${sample}.vcf.gz"
+        tabix -p vcf "results/${sample}.vcf.gz"
+        rm "results/${sample}.vcf"
+        ```
+
+    *   *Collapsing*:
+        Check if `results/collapsed.tsv` is newer than all `.vcf.gz`.
+        ```bash
+        printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+        for s in "${SAMPLES[@]}"; do
+          bcftools query -f "${s}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${s}.vcf.gz" >> results/collapsed.tsv
+        done
+        ```
+
+    *   `set -euo pipefail`.
+    *   `THREADS=4`.
+    *   `SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)`.
+    *   Use `[[ file1 -nt file2 ]]` for idempotency.
+
+    *Wait*, the prompt says: "The `\t` must remain the two characters backslash and `t` — bwa parses them itself."
+    In bash, if I write `-R "@RG\tID..."`, depending on how it's quoted, the shell might interpret `\t`.
+    If I use single quotes: `-R '@RG\tID...'`, the literal backslash and 't' are preserved.
+    Example: `bwa mem -R '@RG\tID:S1\tSM:S1'` -> bwa sees `\t`.
+
+    *Wait*, let's check the requirement for `lofreq call-parallel`: "Write uncompressed VCF to a temporary path (e.g. `results/{sample}.vcf`); lofreq emits plain VCF."
+    And: "Compress with `bgzip`... Remove the intermediate uncompressed `.vcf`."
+
+    *Wait*, let's check the requirement for `collapsed.tsv`: "Rebuild only if any input VCF is newer than the TSV."
+
+    *Refining the loop*:
+    ```bash
+    for sample in "${SAMPLES[@]}"; do
+        # Check if output exists and is newer than inputs
+        if [[ -f "results/${sample}.vcf.gz.tbi" ]] && \
+           [[ "results/${sample}.vcf.gz.tbi" -nt "data/raw/${sample}_1.fq.gz" ]] && \
+           [[ "results/${sample}.vcf.gz.tbi" -nt "data/raw/${sample}_2.fq.gz" ]]; then
+            continue
+        fi
+
+        # Alignment
+        bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" | \
+        samtools sort -@ "$THREADS" -o "results/${sample}.bam"
+
+        samtools index -@ "$THREADS" "results/${sample}.bam"
+
+        # Variant calling
+        lofreq call-parallel --pp-threads "$THREADS" -f data/ref/chrM.fa "results/${sample}.bam" > "results/${comp_vcf}"
+        bgzip -c "results/${comp_vcf}" > "results/${sample}.vcf.gz"
+        tabix -p vcf "results/${sample}.vcf.gz"
+        rm "results/${sample}.vcf"
+    done
+    ```
+
+    *Refining the collapse*:
+    ```bash
+    # Check if collapsed.tsv exists and is newer than all VCFs
+    needs_collapse=false
+    if [[ ! -f "results/collapsed.tsv" ]]; then
+        needs_collapse=true
+    else
+        for sample in "${SAMPLES[@]}"; do
+            if [[ "data/raw/${sample}_1.fq.gz" -nt "results/collapsed.tsv" ]] || \
+               [[ "data/raw/${sample}_2.fq.gz" -nt "results/collapsed.tsv" ]] || \
+               [[ "results/${sample}.vcf.gz" -nt "results/collapsed.tsv" ]]; then
+                needs_collapse=true
+                break
+            fi
+        done
+    fi
+
+    if [ "$needs_collapse" = true ]; then
+        printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz" >> results/collapsed.tsv
+        done
+    fi
+    ```
+
+    *Wait*, the `lofreq` step: The prompt says "Write uncompressed VCF to a temporary path (e.g. `results/{sample}.vcf`)". I'll use that.
+
+    *Check constraints*:
+    - `THREADS=4`.
+    - `SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)`.
+    - `results/` directory creation.
+    - Reference indexing (idempotent).
+    - BWA `-R` format: `@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA`. Note the literal backslash and t. In a bash script, to ensure `\t` is passed as `\` and `t`, I should use single quotes or escape the backslash.
+    - Single file output.
+    - No prose/markdown.
+
+    *Self-overriding check*: The prompt says "The `\t` must remain the two characters backslash and `t` — bwa parses them itself."
+    If I write: `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"` in a script, bash will interpret `\t` as a tab if it's inside double quotes and the shell/environment handles escapes. To be safe and ensure literal backslash-t, I should use single quotes for the string or escape the backslash: `-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`.
+    Actually, in a standard bash script, `"\t"` inside double quotes is often interpreted as a literal tab by some shells but not all. However, the prompt specifically says "The `\t` must remain the two characters backslash and `t`".
+    Let's use: `-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`. This ensures that when the command is executed, the argument passed to bwa contains the literal string `\t`.
+
+    *Wait*, let's re-read: "The `\t` must remain the two characters backslash and `t` — bwa parses them itself. Do NOT use `printf`, `echo -e`, `$'\t'`, or any mechanism that turns them into real tabs".
+    If I write `-R "@RG\tID..."` in a script, bash sees `\t`. In most modern bash versions, `\t` inside double quotes is just `\` and `t` unless it's an ANSI-C quoted string `$'\t'`. But to be absolutely certain of the "literal" requirement, I will use the double backslash.
+
+    *Wait*, let's check the `bcftools query` format:
+    `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`
+    The prompt says "the `{sample}` literal is prepended via the format string". This means I should use double quotes for the `-f` argument so the variable `${sample}` expands, but keep the tabs as `\t`.
+
+    *Final check on logic*:
+    - Reference index: `samtools faidx data/ref/chrM.fa` and `bwa index data/ref/chrM.fa`.
+    - Loop samples:
+        - Check if `results/${sample}.vcf.gz.tbi` exists AND is newer than FASTQs.
+        - If not, run bwa -> samtools sort -> samtools index -> lofreq -> bgzip -> tabix -> rm vcf.
+    - Collapse:
+        - Check if `results/collapsed.tsv` exists AND is newer than all VCFs and FASTQs (to be safe).
+        - If not, create header, loop samples, bcftools query >> tsv.
+
+    *One detail*: `lofreq call-parallel` output. The prompt says "Write uncompressed VCF to a temporary path (e.g. `results/{sample}.vcf`)". I'll use that.
+
+    *Wait*, one more thing: `bwa index` produces multiple files (`.amb`, `.ann`, etc.). Checking for just `.bwt` is usually enough, but checking for the existence of any of them or a specific one like `.bwt` is fine.
+
+    *Final structure*:
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    THREADS=4
+    SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+    mkdir -p results
+
+    # Reference indexing
+    if [[ ! -f data/ref/chrM.fa.fai ]]; then
+        samtools faidx data/ref/chrM.fa
+    fi
+    if [[ ! -f data/ref/chrM.fa.bwt ]]; then
+        bwa index data/ref/chrM.fa
+    fi
+
+    for sample in "${SAMPLES[@]}"; do
+        # Check if output is up to date
+        if [[ -f "results/${sample}.vcf.gz.tbi" ]] && \
+           [[ "results/${sample}.vcf.gz.tbi" -nt "data/raw/${sample}_1.fq.gz" ]] && \
+           [[ "results/${sample}.vcf.gz.tbi" -nt "data/raw/${sample}_2.fq.gz" ]]; then
+            continue
+        fi
+
+        # Alignment and sorting
+        bwa mem -t "$THREADS" -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+            "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" | \
+        samtools sort -@ "$THREADS" -o "results/${sample}.bam"
+
+        samtools index -@ "$THREADS" "results/${sample}.bam"
+
+        # Variant calling
+        lofreq call-parallel --pp-threads "$THREADS" -f data/ref/chrM.fa "results/${sample}.bam" > "results/${sample}.vcf"
+        bgzip -c "results/${sample}.vcf" > "results/${sample}.vcf.gz"
+        tabix -p vcf "results/${sample}.vcf.gz"
+        rm "results/${sample}.vcf"
+    done
+
+    # Collapsing
+    needs_collapse=false
+    if [[ ! -f "results/collapsed.tsv" ]]; then
+        needs_collapse=true
+    else
+        for sample in "${SAMPLES[@]}"; do
+            if [[ "data/raw/${sample}_1.fq.gz" -nt "results/collapsed.tsv" ]] || \
+               [[ "data/raw/${sample}_2.fq.gz" -nt "results/collapsed.tsv" ]] || \
+               [[ "results/${sample}.vcf.gz" -nt "results/collapsed.tsv" ]]; then
+                needs_collapse=true
+                break
+            fi
+        done
+    fi
+
+    if [ "$needs_collapse" = true ]; then
+        printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz" >> results/collapsed.tsv
+        done
+    fi
+    ```
+
+    *Wait*, the `bwa mem` command: The prompt says `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`. It specifically uses backslash-t. If I use double quotes in bash, `\t` is just `\t` unless it's `$'\t'`. However, to be absolutely safe and follow the instruction "The \t must remain the two characters backslash and t", using `\\t` ensures that even if a shell tried to interpret it, it wouldn't. But actually, in standard bash double quotes, `\t` is not an escape sequence for tab (unlike in `echo -e`). Only `$'\t'` or `$'...'` does that. So `"@RG\tID..."` should be fine and will pass literal backslash-t to bwa. I'll use the single backslash as it's cleaner and standard, but if I want to be 100% sure of "literal", double backslash is the way. Let's look at the prompt again: `exact form: -R "@RG\tID:{sample}\tSM:{...}"`. It shows single backslashes. I will use single backslashes inside double quotes.
+
+    *Wait*, one more check on `lofreq call-parallel`: The command is `lofreq call-parallel --pp-threads 4 -f ref.fa bam`.
+    The output of `lofreq` is a VCF file.
+
+    *Final Check*:
+    - `results/` directory: Yes.
+    - Idempotency: Yes (using `-nt`).
+    - Threads: 4.
+    - No absolute paths: Yes.
+    - Tools used correctly: Yes.
+    - Output format for `collapsed.tsv`: Yes.
+
+    One small detail: The prompt says "The collapsed.tsv must have columns... sample chrom pos ref alt af". My code does exactly that.
+
+    *Self-Correction on `bwa index`*: `bwa index` creates several files. Checking for `.bwt` is the standard way to see if it's done.
+    *Self-Correction on `bgzip`*: `bgzip -c` is correct for compressing and redirecting.
+
+    One last check: "Total wall-clock must be under 600 seconds at THREADS=4." This depends on the data, but the logic is as efficient as possible (piping bwa to samtools).
+
+    *Wait*, `lofreq call-parallel` might not exist in all versions of lofreq? The prompt says "Use the `call-parallel` subcommand". So I must use it.

@@ -1,0 +1,199 @@
+Thinking Process:
+
+1.  **Analyze the Request:**
+    *   **Goal:** Create a self-contained bash script for per-sample variant calling on mitochondrial amplicon data.
+    *   **Constraints:**
+        *   First line: `#!/usr/bin/env bash`
+        *   Second line: `set -euo pipefail`
+        *   Working directory structure assumed: `data/raw/`, `data/ref/`. Outputs to `results/`.
+        *   Idempotent: Rerunning on populated `results/` must exit 0 without redoing work.
+        *   No hardcoded absolute paths (e.g., no `/home/anton`). Use relative paths from cwd.
+        *   Tools available in PATH (`bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`, etc.).
+        *   Wall-clock < 600s at THREADS=4.
+        *   No stderr/stdout prose (no `echo`).
+        *   Specific tool usage instructions provided in the PLAN section.
+
+2.  **Deconstruct the Plan:**
+    *   **Globals:** `THREADS=4`, samples list (`M117-bl M117-ch M117C1-bl M117C1-ch`). Create `results/` if missing (but check idempotency logic carefully).
+    *   **Reference Indexing:** Check existence of `.fai` and BWA index files. If exist, skip. Else run `samtools faidx` and `bwa index`.
+    *   **Per-sample Alignment:** Use specific `-R` format with literal `\t`. Pipe to `samtools sort -@ 4`. Do NOT mark duplicates. Index BAM (`results/{sample}.bam.bai`).
+    *   **Variant Calling:** Run `lofreq call-parallel --pp-threads 4 ...`. Output uncompressed VCF first (per instructions). Then compress with `bgzip` and index with `tabix`. Remove intermediate `.vcf`.
+        *   Wait, the instruction says: "Compress with bgzip... producing results/{sample}.vcf.gz. Index... -> results/{sample}.vcf.gz.tbi. Remove the intermediate uncompressed .vcf." This implies I need to generate the VCF first (step 6), then compress it (step 7).
+    *   **Collapse Step:** Check if `collapsed.tsv` exists and is newer than inputs? Or just rebuild if any input VCF is newer? The instruction says: "Rebuild only if any input VCF is newer than the TSV." Actually, usually idempotency means skip everything if outputs exist. But specifically for collapsed.tsv: "Prepend a single header line... Output is tab-separated... Rebuild only if any input VCF is newer than the TSV."
+    *   **Idempotency Check:** The script must exit 0 on rerun without redoing work. This means I need to check existence of outputs before starting, or ensure conditional logic prevents re-running steps that are already done.
+
+3.  **Specific Tool Usage Details & Constraints:**
+    *   `-R` argument: Must be a single double-quoted string containing literal `\t`. `bwa mem -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`. Note the instruction says "literal backslash and t". In bash, inside quotes `"..."`, `\t` is usually interpreted as a tab by some shells or not depending on quoting. However, `bwa mem` documentation often requires literal tabs in read group strings if passed via command line arguments to avoid interpretation issues? The prompt specifically warns: "Do NOT use printf... bwa rejects real tabs with 'the read group line contained literal <tab> characters'". Wait, usually BWA *likes* actual tab characters. But the instruction says `bwa` parses them itself and I must provide `\t`.
+    *   Actually, looking closely at the prompt: "The \t must remain the two characters backslash and t — bwa parses them themselves." This is a specific constraint for this environment/tool version (0.7.18). Standard BWA usually accepts actual tabs or escaped sequences depending on how it's invoked. I will follow the instruction literally: use `\t` inside the quotes provided to `bwa mem`.
+    *   Wait, if I write `"@RG\tID:..."` in bash, does that become a literal backslash-t? Yes, unless interpreted by shell escape rules (e.g., `$'...'`). In double quotes, `\n`, `\t`, etc. are usually NOT expanded to control characters in standard Bash unless using `printf` or specific flags. Wait, actually Bash *does* interpret `\t` as a tab inside double quotes? No, typically only `\n`, `\r`, `\f` and backslash escapes like `\\`. Actually, checking man bash: "In single-quoted strings... In double-quoted strings..." Backslashes are treated literally except for specific sequences. Wait, actually in Bash double quotes, `\t` is *not* a tab character by default unless using `$'...'` or similar?
+    *   Correction: In standard POSIX/Bash, inside `"string"`, backslash escapes like `\\n` become literal characters if not special to the shell. However, many sources say Bash interprets `\n` as newline in double quotes too (historically). But for safety regarding "literal <tab> characters", I should probably use actual tabs or ensure bash doesn't expand it.
+    *   Actually, let's look at the constraint again: "`bwa mem -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`". The prompt explicitly says "The \t must remain the two characters backslash and t — bwa parses them themselves." This implies I should write `\t` in my script, but ensure it doesn't get converted to a real tab by bash before reaching `bwa`.
+    *   In Bash double quotes `"..."`, `\t` is often interpreted as a TAB character (e.g. `echo "a\tb"` prints with a tab). To force literal backslash-t in the argument passed to BWA, I should use single quotes `'...'` or escape it properly? Or maybe just rely on standard behavior if the prompt implies that's what happens when using `\t`.
+    *   Wait, re-reading: "Do NOT use printf... bwa rejects real tabs with 'the read group line contained literal <tab> characters'". This is confusing. Usually BWA accepts actual tabs in `-R` strings. If it rejects them, I must send the string `@RG\tID:...`.
+    *   To ensure Bash sends `\t` (backslash + t) to stdin/pipe rather than a TAB character: Use single quotes `'...'`? In single quotes, everything is literal except `$`, backticks etc. So `'@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA'`. This will pass the characters `\`, `t` to BWA.
+    *   Wait, if I use double quotes `"..."`, Bash expands `\t` to a tab (usually). So to avoid that expansion and keep literal backslash-t, single quotes are safer for this specific constraint requirement ("literal <tab> characters" rejection implies actual tabs cause error).
+    *   However, the prompt example shows: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"` (double quoted in description). But it says "The \t must remain...". I will use single quotes for safety to ensure literal backslash-t is passed if Bash interprets `\t` as tab.
+    *   Wait, actually the prompt example uses double quotes around the `-R` value: `"-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`. If I copy-paste that into a bash script with `$sample`, it works. But does Bash expand `\t`? Yes, usually in double quotes `\n` is newline and `\t` is tab (since version 2).
+    *   To be safe given the explicit instruction "bwa rejects real tabs", I will use single quotes for the string content to prevent bash from interpreting it as a control character. Or better yet, just ensure the script passes literal backslash-t. Let's assume standard Bash behavior where `\t` in double quotes is TAB. So `'@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA'`.
+    *   Wait, I need to check if `bwa mem -R "@..."` works with literal backslash-t or actual tabs. The prompt says "Do NOT use printf... bwa rejects real tabs". This implies BWA in this specific environment (0.7.18) might be strict about the format string containing `\t`.
+    *   Okay, I will construct the argument using single quotes to guarantee literal backslash-t is passed as characters 92 and 116? No, just ensure it's not a tab character.
+
+4.  **Idempotency Logic:**
+    *   Check if `results/` exists (create if missing).
+    *   For Reference Indexing: If `.fai`, BWA index files exist -> Skip. Else run.
+    *   Per-sample steps:
+        *   Alignment output (`{sample}.bam`) needs to be sorted and indexed? The plan says "SAM → sorted BAM". Then "BAM indexing". So `results/{sample}.bam` is the target for sorting, then `.bai`.
+        *   Check if `{sample}.vcf.gz.tbi` exists. If yes -> Skip alignment/calling/compression steps (assuming inputs are valid). But wait, idempotency means rerunning on populated results should exit 0 without redoing work. So I need to check existence of the final output `results/{sample}.bam.bai` or `results/{sample}.vcf.gz.tbi`.
+        *   Actually, simpler: Check if all outputs for a sample exist (`{sample}.bam`, `{sample}.bai`, `{sample}.vcf.gz`, `{sample}.vcf.gz.tbi`). If yes -> Skip. Else run pipeline up to that point.
+    *   Collapse step: Check `collapsed.tsv`. Rebuild only if any input VCF is newer than TSV? Or just rebuild if missing or older inputs exist? "Rebuild only if any input VCF is newer than the TSV." This implies I need timestamps.
+
+5.  **Tool Constraints:**
+    *   No conda, pip, apt, curl, wget.
+    *   `THREADS=4`.
+    *   Use specific commands exactly as listed in PLAN.
+    *   Do not use `echo` for prose (only output data).
+
+6.  **Script Structure:**
+    *   Shebang + set flags.
+    *   Define variables (`SAMPLES`, `REF_FILE`).
+    *   Function or block to handle Reference Indexing (check existence first).
+    *   Loop over samples: Check if all outputs exist -> Skip logic? Or check specific steps? The prompt says "rerunning on a populated results/ directory must exit 0 without redoing work". So I should check the final state of each sample. If `results/{sample}.vcf.gz.tbi` exists, skip alignment/calling/compression for that sample.
+    *   Wait, if I run it once and populate everything, then run again:
+        *   Ref index files exist -> Skip ref indexing (good).
+        *   Sample outputs exist (`{sample}.bam.bai`) -> Skip per-sample steps? Yes.
+        *   Collapse TSV exists and is newer than inputs -> Keep existing? Or rebuild if older? "Rebuild only if any input VCF is newer". This implies I need to check timestamps of `results/{sample}.vcf.gz` vs `collapsed.tsv`. If `ts(vcf) > ts(tsv)` then update.
+    *   Wait, the prompt says: "rerunning on a populated results/ directory must exit 0 without redoing work or erroring." This implies if I run it again with everything done, nothing should happen (except maybe checking timestamps). But for idempotency to be robust, usually we check existence of final artifacts.
+    *   Let's refine the "Skip" logic: If `results/{sample}.vcf.gz.tbi` exists AND is newer than inputs? No, just if it exists and all dependencies are satisfied (which they will be). But wait, what if I run step 1-8 again on a populated directory?
+    *   Constraint: "rerunning ... must exit 0 without redoing work". This means `if [ -f results/{sample}.vcf.gz.tbi ]; then continue; fi` inside the loop.
+    *   For Collapse TSV: Check if it exists and is newer than inputs (VCFs). If older, rebuild.
+
+7.  **Refining Idempotency for Reference:**
+    *   `data/ref/chrM.fa.fai`, `.amb`, etc. exist? Skip indexing. Else index.
+    *   Note: The prompt says "Skip both if the index files already exist." (plural). So check existence of BWA index set or fai file.
+
+8.  **Refining Idempotency for Samples:**
+    *   If `results/{sample}.vcf.gz.tbi` exists, skip alignment/calling/compression? Yes. Because that's the final state indicator per sample (along with .bai). Actually `.bam.bai` is also good. Let's check if `{sample}.vcf.gz.tbi` exists to decide whether to run the pipeline for that sample.
+    *   Wait, what about `collapsed.tsv`? It depends on all VCFs. If it exists and inputs are older than TSV (or just newer), we rebuild.
+
+9.  **Timestamp Logic:**
+    *   Need a function or logic to compare timestamps. Bash `$((...))` arithmetic doesn't handle file modification time directly without `stat`. I can use `find -mtime ...`? No, simpler: check if input files are older than output TSV using `touch`? No, just rely on existence for the main pipeline steps (if final VCF index exists, skip). For collapsed.tsv specifically: "Rebuild only if any input VCF is newer than the TSV."
+    *   I need to get modification times. Bash doesn't have a built-in file timestamp comparison without external tools or `stat`. Since no extra tools are allowed (only listed inventory), and `ls -l` output parsing might be messy, but `find ... +printf`? Or just use `touch` logic?
+    *   Actually, standard idempotency usually means "if outputs exist, skip". The specific instruction for collapsed.tsv is stricter: check timestamps. I will implement a simple timestamp comparison using bash arithmetic on seconds since epoch if possible (using `date -r`) or parsing `stat`. Since tools are limited to inventory (`bwa`, `samtools`...), does it have `stat`? It's not listed in TOOL_INVENTORY but is standard Linux tool. The prompt says "Use only tools listed in TOOL_INVENTORY". This might be a hard constraint for the script content, implying I shouldn't rely on external binaries like `date -r`.
+    *   However, usually scripts assume PATH contains common utilities unless specified otherwise ("Do not invoke conda..."). But strict adherence to "Only these are on PATH" implies no `stat`, `date`? That makes timestamp comparison hard.
+    *   Wait, the instruction says: "Use only tools listed in TOOL_INVENTORY." This is a constraint for tool usage within the script logic (e.g., don't use python). But standard shell utilities (`ls`, `find`) are usually available as part of the OS environment even if not explicitly in the conda env PATH list provided? The prompt says "Use only tools listed...". I should be careful.
+    *   Actually, checking existence is trivial with `[ -f ]`. Checking timestamps without a tool like `stat` or `date` requires parsing output from commands that might not be allowed (like `ls`). But wait, if the script runs in an environment where only those tools are guaranteed on PATH... I can't use `find`, `grep`, etc. reliably?
+    *   Let's re-read: "Use only tools listed in TOOL_INVENTORY." This likely means for data processing steps. Shell built-ins and standard utilities (`ls`, `test`) might be implicitly allowed as they aren't external binaries like `conda`. But to be safe, I should minimize reliance on non-listed tools if possible.
+    *   However, checking timestamps is critical for the specific collapsed.tsv instruction ("Rebuild only if any input VCF is newer than the TSV"). Without a timestamp tool, this is hard in pure bash without external commands like `stat`. But maybe I can use `touch` to update? No, that changes time.
+    *   Alternative interpretation: The "idempotency" for collapsed.tsv might just mean checking if it exists and inputs are newer (which implies a dependency check). If I cannot reliably compare timestamps without allowed tools, I should prioritize the main idempotency rule ("rerunning ... must exit 0"). This usually means skipping everything if final outputs exist. The specific timestamp instruction is for *when* to rebuild collapsed.tsv specifically.
+    *   Given "Use only tools listed in TOOL_INVENTORY", and `stat`/`date` are not there, I might need to simulate or assume standard shell behavior allows checking modification time? Actually, bash doesn't have a built-in file timestamp command without external help (like `ls -l`). If I can use `find`, maybe. But if strict "only tools listed", then no `stat`.
+    *   Wait, is there another way? Maybe just check existence of inputs vs outputs for the main pipeline steps. For collapsed.tsv: Check if it exists AND all VCFs are older than TSV (or newer?). If I can't compare timestamps reliably with allowed tools...
+    *   Let's assume standard shell utilities (`ls`, `stat` might be available in PATH even if not listed? Or maybe the prompt implies "Use only these for data processing"). The constraint says "Do not invoke conda, pip, apt...". It doesn't explicitly ban all other binaries. But to be safe on strictness: I will try to avoid non-listed tools where possible.
+    *   Actually, `touch` is a shell builtin? No, external command usually (unless `-t`). Wait, bash has built-in commands like `test`.
+    *   Okay, let's look at the instruction again: "Use only tools listed in TOOL_INVENTORY." This applies to data processing. Shell utilities are generally acceptable for orchestration unless specified otherwise ("Do not invoke..."). I will assume standard shell environment is available (ls, find) but avoid heavy dependencies if possible.
+    *   Wait, `date` isn't there either. Comparing timestamps without tools? Maybe I can use the fact that newer files usually have higher modification times. But how to compare two numbers in bash without a tool? `$((...))`. If I could get epoch time from shell built-ins... No.
+    *   Okay, maybe I should interpret "Use only tools listed" as "Do not install or call external package managers". Standard `ls`, `test` are fine. But for timestamp comparison specifically: Maybe the instruction implies that if inputs exist and outputs don't (or TSV is missing), rebuild? Or just check existence of VCFs vs TSV file age using a workaround?
+    *   Actually, I can use `find -mmin +0 ...` but `-mtime` isn't standard in all shells.
+    *   Let's try to find the safest path: Check if inputs exist and outputs don't (for pipeline steps). For collapsed.tsv: If it exists AND is newer than VCFs? Without timestamp tools, this is tricky. I will assume `stat` or similar might be available as standard Linux tool despite not being in inventory list for *processing* purposes? Or maybe the prompt implies "Use only these [tools] to process data".
+    *   Wait, looking at TOOL_INVENTORY: It lists specific bioinformatics tools. Standard OS utilities (`ls`, `grep`, `sed`) are usually assumed available unless restricted ("Do not invoke..."). I will assume standard shell environment is allowed for orchestration (checking files). For timestamp comparison without a tool like `stat` or `date`:
+    *   Maybe I can use the fact that if VCFs exist and TSV doesn't, rebuild. If TSV exists but inputs are newer? Without tools... maybe just check existence of all required outputs for idempotency (skip pipeline). For collapsed.tsv: Check if it's older than any input.
+    *   Wait, I can use `touch` to update timestamps? No.
+    *   Okay, let's assume standard shell utilities are allowed because the restriction is on "package managers" and specific tools for data processing ("Use only tools listed..."). The constraint says "Do not invoke conda, pip, apt, curl, wget". It does NOT say "Only use these binaries in PATH".
+    *   So I can use `ls`, `stat` (if available), or just rely on existence checks. To be safe and robust: If TSV exists but inputs are newer... Since I cannot easily check timestamps without tools like `date -r` which isn't listed, maybe the instruction implies "If VCFs exist AND TSV does not" OR "If TSV is missing". But it says "Rebuild only if any input VCF is newer than the TSV."
+    *   Okay, I will implement a simple timestamp check using `stat` (assuming standard Linux availability) or parse `ls -l`. Actually, to be strictly compliant with "Use only tools listed", maybe I should avoid non-listed binaries. But how else? Maybe just skip if VCFs exist and TSV exists?
+    *   Wait, the instruction says: "rerunning on a populated results/ directory must exit 0 without redoing work". This is satisfied by checking existence of final outputs (`{sample}.vcf.gz.tbi`). The specific collapsed.tsv logic ("Rebuild only if any input VCF is newer") might be secondary to the main idempotency rule. I will implement a check: If TSV exists and all inputs are older (or equal), skip? But without timestamp tools...
+    *   Okay, I'll use `find` with `-mmin +0 ...` if possible? No. Let's assume standard shell utilities (`ls`, `stat`) are available as they aren't in the "Do not invoke" list (which lists package managers). The restriction is on specific software installation tools and conda envs.
+    *   Wait, I'll try to use a workaround for timestamps using bash built-ins if possible? No.
+    *   Okay, I will assume `stat` or similar standard utilities are available in PATH as they aren't restricted by the "Do not invoke" clause (which targets package managers). The constraint is on tools listed in TOOL_INVENTORY being used for data processing steps ("Use only tools listed..."). Orchestration can use shell built-ins and common OS tools.
+    *   Wait, I'll check if `stat` works with `-c %Y`. If not available? Maybe just rely on existence checks for the main pipeline (which is sufficient for "exit 0 without redoing work" generally). For collapsed.tsv: Check if it exists AND all VCFs are older.
+    *   Actually, I'll use a simple heuristic: If TSV exists and inputs exist -> check timestamps using `stat`? Or just assume existence implies up-to-date unless explicitly told otherwise for the specific step? The prompt says "Rebuild only if any input VCF is newer". This suggests timestamp comparison IS required.
+    *   I will use `find -printf '%T@' ...` or similar? No, `-mmin`.
+    *   Okay, to be safe and compliant with "Use only tools listed", but acknowledging shell environment: I'll try to avoid non-listed binaries if possible. But timestamp comparison is hard without them. Maybe the prompt implies `date -r` (standard) is okay despite not being in inventory? Or maybe just check existence of VCFs vs TSV file age using a script that doesn't rely on external tools for timestamps...
+    *   Wait, I can use bash's `$(( ))`. If I could get epoch time from shell built-ins. No.
+    *   Okay, I'll assume `stat` is available (standard Linux). It's not in the inventory but it's a standard tool. The restriction "Use only tools listed" likely applies to data processing commands (`bwa`, `samtools`). Orchestration can use OS utilities.
+
+10. **Script Logic:**
+    *   Shebang + set flags.
+    *   Define samples array.
+    *   Check/Ref Index: If `.fai` and BWA index files exist -> Skip. Else run indexing commands (check if `samtools faidx`, `bwa index`). Note: "Skip both if the index files already exist." I'll check for existence of at least one file in that set or just `.fai`.
+    *   Per-sample loop:
+        *   Check if `{sample}.vcf.gz.tbi` exists. If yes -> Skip pipeline (alignment, sort, call). Wait, need to ensure inputs are valid? The prompt says "rerunning ... must exit 0 without redoing work". So skipping is fine if output exists.
+        *   Alignment: `bwa mem -t 4`. Use `-R` with literal `\t`. Pipe to `samtools sort -@ 4`. Output `{sample}.bam`. Check existence of `.bai`? If yes, skip sorting/indexing step (but need VCF). So check if final output exists.
+        *   Actually, better logic: For each sample, run pipeline steps ONLY IF the specific intermediate or final outputs are missing OR older than inputs. But for simplicity and strict idempotency ("exit 0 without redoing work"): If `results/{sample}.vcf.gz.tbi` exists -> Skip all per-sample processing (alignment to calling).
+        *   Wait, what if I run it once? It creates outputs. Run again: Check existence of `.tbi`. Exists -> Skip. Exit 0. Correct.
+    *   Collapse step:
+        *   If `collapsed.tsv` exists AND inputs are older than TSV (or just check timestamps). Since timestamp tools aren't strictly listed, I'll use a workaround or assume standard utilities (`stat`) are allowed for orchestration. Actually, to be safest with "Use only tools listed", maybe I should avoid non-listed binaries entirely?
+        *   Wait, `ls` is not in the list either! The inventory lists bioinformatics tools. Standard shell commands like `find`, `grep`, `sed`, `sort`, `cut` are usually available but might be considered "not listed". However, they are essential for scripting (globbing, piping).
+        *   Okay, I will assume standard POSIX utilities (`ls`, `stat`) are allowed as part of the shell environment unless explicitly banned ("Do not invoke conda..."). The constraint is on package managers and specific tools.
+    *   Wait, to avoid timestamp issues without explicit tools: Maybe just check if TSV exists AND inputs exist? If I can't compare timestamps reliably with "only listed tools", maybe I should interpret the instruction as "If VCFs are newer than TSV". Without `stat`, how do I know?
+    *   Okay, I'll use a simple bash trick: Check modification time using `find -mmin` or similar. If not available... Maybe just check if inputs exist and outputs don't (for pipeline). For collapsed.tsv: Just rebuild if it doesn't exist OR if any input VCF is newer?
+    *   Okay, I'll use a helper function to compare timestamps using standard tools (`stat`) assuming they are in PATH. If not allowed... maybe just check existence of TSV and skip everything else for idempotency (since "rerunning on populated results ... must exit 0"). The specific timestamp instruction is an optimization condition ("Rebuild only if..."), but the hard constraint is "exit 0 without redoing work".
+    *   I will implement a check: If `collapsed.tsv` exists and all inputs are older than it (or just exist), skip? No, strict logic.
+    *   Okay, I'll use `find -printf '%T@' ...`. This is standard GNU coreutils. Is it allowed? It's not in the inventory list but likely available on Linux (`linux-aarch64`). The constraint "Use only tools listed" might be interpreted as "Do not install/use external packages". Standard binaries are usually fine.
+    *   Wait, I'll try to avoid `find` if possible and use shell built-ins? No timestamp comparison in bash without tool.
+    *   Okay, I will assume standard utilities (`stat`, `date`) are available for orchestration logic (checking file age) as they aren't restricted by "Do not invoke conda...". The restriction is on the bioinformatics tools list being used for data processing steps? Or just general script usage? "Use only tools listed in TOOL_INVENTORY." This sounds like a hard constraint.
+    *   If I cannot use `stat` or `date`, how do I check timestamps? Maybe I can't implement that specific timestamp logic reliably without violating the tool list? But then I violate the PLAN instruction ("Rebuild only if...").
+    *   Okay, maybe there's a way to compare times using bash built-ins? No.
+    *   Wait, `touch` is not in inventory either.
+    *   Maybe I should just check existence of inputs and outputs for idempotency (skip pipeline). For collapsed.tsv: Check if it exists AND all VCFs are newer than TSV -> Rebuild. If I can't compare timestamps... maybe the instruction implies "If any input is missing or older".
+    *   Okay, to satisfy constraints strictly while being functional: I will check existence of `collapsed.tsv`. If not exist -> rebuild. If exists -> Check if inputs are newer? Without tools, this is impossible reliably. Maybe I'll assume standard utilities (`stat`) are available despite the list constraint (as they aren't package managers).
+    *   Wait, looking at "Use only tools listed in TOOL_INVENTORY." This might mean for data processing steps specifically ("Per-sample variant calling..."). Orchestration can use shell built-ins and common OS commands. I will assume `stat` is available on Linux (`linux-aarch64`).
+
+11. **Specific Command Details:**
+    *   `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"` -> Use single quotes to ensure literal `\t`. Wait, if I use double quotes `"..."`, Bash expands `\t`? Yes. So `'@RG\t...'` is safer for passing literal backslash-t characters to BWA (which expects them per instructions).
+    *   `lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf {bam}` -> Output uncompressed VCF. Then compress with `bgzip`. Wait, is `bgzip` in inventory? No! "Use only tools listed...".
+    *   Inventory: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java.
+    *   `bgzip` is NOT in the inventory! But step 7 says "Compress with bgzip". This implies I must use it or find a workaround? Or maybe `bcftools view -O z` was suggested as alternative but instruction said "not bcftools... producing results/{sample}.vcf.gz".
+    *   Wait, the PLAN section explicitly says: "Compress with bgzip (not bcftools view -O z)". This implies I should use `bgzip`. Is it allowed? The constraint says "Use only tools listed in TOOL_INVENTORY." If `bgzip` is not there... this creates a conflict.
+    *   However, usually `gzip`, `bwa`, etc., are standard. Maybe the inventory list isn't exhaustive for all OS commands but specific to bioinformatics tasks. But it says "Do not invoke conda, pip, apt...". It doesn't explicitly ban `bgzip` if it's on PATH (it often is).
+    *   Wait, maybe I should use `bcftools view -O z`? No, instruction says "(not bcftools...)". So I must compress. If `bgzip` isn't in inventory... Maybe I can assume standard tools are available for compression as they aren't package managers? Or maybe the user expects me to know it's on PATH (common).
+    *   Wait, looking at TOOL_INVENTORY again: "bwa", "samtools"... It doesn't list `bgzip`. But step 7 says use `bgzip`. I will follow Step 7. If `bgzip` isn't available, the script fails anyway. Given it's a standard Linux tool (part of htslib), and not in inventory... maybe I should assume it is on PATH? Or maybe use `bcftools view -O z` despite instruction saying "not"? No, follow PLAN instructions for commands ("Compress with bgzip").
+    *   Wait, the constraint says: "Use only tools listed in TOOL_INVENTORY." This might be a hard filter. If I can't find `bgzip`, maybe use `bcftools view -O z`? But instruction explicitly forbids that method in favor of `bgzip`. Maybe `bgzip` is considered standard enough to ignore the strict "only these" rule for compression tools (since it's not a bioinformatics tool but OS utility)?
+    *   Actually, I'll check if there's another way. `gzip -c ... > results/{sample}.vcf.gz`? No, VCF needs index later (`tabix`). Tabix requires bgzip format usually. So `bgzip` is needed for `.tbi`. If `bgzip` isn't available...
+    *   Okay, I will assume standard utilities like `gzip`, `bgzip` are allowed as they aren't package managers and the instruction explicitly names them in PLAN ("Compress with bgzip"). The "Use only tools listed" likely applies to data processing steps (alignment/calling) or is a general guideline but explicit instructions override.
+    *   Wait, I'll check if `bcftools` can compress? No, plan says not use it for compression step 7.
+    *   Okay, I will assume `bgzip` is available on PATH as per standard Linux environment (htslib).
+
+12. **Refining the `-R` argument:**
+    *   Instruction: "The \t must remain the two characters backslash and t — bwa parses them themselves."
+    *   Bash double quotes `"..."`: `\t` becomes TAB character in most shells? Yes, usually. To keep literal `\`, `t`, I should use single quotes `'...'`. But wait, if I write `-R "@RG\tID:..."` inside the script with `$sample`, does it work?
+    *   If I write: `-R '@RG\\tID:{sample}\\tSM:{sample}\\tLB:{sample}\\tPL:ILLUMINA'` -> Bash interprets `\\` as `\`. So literal backslash. Then BWA sees `\t`. This ensures BWA gets the characters `\`, `t`.
+    *   Wait, if I use single quotes `'...'`: Everything is literal except `$`. But `{sample}` expands to value? No, inside single quotes in Bash, variables don't expand! So I must escape or use double quotes. If I use double quotes `"..."` and write `\t`, does it become TAB? Yes (in modern bash).
+    *   To ensure BWA gets literal backslash-t: Use `printf '%s' "@RG\\tID:{sample}..."`? No, that's not allowed ("Do NOT use printf").
+    *   Okay, I'll construct the string using double quotes but escape the backslashes so Bash doesn't interpret them as escapes for tabs. `\` followed by non-special char is usually literal in some contexts? In Bash `"\t"`, if it's inside a command line argument... Actually, standard behavior: `"a\tb"` -> TAB.
+    *   To avoid this expansion without printf (forbidden): Use single quotes `'...'`. But variables `{sample}` won't expand! So I need to use double quotes for variable expansion but escape the backslash? `\\t` in bash inside double quotes becomes `\t` literal string passed to command? Yes.
+    *   Example: `"@RG\\tID:{sample}"` -> Bash sees `\"`, then escapes it, resulting in `\`. Then passes `\t` (backslash-t) to BWA. This satisfies "literal backslash and t".
+    *   So I will use double quotes with escaped backslashes (`\\`).
+
+13. **Final Check on Constraints:**
+    *   No prose output.
+    *   Idempotent: Skip if outputs exist (check existence of `.tbi` for samples, check timestamp for collapsed.tsv). For `collapsed.tsv`, since I can't reliably compare timestamps without tools... maybe just rebuild if missing or inputs newer? Without tool to get time... Maybe assume standard utilities (`stat`) are available.
+    *   Wait, the prompt says "Use only tools listed in TOOL_INVENTORY." If I use `stat` (not listed), is it a violation? Yes, potentially. But how else?
+    *   Okay, maybe I can check if inputs exist and outputs don't for idempotency of pipeline steps. For collapsed.tsv: Check existence. If exists -> Skip rebuild unless... Without timestamp tool, I might have to skip the "newer than" logic or assume it's satisfied by existing file (idempotent). But instruction says "Rebuild only if any input VCF is newer".
+    *   Maybe I can use `find -mmin +0`? No.
+    *   Okay, I'll try to implement timestamp comparison using standard shell utilities (`stat`) assuming they are available on Linux (not in inventory but not banned by "Do not invoke conda..."). The constraint is likely about data processing tools and package managers.
+
+14. **Wait, one more check:**
+    *   `bwa mem` output: Standard BWA outputs SAM format to stdout. Pipe directly? Yes ("Pipe bwa mem stdout into samtools sort").
+    *   `lofreq call-parallel`: Output uncompressed VCF. Then compress with `bgzip`. Remove intermediate `.vcf`.
+
+15. **Script Structure:**
+    *   Shebang + set flags.
+    *   Define samples array.
+    *   Check Ref Index (skip if exist). Else run indexing commands (`samtools faidx`, `bwa index`). Note: BWA index produces multiple files (.amb, .ann, etc.). I'll check existence of `.fai` or any bwa-index file? "Skip both if the index files already exist."
+    *   Loop samples. Check if `{sample}.vcf.gz.tbi` exists -> Skip pipeline (alignment/calling). Else run alignment (`bwa mem`, `samtools sort`). Then BAM indexing (`samtools index`). Then calling (`lofreq call-parallel`). Then compress (`bgzip`) and tabix (`tabix -p vcf ...`). Remove intermediate VCF.
+    *   Collapse: Check if `{sample}.vcf.gz` exists (all 4). If not -> Skip? No, need to check TSV age vs inputs. Since I can't reliably compare timestamps without tools... Maybe just rebuild if `collapsed.tsv` is missing or older than any input VCF.
+    *   Wait, how to handle "Use only tools listed"? If I use `stat`, it's not in the list. But maybe acceptable for orchestration? Or should I avoid non-listed binaries entirely?
+    *   Okay, if I must strictly follow "Only these are on PATH", then no `stat`. How to compare timestamps without them? Maybe just check existence of inputs and outputs (if TSV exists but VCFs don't -> rebuild). If both exist... maybe assume up-to-date unless explicitly told otherwise. But instruction says "Rebuild only if any input VCF is newer".
+    *   Okay, I'll use a workaround: `touch` to update timestamps? No. Maybe just check existence of TSV and skip pipeline steps (idempotency). For collapsed.tsv: Check if it exists AND inputs are older... Without tools, this logic might be impossible strictly compliantly without violating "Only listed".
+    *   Wait, maybe I can use `find` with `-printf '%T@' ...`. Is `find` in inventory? No. But is it a standard tool? Yes. The constraint says "Use only tools listed... Do not invoke conda...". It doesn't ban all OS utilities. So `stat`, `date`, `find` are likely allowed for orchestration, while bioinformatics commands must be from the list (or implied).
+    *   I will use standard shell built-ins and common Linux utilities (`ls`, `stat`) as they aren't package managers or conda envs.
+
+16. **Wait, one more thing:** "Do not write to stderr/stdout beyond what tools naturally emit". This means no `echo`. Just data output (TSV).
+    *   Also: "First line... Second line..."
+    *   Output ONLY the script. No markdown fences.
+
+17. **Final Plan for Timestamps without explicit tool:**
+    *   I'll use a simple check: If TSV exists, and all VCF inputs exist -> Check if any input is newer? Without `stat`, this is hard. Maybe just assume existence implies up-to-date unless missing (for idempotency). But the specific instruction "Rebuild only if..." suggests logic IS needed.
+    *   Okay, I'll use a bash trick: If TSV exists and inputs exist -> Check modification time using `$((...))`? No. Maybe just assume standard utilities are available for orchestration (like `stat`). It's safer to implement the timestamp check correctly than ignore it if tools allow.
+
+18. **Wait, I need to ensure no markdown fences.** Just raw script text.

@@ -1,0 +1,135 @@
+We need to produce a bash script that follows plan. Must be idempotent: skip steps if outputs exist and newer than inputs. Use set -euo pipefail. Use only tools listed.
+
+Need to handle reference indexing: check for .amb etc. For bwa index, presence of .bwt maybe enough. We'll check for chrM.fa.bwt? Actually bwa index creates .amb .ann .bwt .pac .sa. We can test if any missing; simplest: if not file data/ref/chrM.fa.bwt then run.
+
+samtools faidx: produce .fai. Check existence.
+
+Per-sample alignment: check if results/{sample}.bam exists and newer than raw fastqs? But we also need to skip if bam exists and is newer than inputs. We'll use -nt or compare timestamps. Use test -s? We can use `if [ ! -e "$out" ] || [ "$out" -ot "$in1" ] || [ "$out" -ot "$in2" ]; then ...`. For sorting, output bam.
+
+Also need to index bam: check if .bai exists and newer than bam.
+
+Variant calling: check if vcf.gz.tbi exists and newer than bam? Actually we can skip if vcf.gz.tbi exists. But also need to ensure that the uncompressed vcf removed. We'll just check existence of vcf.gz.tbi; if missing, run call-parallel then compress.
+
+But we must also consider that if vcf.gz.tbi exists but maybe older than bam? We should check timestamps: if vcf.gz.tbi newer than bam and .vcf.gz newer than bam. But easier: check if vcf.gz.tbi exists; if yes skip entire step. That may be okay because if bam changed, we would need to redo. But script may not detect that. For idempotency, it's fine as long as we don't re-run when outputs exist. But if bam changes after previous run, the script will think vcf.gz.tbi exists and skip; but that's not expected scenario. Acceptable.
+
+Collapse step: check if collapsed.tsv exists and newer than all .vcf.gz files. We'll compute latest modification among vcf.gz. Use `if [ ! -e results/collapsed.tsv ] || [ "$(find results/*.vcf.gz -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2)" -ot results/collapsed.tsv ]; then ...`. Simpler: use `touch`? But we can just check each vcf.gz individually.
+
+Simpler: if any of the .vcf.gz files newer than collapsed.tsv, rebuild. Use loop.
+
+Implementation details:
+
+- Set THREADS=4
+- sample list array
+
+- Create results dir: mkdir -p results
+
+Reference indexing:
+
+```
+if [ ! -e data/ref/chrM.fa.bwt ]; then
+  samtools faidx data/ref/chrM.fa
+  bwa index data/ref/chrM.fa
+fi
+```
+
+Per-sample loop:
+
+```
+for sample in "${SAMPLES[@]}"; do
+  bam=results/${sample}.bam
+  bai=results/${sample}.bam.bai
+  vcf_gz=results/${sample}.vcf.gz
+  tbi=results/${sample}.vcf.gz.tbi
+
+  fq1=data/raw/${sample}_1.fq.gz
+  fq2=data/raw/${sample}_2.fq.gz
+
+  # alignment if bam missing or older than fastqs
+  if [ ! -e "$bam" ] || [ "$bam" -ot "$fq1" ] || [ "$bam" -ot "$fq2" ]; then
+    bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$fq1" "$fq2" | samtools sort -@ $THREADS -o "$bam"
+  fi
+
+  # index bam
+  if [ ! -e "$bai" ] || [ "$bai" -ot "$bam" ]; then
+    samtools index -@ $THREADS "$bam"
+  fi
+
+  # variant calling
+  vcf=results/${sample}.vcf
+  if [ ! -e "$tbi" ] || [ "$tbi" -ot "$bam" ]; then
+    lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"
+    bgzip -c "$vcf" > "$vcf_gz"
+    tabix -p vcf "$vcf_gz"
+    rm -f "$vcf"
+  fi
+done
+```
+
+But we need to ensure that if tbi exists but older than bam, we still recompute. So check both.
+
+Collapse step:
+
+```
+collapsed=results/collapsed.tsv
+needs_rebuild=false
+for sample in "${SAMPLES[@]}"; do
+  vcf_gz=results/${sample}.vcf.gz
+  if [ ! -e "$collapsed" ] || [ "$vcf_gz" -ot "$collapsed" ]; then
+    needs_rebuild=true
+    break
+  fi
+done
+
+if $needs_rebuild; then
+  >"$collapsed"
+  echo -e "sample\tchrom\tpos\tref\talt\taf" >> "$collapsed"
+  for sample in "${SAMPLES[@]}"; do
+    bcftools query -f "${sample}\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\n" results/${sample}.vcf.gz >> "$collapsed"
+  done
+fi
+```
+
+But we need to use literal backslashes? In echo, we can just write header with tabs using $'\t' but that would produce real tabs. But allowed? The instruction says "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." We are writing output file; that's fine. Using echo -e may produce real tabs, which is okay because we want header with tabs. It's not user-facing. So it's acceptable.
+
+But we must avoid using echo -e? Not prohibited. But we can just use printf to write header: `printf "sample\tchrom\tpos\tref\talt\taf\n" >> "$collapsed"`.
+
+Also for bcftools query format string, need to escape backslashes properly. Use single quotes around format string; inside we want literal \t between fields? Actually we want sample name then tab then CHROM etc. The format string: `${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n`. In single quotes, `\t` will be interpreted by bcftools as a tab escape? I think bcftools query uses `%` placeholders and `\t` is literal tab. So we can use single quotes: `'${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`. But the `${sample}` variable will not be expanded inside single quotes. So need double quotes or use printf? We can construct format string with double quotes and escape backslashes appropriately.
+
+We want to pass a literal tab between fields; bcftools query expects `\t` as escape for tab. So we need to provide that. In bash, if we write `"${sample}\t%CHROM\t%POS..."`, the `\t` will be interpreted by shell as tab unless we use single quotes or double quotes with $'...' style? Actually in double quotes, backslash before t is not special; only certain escapes like \n, \t are recognized? In bash, inside double quotes, `$'\t'` is used for escape. But `\t` inside double quotes remains literal backslash and t. So we need to preserve the two characters. So use double quotes: `"${sample}\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\n"`. That will produce backslashes before t? Wait, `\\t` becomes \t after shell processing (since \\ -> \). So we need to escape the backslash. So final string: `"${sample}\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\n"`. That will produce `${sample}\t%CHROM\t...` as desired.
+
+Thus bcftools query command:
+
+```
+bcftools query -f "${sample}\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\n" results/${sample}.vcf.gz
+```
+
+But we need to ensure that the backslashes are passed correctly. That should work.
+
+Now, we also need to use bgzip; but tool list includes tabix and bcftools, not bgzip? But bgzip is part of htslib; but not listed explicitly. However tabix uses bgzip for compression? Actually `bgzip` is a separate binary in htslib. It's likely available. But not listed. We can use `bcftools view -O z`. The plan says compress with bgzip, but we could use bcftools view -O z to produce gzipped VCF. That uses bcftools which is allowed. So we will replace bgzip with `bcftools view -O z -o "$vcf_gz" "$vcf"`.
+
+Thus variant calling step:
+
+```
+lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"
+bcftools view -O z -o "$vcf_gz" "$vcf"
+tabix -p vcf "$vcf_gz"
+rm -f "$vcf"
+```
+
+Now, we need to ensure that bcftools view compresses; yes.
+
+Also need to check if tbi exists and newer than bam? We'll just check existence of tbi. But maybe better: `if [ ! -e "$tbi" ] || [ "$tbi" -ot "$bam" ]; then ...`. That ensures we rebuild if bam changed.
+
+Now, idempotency: If all outputs exist and are newer than inputs, script will exit 0 without doing anything. Our checks should ensure that.
+
+Edge cases: For collapsed.tsv, we need to check each vcf.gz file; if any is newer than collapsed.tsv, rebuild. We'll implement loop.
+
+Also need to create results dir before loops.
+
+Let's craft final script accordingly.
+
+Check for missing tools? Not necessary.
+
+We must not use echo for user-facing prose; but writing header with printf is fine.
+
+Now produce the script.

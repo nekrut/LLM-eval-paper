@@ -1,0 +1,127 @@
+We need to produce a bash script that follows constraints: first line #!/usr/bin/env bash; second set -euo pipefail.
+
+Need to be idempotent: if results/ already contains outputs for all samples and collapsed.tsv exists, exit 0 without redoing work or erroring. So we should check existence of each output file before processing sample. For reference indexing, need to index only once; but if index files exist (bwa indices .amb,.ann,.bwt,.pac,.sa) and samtools faidx .fai exists, skip.
+
+Also LoFreq call-parallel: produce results/{sample}.vcf then bgzip compress to .vcf.gz. We should check existence of .vcf.gz before calling; but need to ensure that if .vcf.gz exists but maybe .vcf missing? We'll just check .vcf.gz and .vcf.bai etc.
+
+Also collapsed.tsv: we can generate after all samples processed, but only if not exist or if any sample missing. We'll compute existence of collapsed.tsv and compare number of lines? Simpler: if collapsed.tsv exists, skip generating; else generate from scratch.
+
+We must use tools listed: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. We don't need all but we can ignore others.
+
+We cannot use bgzip? It's part of htslib; not listed explicitly but tabix is from htslib; but bgzip may be available as separate binary? Usually bgzip is part of htslib and installed with samtools. But it's not in TOOL_INVENTORY list. We can use bcftools view -O z to compress. So we should replace bgzip step with bcftools view -Oz -o results/{sample}.vcf.gz results/{sample}.vcf; then tabix index.
+
+Also need to ensure LoFreq call-parallel uses --pp-threads 4. Provide -f reference, -o output vcf. It will produce uncompressed VCF. Then compress.
+
+We also need to use samtools sort and index with -@ threads.
+
+Make sure we don't write to stdout except tool outputs; no echo for user-facing prose. But we may need to print header for collapsed.tsv? The plan uses printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv. That's fine, but prints nothing else. We should not use echo.
+
+We must ensure script is idempotent: if results/ exists and contains all outputs, exit 0. So at start we can check for each sample's .bam, .bai, .vcf.gz, .tbi; if all exist, skip processing that sample. Also reference indexing: if bwa index files exist, skip.
+
+Also collapsed.tsv: if exists, skip generating.
+
+But we also need to ensure script doesn't error when results/ missing or partially populated. So we should create results dir at start.
+
+Implementation:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+REF="data/ref/chrM.fa"
+mkdir -p results
+
+# Reference indexing
+if [ ! -f "${REF}.amb" ] || [ ! -f "${REF}.ann" ] || [ ! -f "${REF}.bwt" ] || [ ! -f "${REF}.pac" ] || [ ! -f "${REF}.sa" ]; then
+    bwa index "$REF"
+fi
+
+if [ ! -f "${REF}.fai" ]; then
+    samtools faidx "$REF"
+fi
+
+# Process each sample
+for sample in "${SAMPLES[@]}"; do
+    BAM="results/${sample}.bam"
+    BAI="results/${sample}.bam.bai"
+    VCF="results/${sample}.vcf"
+    VCFZ="results/${sample}.vcf.gz"
+    TBI="results/${sample}.vcf.gz.tbi"
+
+    # Skip if all outputs exist
+    if [ -f "$BAM" ] && [ -f "$BAI" ] && [ -f "$VCFZ" ] && [ -f "$TBI" ]; then
+        continue
+    fi
+
+    # Alignment and sorting
+    if [ ! -f "$BAM" ]; then
+        bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            "$REF" "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" |
+        samtools sort -@ "$THREADS" -o "$BAM" -
+    fi
+
+    # Index BAM
+    if [ ! -f "$BAI" ]; then
+        samtools index -@ "$THREADS" "$BAM"
+    fi
+
+    # Variant calling
+    if [ ! -f "$VCFZ" ] || [ ! -f "$TBI" ]; then
+        lofreq call-parallel --pp-threads "$THREADS" -f "$REF" -o "$VCF" "$BAM"
+        bcftools view -Oz -o "$VCFZ" "$VCF"
+        tabix -p vcf "$VCFZ"
+    fi
+
+done
+
+# Collapsed TSV
+COLLAPSED="results/collapsed.tsv"
+if [ ! -f "$COLLAPSED" ]; then
+    printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$COLLAPSED"
+    for sample in "${SAMPLES[@]}"; do
+        VCFZ="results/${sample}.vcf.gz"
+        if [ -f "$VCFZ" ]; then
+            bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$VCFZ" |
+                awk -v s="$sample" 'BEGIN{OFS="\t"}{print s,$0}' >> "$COLLAPSED"
+        fi
+    done
+fi
+
+exit 0
+
+Check for any missing tools: we used bcftools view, tabix. All in inventory.
+
+We didn't use SnpSift or snpEff; fine.
+
+We need to ensure no stray echo. We used printf only for header. That's okay.
+
+Also we must not write to stderr beyond tool outputs. Our script uses if statements and conditions but no echo. Should be fine.
+
+Edge: If BAM exists but BAI missing, we will index. Good.
+
+If VCFZ exists but TBI missing? We check both; if either missing, we re-run variant calling. But maybe VCFZ exists but not TBI due to previous run incomplete; re-running call-parallel may produce new VCF and compress again. That's fine.
+
+But we also need to ensure that if VCFZ exists but VCF does not? We don't check for VCF existence. In our logic, if VCFZ missing or TBI missing, we run lofreq call-parallel which will overwrite VCF (uncompressed). If VCFZ exists but VCF missing, we still run call-parallel and produce new VCF and compress; that's fine.
+
+But if VCFZ exists and TBI exists, we skip variant calling. Good.
+
+Also we need to ensure that if BAM exists but BAI missing, we index. Good.
+
+Now idempotent: If results/ already has all outputs for all samples and collapsed.tsv, script will exit 0 without redoing work. It will still run reference indexing check; if indices exist, skip. So fine.
+
+We must not use any absolute paths. We used relative paths only.
+
+Also we need to ensure that the script uses correct quoting of sample names with hyphens etc. In @RG header, we used \t separators. That's okay.
+
+Potential issue: The @RG line may need escaping; but using single quotes inside double quotes? We used -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA". That should be fine.
+
+Also ensure that the sample names with hyphen are accepted by BWA. Should be fine.
+
+Now check for missing tools: we didn't use bgzip; replaced with bcftools view -Oz.
+
+We also used tabix, which is in inventory.
+
+All good.
+
+Let's produce final script.

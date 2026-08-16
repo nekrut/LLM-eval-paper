@@ -1,0 +1,346 @@
+We need to produce a bash script that follows plan.
+
+Constraints: only tools listed in TOOL_INVENTORY. We have bgzip? Not listed. But bcftools can compress with -O z. However plan says use bgzip not bcftools view -O z. But bgzip is part of htslib, but not explicitly listed. But tabix is there; bgzip likely available as part of htslib too. We need to check if bgzip is in TOOL_INVENTORY: Not listed. Only tools: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. So cannot use bgzip. But we can compress with bcftools view -O z. The plan says not to but maybe we can still use bcftools view -O z because it's allowed tool. However the plan explicitly says "Compress with bgzip (not bcftools view -O z)". But if bgzip is not available, we might need to rely on bcftools view -O z. The instruction: Use only tools listed in TOOL_INVENTORY. So we cannot use bgzip. We must compress using bcftools view -O z.
+
+But the plan says "Compress with bgzip (not `bcftools view -O z`) producing `results/{sample}.vcf.gz`." That is contradictory to tool list. But maybe bgzip is part of tabix? Actually bgzip is separate binary in htslib; but not listed. However bcftools view -O z uses bgzip internally, so we can use that.
+
+Thus we will compress with `bcftools view -Oz -o results/{sample}.vcf.gz results/{sample}.vcf`. That will produce gzipped VCF and index with tabix.
+
+Ok.
+
+Also need to ensure idempotency: skip steps if outputs exist and are newer than inputs. We can use `if [[ ! -s ... ]]` or check timestamps. Simpler: use `touch`? But we can just test existence of final output file; but some intermediate may be missing. For each step, we can guard with `[ ! -f results/${sample}.bam ]` etc.
+
+But need to ensure that if outputs exist but inputs older, we still re-run. The requirement: "skip if `results/{sample}.vcf.gz.tbi` already exists and is newer than its inputs". So we need to check timestamps relative to inputs. We can use `if [[ ! -f results/${sample}.bam.bai || $(stat -c %Y results/${sample}.bam) -gt $(stat -c %Y data/raw/${sample}_1.fq.gz) ]]` etc.
+
+Simpler: Use `touch`? But we need to re-run if inputs newer. So we can use `if [[ ! -f ... || $(find ...) -nt ... ]]; then ... fi`. We can compute newest input timestamp and compare with output.
+
+We have four samples; each step per sample.
+
+Also reference indexing: skip if index files exist. For bwa, need .amb .ann .bwt .pac .sa. We can check for one of them e.g., `data/ref/chrM.fa.bwt`. If exists, assume indexed.
+
+For samtools faidx, check `.fai`.
+
+Ok.
+
+Also we need to create results directory if missing.
+
+Also final collapsed.tsv: need to rebuild only if any input VCF is newer than TSV. So compute newest timestamp among all sample vcf.gz files and compare with collapsed.tsv.
+
+Implementation details:
+
+- Use `set -euo pipefail` as second line.
+
+- Define THREADS=4, SAMPLE_LIST="M117-bl M117-ch M117C1-bl M117C1-ch".
+
+- For each sample: define variables.
+
+- For read group string: need to pass literal backslash-t. In bash, we can use single quotes around the whole argument and escape backslashes? Actually we need to produce a string that contains literal characters \t. BWA expects the string with actual tab characters? Wait the plan says "The `\t` must remain the two characters backslash and `t` — bwa parses them itself." So we need to pass the string containing backslash-t, not an actual tab.
+
+Thus we can use single quotes: '-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"'. But inside single quotes, backslashes are literal. We need double backslashes? Actually to produce \t in the string, we just write `\t` inside single quotes; it will be passed as two characters. So we can use:
+
+```
+RG="@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"
+bwa mem -R "$RG" ...
+```
+
+But the plan says "exact form: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`". So we need to produce that string exactly. In bash, we can use single quotes around the whole argument and escape backslashes? Wait inside single quotes, backslash is literal; so `\t` will be two characters \ and t. Good.
+
+Thus:
+
+```
+RG='@RG\tID:'$sample'\tSM:'$sample'\tLB:'$sample'\tPL:ILLUMINA'
+bwa mem -R "$RG" ...
+```
+
+But we need to ensure the quotes produce correct string. Use single quotes around each part and concatenate with variable.
+
+Simpler: use printf? But plan says do not use printf or echo -e etc. So we can just construct string as above.
+
+Ok.
+
+Now implement per-sample steps:
+
+- Alignment: if results/${sample}.bam does not exist, run bwa mem ... | samtools sort -@ $THREADS -o results/${sample}.bam
+
+- Index: if results/${sample}.bam.bai missing or older than bam, run samtools index -@ $THREADS results/${sample}.bam
+
+- Variant calling: if results/${sample}.vcf.gz.tbi missing or older than bam, run lofreq call-parallel ... produce .vcf then compress.
+
+But we need to check for existence of .vcf.gz and .tbi. We can skip entire step if both exist and newer than inputs. But easier: if .vcf.gz.tbi exists and is newer than bam, skip. else do steps.
+
+- For compression: use bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf
+
+- Then tabix index.
+
+- Remove intermediate .vcf file.
+
+Now collapsed.tsv:
+
+If results/collapsed.tsv missing or older than any sample vcf.gz, rebuild.
+
+Implementation of timestamp comparison: Use `find` to get newest input. For each sample, we can compute `stat -c %Y`. But easier: use `touch`? Not good.
+
+We can compute latest input timestamp among all sample vcf.gz:
+
+```
+latest_input=0
+for s in $SAMPLE_LIST; do
+  ts=$(stat -c %Y results/${s}.vcf.gz)
+  if (( ts > latest_input )); then latest_input=$ts; fi
+done
+```
+
+Then compare with collapsed.tsv timestamp.
+
+If collapsed.tsv missing or its timestamp < latest_input, rebuild.
+
+Ok.
+
+Now we need to ensure script is idempotent: If all outputs exist and newer than inputs, script exits without doing anything. Our script will run loops but skip steps due to conditions; no output beyond tool logs.
+
+Also we must not write to stderr/stdout beyond what tools naturally emit. So avoid echo statements. But we may need to print nothing. Just rely on commands.
+
+But we might use `printf` for internal string building? That prints to stdout, which is disallowed. We should avoid printing anything. Use variable assignments only.
+
+Thus no echo or printf that outputs to console.
+
+Ok.
+
+Now implement.
+
+Edge: The script must be self-contained; no external files.
+
+Let's craft the script:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"
+
+# Ensure results directory exists
+mkdir -p results
+
+# Reference indexing
+REF=data/ref/chrM.fa
+if [[ ! -f ${REF}.fai ]]; then
+  samtools faidx "$REF"
+fi
+if [[ ! -f ${REF}.bwt ]]; then
+  bwa index "$REF"
+fi
+
+for sample in $SAMPLES; do
+  # Input FASTQ files
+  fq1=data/raw/${sample}_1.fq.gz
+  fq2=data/raw/${sample}_2.fq.gz
+  bam=results/${sample}.bam
+  bai=results/${sample}.bam.bai
+  vcf=results/${sample}.vcf
+  vcfz=results/${sample}.vcf.gz
+  tbiz=results/${sample}.vcf.gz.tbi
+
+  # Alignment and sorting
+  if [[ ! -f "$bam" || $(stat -c %Y "$fq1") -gt $(stat -c %Y "$bam") || $(stat -c %Y "$fq2") -gt $(stat -c %Y "$bam") ]]; then
+    RG='@RG\tID:'$sample'\tSM:'$sample'\tLB:'$sample'\tPL:ILLUMINA'
+    bwa mem -t $THREADS -R "$RG" "$REF" "$fq1" "$fq2" | samtools sort -@ $THREADS -o "$bam"
+  fi
+
+  # BAM indexing
+  if [[ ! -f "$bai" || $(stat -c %Y "$bam") -gt $(stat -c %Y "$bai") ]]; then
+    samtools index -@ $THREADS "$bam"
+  fi
+
+  # Variant calling
+  if [[ ! -f "$tbiz" || $(stat -c %Y "$bam") -gt $(stat -c %Y "$tbiz") ]]; then
+    lofreq call-parallel --pp-threads $THREADS -f "$REF" -o "$vcf" "$bam"
+    bcftools view -Oz -o "$vcfz" "$vcf"
+    tabix -p vcf "$vcfz"
+    rm -f "$vcf"
+  fi
+done
+
+# Collapse VCFs into TSV
+collapsed=results/collapsed.tsv
+rebuild=false
+if [[ ! -f "$collapsed" ]]; then
+  rebuild=true
+else
+  for sample in $SAMPLES; do
+    vcfz=results/${sample}.vcf.gz
+    if [[ $(stat -c %Y "$vcfz") -gt $(stat -c %Y "$collapsed") ]]; then
+      rebuild=true
+      break
+    fi
+  done
+fi
+
+if $rebuild; then
+  {
+    printf "sample\tchrom\tpos\tref\talt\taf\n"
+    for sample in $SAMPLES; do
+      vcfz=results/${sample}.vcf.gz
+      bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$vcfz"
+    done
+  } > "$collapsed"
+fi
+
+exit 0
+```
+
+But we used printf to output header. That prints to stdout; but it's part of script's output. The requirement: "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." Using printf to produce the collapsed.tsv file is acceptable because it writes to a file, not to console. But we used `printf` inside braces and redirect to file. That prints to stdout but redirected to file. So no output to console. That's fine.
+
+But we also used `printf` earlier for header; that's okay.
+
+We need to ensure that the script uses only tools listed: samtools, bwa, lofreq, bcftools, tabix. We used them.
+
+Also we used `stat -c %Y`. stat is part of coreutils, allowed? Not in TOOL_INVENTORY but it's a standard tool; not disallowed. The constraints mention "Use only tools listed in TOOL_INVENTORY" but that might refer to external bioinformatics tools. Using core utilities like stat should be fine.
+
+But we used `stat -c %Y`. On some systems, `stat` may use different syntax. But it's typical on Linux. Could also use `touch -d @$(date +%s)`? Not needed.
+
+Alternatively, we can avoid using stat by using `find -newer`. But easier to keep.
+
+But we used `[[ ! -f "$bam" || $(stat -c %Y "$fq1") -gt $(stat -c %Y "$bam") ... ]]`. That may produce errors if file missing. But we check existence of bam first; but if bam doesn't exist, the stat on bam will fail. We guard with `||` short-circuit: if ! -f "$bam" then left side true and right side not evaluated? In bash, `[[ condition1 || condition2 ]]`, both conditions are evaluated? Actually in [[ ... ]], each expression is evaluated; but due to short-circuit semantics of `||`, the second part may still be evaluated? I think within [[ .. ]], it's a single test expression; the shell will evaluate each side separately. But if left side true, right side might still be evaluated? I'm not sure. Safer: use separate if statements.
+
+Simpler: we can skip timestamp check for alignment and just run if bam missing. That may re-run unnecessarily but acceptable within time limit. But requirement says idempotent; skipping only when outputs newer than inputs is ideal but not mandatory maybe. But to be safe, we can keep simple existence checks only. The plan emphasises "skip if ... already exists and is newer". But we might ignore timestamp check for alignment and just skip if bam exists. That would still satisfy idempotency: if bam exists, we don't re-run even if inputs changed; but that may lead to stale results if raw data updated. But not required by spec.
+
+But the plan says "skip if ... already exists and is newer than its inputs". So we should implement timestamp check for each step. Let's keep as earlier but adjust logic to avoid stat on missing file.
+
+We can compute input timestamps only if bam exists; else skip check. Use separate conditions:
+
+```
+if [[ ! -f "$bam" ]]; then
+  # run alignment
+else
+  # check if any fq newer than bam
+  if [[ $(stat -c %Y "$fq1") -gt $(stat -c %Y "$bam") || $(stat -c %Y "$fq2") -gt $(stat -c %Y "$bam") ]]; then
+    # re-run alignment
+  fi
+fi
+```
+
+But we need to run alignment only if bam missing or inputs newer. So combine:
+
+```
+if [[ ! -f "$bam" || $(stat -c %Y "$fq1") -gt $(stat -c %Y "$bam") || $(stat -c %Y "$fq2") -gt $(stat -c %Y "$bam") ]]; then
+  ...
+fi
+```
+
+But if bam missing, the `$(stat -c %Y "$bam")` will error. So we need to guard.
+
+Thus use:
+
+```
+needs_align=false
+if [[ ! -f "$bam" ]]; then needs_align=true; fi
+if [[ -f "$bam" && ( $(stat -c %Y "$fq1") -gt $(stat -c %Y "$bam") || $(stat -c %Y "$fq2") -gt $(stat -c %Y "$bam") ) ]]; then needs_align=true; fi
+if $needs_align; then ... fi
+```
+
+But we can use `[[ ! -f "$bam" ]] && needs_align=true` etc.
+
+Simpler: Use function to compare timestamps:
+
+```
+is_newer() { [[ $(stat -c %Y "$1") -gt $(stat -c %Y "$2") ]]; }
+```
+
+But again if file missing, stat fails. So we need to check existence first.
+
+Ok.
+
+Let's implement per sample:
+
+```
+needs_align=false
+if [[ ! -f "$bam" ]]; then needs_align=true; fi
+if [[ -f "$bam" && ( $(stat -c %Y "$fq1") -gt $(stat -c %Y "$bam") || $(stat -c %Y "$fq2") -gt $(stat -c %Y "$bam") ) ]]; then needs_align=true; fi
+if $needs_align; then ... fi
+```
+
+But we need to use `||` inside [[ .. ]]? We can use separate if:
+
+```
+if [[ ! -f "$bam" || ( -f "$bam" && ( $(stat -c %Y "$fq1") -gt $(stat -c %Y "$bam") || $(stat -c %Y "$fq2") -gt $(stat -c %Y "$bam") ) ) ]]; then
+  ...
+fi
+```
+
+But again `$(stat ...)` inside [[ .. ]] may error if file missing. But we guard with -f.
+
+Let's implement as:
+
+```
+needs_align=false
+if [[ ! -f "$bam" ]]; then needs_align=true; fi
+if [[ -f "$bam" ]]; then
+  if [[ $(stat -c %Y "$fq1") -gt $(stat -c %Y "$bam") || $(stat -c %Y "$fq2") -gt $(stat -c %Y "$bam") ]]; then
+    needs_align=true
+  fi
+fi
+if $needs_align; then
+  ...
+fi
+```
+
+Similarly for indexing and variant calling.
+
+But we can simplify: For each step, just check if output exists. If not, run. That ensures idempotency but may re-run unnecessarily if inputs updated. But spec says "skip if ... already exists and is newer than its inputs". So we should implement timestamp checks.
+
+Ok.
+
+Let's write functions:
+
+```
+is_newer() {
+  local new=$1
+  local old=$2
+  [[ -f "$new" && -f "$old" && $(stat -c %Y "$new") -gt $(stat -c %Y "$old") ]]
+}
+```
+
+But we need to check if new file exists; else return false.
+
+We can use:
+
+```
+needs_rebuild() {
+  local out=$1
+  shift
+  for inp in "$@"; do
+    if [[ ! -f "$out" ]]; then
+      echo true
+      return
+    fi
+    if [[ $(stat -c %Y "$inp") -gt $(stat -c %Y "$out") ]]; then
+      echo true
+      return
+    fi
+  done
+  echo false
+}
+```
+
+But we can just use inline logic.
+
+Ok.
+
+Let's craft script with careful timestamp checks but not too complex.
+
+Also need to ensure that `bcftools query` output uses `%INFO/AF`. The VCF may have AF field; if missing, will produce empty. That's fine.
+
+Now final script:
+
+We must avoid any echo or printf to console. But we used printf inside braces redirecting to file; that's okay.
+
+But we also used `printf` for header line; it's part of output to file.
+
+Ok.
+
+Let's produce final script accordingly.
+
+Check for missing dependencies: bcftools, tabix, samtools, bwa, lofreq. All present.
+
+Now produce final answer.

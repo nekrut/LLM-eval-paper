@@ -1,0 +1,156 @@
+We need to produce final bash script with shebang line "#!/usr/bin/env bash" (note typo? Usually "#!/usr/bin/env bash". But they wrote exactly that). Second line set -euo pipefail.
+
+Script must be self-contained, no extra output. Must follow plan.
+
+Need to ensure quoting correct: use double quotes for paths; inside -R string need literal \t not actual tab. Use $'\t'? That's a real tab character, which is bad because they said do NOT use printf, echo -e, $'\t', or a real tab. So we must embed the two characters backslash t as part of double-quoted string: "-R \"@RG\\tID:{sample}\\tSM:{sample}\\tLB:{sample}\\tPL:ILLUMINA\""? Wait they said use literal two characters \t inside double-quoted string. That means we write "\t" as characters backslash and t, not a tab. So the -R value is "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA". In shell, that's fine.
+
+But they said do NOT use $'\t' or real tab. So we must write "\t" as literal characters inside double quotes. That's okay.
+
+Thus the bwa mem command:
+
+bwa mem -t 4 -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/{sample}_1.ff.gz? Wait file names: M117-bl_1. fq. gz etc.
+
+So use data/raw/{sample}_1.fq.gz and _2.fq.gz.
+
+Thus pipeline:
+
+{ bwa mem -t 4 -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/{sample}_1.fq.gz data/raw/{sample}_2.fq.gz | samtools sort -@ 4 -o results/${sample}.bam; }
+
+Guard: [[ -f results/${sample}.bam ]] || { ... pipeline ; }
+
+But need to wrap whole pipeline in braces for guard.
+
+Now step 5 lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam
+
+Guard: [[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] || { lofreq ... }
+
+Step 6 bgzip and tabix.
+
+Combined guard: [[ -f results/${sample}.vcf.gz.tbi ]] || { bgzip -f results/${sample}.vcf && tabix -p vcf results/${sample}.vcf.gz; }
+
+But note that after bgzip, .vcf is deleted. So we need to check both.
+
+Step 7 collapsed tsv: always overwrite header > and then append per sample using bcftools query.
+
+Header: printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+
+Then for each sample:
+
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+
+But note that $0 already contains tab separated fields, so printing s,$0 with OFS "\t" will produce sample<tab>chrom<tab>pos<tab>ref<tab>alt<tab>af? Actually $0 is "chrom\tpos\tref\talt\taf". So after adding sample at front with OFS "\t", we get sample<tab>chrom<tab>pos<tab>ref<tab>alt<tab>af. Good.
+
+Now script must be idempotent: step 7 overwrites header each run, then appends per sample again (so duplicates? but that's fine). The guard for steps 1-6 ensures they are skipped if output exists.
+
+Potential issue: lofreq call may produce .vcf.gz and .vcf.gz.tbi; the guard checks both. Good.
+
+Now script must not write to stderr/stdout beyond tools natural emission. So we should avoid echo. Use only commands.
+
+But we need to create results directory: mkdir -p results
+
+Now final script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+bwa index data/ref/chrM.fa 2>/dev/null || true   # but guard later? Actually step 1 guard is not needed because we always run bwa index; but idempotent: if .bwt exists, skip? The plan says guard around each step's final output. For indexing, sentinel could be .bwt or .ann etc. But they said "Idempotency guard: [[ -f data/ref/chrM.fa.bwt ]] || bwa index ...". So we need to implement that.
+
+Thus:
+
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+
+Similarly for samtools faidx: [[ -f data/ref/chrM.fa.fai ]] || samtools faidx ...
+
+But those steps are not guarded in script? The plan says "Idempotency guard: [[ -f data/ref/chrM.fa.bwt ]] || bwa index ...". So we must include that.
+
+Thus:
+
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+
+Similarly for samtools faidx.
+
+Now script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+# Step 1: BWA index
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+
+# Step 2: samtools faidx
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+# Step 3: alignment+sort per sample
+for sample in "${SAMPLES[@]}"; do
+    [[ -f results/${sample}.bam ]] || { bwa mem -t $THREADS -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/{sample}_1.fq.gz data/raw/{sample}_2.fq.gz | samtools sort -@ $THREADS -o results/${sample}.bam; }
+done
+
+# Step 4: BAM index
+for sample in "${SAMPLES[@]}"; do
+    [[ -f results/${sample}.bam.bai ]] || samtools index -@ $THREADS results/${sample}.bam
+done
+
+# Step 5: LoFreq call-parallel
+for sample in "${SAMPLES[@]}"; do
+    [[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] || lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+done
+
+# Step 6: VCF compression + tabix index
+for sample in "${SAMPLES[@]}"; do
+    [[ -f results/${sample}.vcf.gz.tbi ]] || { bgzip -f results/${sample}.vcf && tabix -p vcf results/${sample}.vcf.gz; }
+done
+
+# Step 7: Collapsed TSV (always rebuild)
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+
+Now ensure no stray echo. The script uses only commands.
+
+But note that the first line is "#!usr/...", but they wrote "#!/usr/bin/env bash". That's weird: missing slash? Actually "#!usr/bin/env bash" correct. They said first line must be: #!/usr/bin/env bash (note double slash?). Might be a typo; we should output exactly as requested: "#!/usr/bin/env bash". So script starts with that.
+
+Thus final script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+for sample in "${SAMPLES[@]}"; do
+    [[ -f results/${sample}.bam ]] || { bwa mem -t $THREADS -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/{sample}_1.fq.gz data/raw/{sample}_2.fq.gz | samtools sort -@ $THREADS -o results/${sample}.bam; }
+done
+
+for sample in "${SAMPLES[@]}"; do
+    [[ -f results/${sample}.bam.bai ]] || samtools index -@ $THREADS results/${sample}.bam
+done
+
+for sample in "${SAMPLES[@]}"; do
+    [[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] || lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+done
+
+for sample in "${SAMPLES[@]}"; do
+    [[ -f results/${sample}.vcf.gz.tbi ]] || { bgzip -f results/${sample}.vcf && tabix -p vcf results/${sample}.vcf.gz; }
+done
+
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+
+Check for any extra output: The script writes to stdout only via commands; no echo.
+
+Now produce final answer with just the script lines.

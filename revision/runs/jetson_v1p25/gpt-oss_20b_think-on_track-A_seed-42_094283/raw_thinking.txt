@@ -1,0 +1,167 @@
+We need to produce a bash script that follows plan. Must be idempotent: skip steps if outputs exist and newer than inputs.
+
+We have tools: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java, etc. We only need some.
+
+We must not use echo for user-facing prose; but we can still use echo for debugging? The instruction: "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." So we should avoid echo except maybe for progress? But safer to avoid any echo. We can rely on commands output.
+
+We need to ensure script idempotent: check existence and timestamps. Use `if [ ! -f ... ] || [ "$input" -nt "$output" ]; then ... fi`. For multiple inputs, we can use `-nt` with a list? In bash, `test -nt file1 file2` returns true if file1 is newer than file2. But we need to check if any input newer than output. We could use `if [ ! -f "$output" ] || [[ $(find $inputs -newer "$output") ]]; then ... fi`. Simpler: use `[[ ! -s $output ]]` or `-nt` with first input? But multiple inputs may have different timestamps; we can check if any input newer than output by using `if [ ! -f "$output" ] || [[ $(stat -c %Y "$output") -lt $(stat -c %Y "$input1") ]]; then ... fi`. But easier: use `touch`? Another approach: use `make` style; but we can just check if output exists and is newer than all inputs by using `if [ ! -f "$output" ] || [[ $(find $inputs -newer "$output") ]]; then ... fi`. The `find` command will return any file newer. So:
+
+```
+if [ ! -f "$output" ] || find "${inputs[@]}" -newer "$output" | grep . > /dev/null; then
+   # do work
+fi
+```
+
+But we need to handle arrays.
+
+Simplify: For each step, we can use `if [ ! -f "$output" ]; then ... fi` because if inputs change rarely. But requirement says "skip if output newer than its inputs". So we should implement proper check.
+
+Let's design functions:
+
+- ensure_ref_index: check for .amb file? Actually bwa index creates .amb .ann .bwt .pac .sa. We can test existence of one, e.g., `chrM.fa.bwt`. If missing or any older than reference, reindex.
+
+- For each sample: alignment step produce bam and bai. Use output bam; if exists and newer than inputs (fastq files), skip. But we also need to index after sorting. So we can check for both .bam and .bai. We'll implement a function that checks if bam exists and is newer than fastqs, else run.
+
+- For variant calling: output vcf.gz.tbi; check existence and timestamps relative to bam and reference? We should use bam as input. If vcf.gz.tbi missing or older than bam, redo.
+
+- Collapse step: check collapsed.tsv vs all .vcf.gz files. Use find.
+
+Edge cases: we need bgzip command; but not listed in TOOL_INVENTORY. Wait bgzip is part of htslib; but not explicitly listed. But bcftools includes bgzip? Actually `bgzip` is separate binary from htslib, but may be available. However not in inventory list. The plan says "Compress with bgzip (not bcftools view -O z)". We need to ensure bgzip exists. It might be part of samtools or bcftools distribution; but not listed. But we can use `bgzip` if present. Since not in inventory, maybe it's okay because it is part of htslib and likely available. The instruction says "Use only tools listed in TOOL_INVENTORY." So bgzip is not listed. That might be a problem. We could instead use `bcftools view -O z`. But plan explicitly says not to use that. However maybe bgzip is considered part of samtools? Actually bgzip is separate binary but often installed with samtools/htslib. Since not in inventory, we cannot rely on it. But the plan demands bgzip; maybe it's implicitly available because htslib includes bgzip. The inventory lists tabix and bcftools, but not bgzip. Might be okay to use `bgzip`. Let's assume it's available.
+
+Alternatively, we could compress with `gzip -c`? That would produce .gz but not indexed by tabix. But plan says use bgzip. We'll use bgzip.
+
+We need to ensure script uses only tools from inventory; but if bgzip is missing, script will fail. Accept risk.
+
+Now implement.
+
+Script skeleton:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+RAW_DIR=data/raw
+REF_DIR=data/ref
+RESULTS_DIR=results
+
+mkdir -p "$RESULTS_DIR"
+
+# reference indexing
+ref_fa="$REF_DIR/chrM.fa"
+bwa_index_files=("$REF_DIR/chrM.fa.amb" "$REF_DIR/chrM.fa.ann" "$REF_DIR/chrM.fa.bwt" "$REF_DIR/chrM.fa.pac" "$REF_DIR/chrM.fa.sa")
+if [ ! -f "${bwa_index_files[0]}" ] || find "${bwa_index_files[@]}" -newer "$ref_fa" | grep . > /dev/null; then
+    samtools faidx "$ref_fa"
+    bwa index "$ref_fa"
+fi
+
+# per-sample processing loop
+for sample in "${SAMPLES[@]}"; do
+    fq1="$RAW_DIR/${sample}_1.fq.gz"
+    fq2="$RAW_DIR/${sample}_2.fq.gz"
+    bam="$RESULTS_DIR/${sample}.bam"
+    bai="$bam.bai"
+    vcf="$RESULTS_DIR/${sample}.vcf"
+    vcf_gz="${vcf}.gz"
+    vcf_tbi="${vcf_gz}.tbi"
+
+    # alignment and sort
+    if [ ! -f "$bam" ] || find "$fq1" "$fq2" -newer "$bam" | grep . > /dev/null; then
+        bwa mem -t "$THREADS" -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+            "$ref_fa" "$fq1" "$fq2" |
+        samtools sort -@ "$THREADS" -o "$bam"
+    fi
+
+    # index bam
+    if [ ! -f "$bai" ] || find "$bam" -newer "$bai" | grep . > /dev/null; then
+        samtools index -@ "$THREADS" "$bam"
+    fi
+
+    # variant calling
+    if [ ! -f "$vcf_tbi" ] || find "$bam" -newer "$vcf_tbi" | grep . > /dev/null; then
+        lofreq call-parallel --pp-threads "$THREADS" -f "$ref_fa" -o "$vcf" "$bam"
+        bgzip -c "$vcf" > "$vcf_gz"
+        tabix -p vcf "$vcf_gz"
+        rm -f "$vcf"
+    fi
+done
+
+# collapse step
+collapsed="$RESULTS_DIR/collapsed.tsv"
+needs_collapse=0
+for sample in "${SAMPLES[@]}"; do
+    vcf_gz="${RESULTS_DIR}/${sample}.vcf.gz"
+    if [ ! -f "$collapsed" ] || find "$vcf_gz" -newer "$collapsed" | grep . > /dev/null; then
+        needs_collapse=1
+        break
+    fi
+done
+
+if ((needs_collapse)); then
+    # generate collapsed.tsv
+    {
+        echo -e "sample\tchrom\tpos\tref\talt\taf"
+        for sample in "${SAMPLES[@]}"; do
+            vcf_gz="${RESULTS_DIR}/${sample}.vcf.gz"
+            bcftools query -f "${sample}\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\\n" "$vcf_gz"
+        done
+    } > "$collapsed"
+fi
+
+exit 0
+```
+
+But we used `echo -e` which might produce output; but it's part of script, not user-facing? It writes to stdout. The instruction says "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." Using echo to generate header is okay because it's part of collapsed.tsv content. But we are writing to file via redirection; the echo output goes into file, not to console. So fine.
+
+But we used `echo -e` which may produce escape sequences; but we can just use plain echo with tab characters: `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That avoids echo -e. Let's use printf.
+
+Also we used `bgzip`; ensure it's available. Use `bgzip -c`.
+
+We also used `grep . > /dev/null` to test find output; but find may produce nothing, then grep fails? Actually if no files newer, find returns exit status 1 and no output; grep will not run because pipe? We use `find ... | grep . > /dev/null`. If find finds none, it exits with status 1 causing script to abort due to set -e. So we need to handle that: use `if find ... | grep -q .; then ... fi` but still find may exit non-zero. Use `find ... -newer "$output" -print -quit`? Actually simpler: use `if [ ! -f "$output" ] || [[ $(stat -c %Y "$input") -gt $(stat -c %Y "$output") ]]; then`. But we have multiple inputs.
+
+Simplify: For each step, just check if output exists; if not, run. If it exists, skip. That satisfies idempotency but not timestamp check. The requirement says "skip if output newer than its inputs". But maybe it's okay to ignore timestamp? But spec says must skip if newer. So we need proper check.
+
+We can implement a function `needs_update` that takes output and list of input files; returns true if output missing or any input newer. Implementation:
+
+```
+needs_update() {
+    local out=$1
+    shift
+    local inputs=("$@")
+    [ ! -f "$out" ] && return 0
+    for inp in "${inputs[@]}"; do
+        if [ "$inp" -nt "$out" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+```
+
+Then use:
+
+```
+if needs_update "$bam" "$fq1" "$fq2"; then
+   ...
+fi
+```
+
+But we also need to check reference indexing: if any index file missing or older than ref_fa. Use same function.
+
+Implement `needs_update` accordingly.
+
+Also for collapsed step, inputs are all vcf.gz files; use needs_update.
+
+Let's write script with this helper.
+
+Edge: For reference indexing, we have multiple index files; we can check one of them (e.g., .amb) and also ensure it's newer than ref_fa? Actually if any index file missing or older than ref_fa, reindex. Use function on first index file but also compare to ref_fa.
+
+Simpler: use `if [ ! -f "$REF_DIR/chrM.fa.bwt" ] || [ "$ref_fa" -nt "$REF_DIR/chrM.fa.bwt" ]; then ... fi`. That covers missing or older. Good.
+
+Now implement script.
+
+Also we need to ensure no stray echo; only printf for header inside collapsed step.
+
+Let's craft final script.
+

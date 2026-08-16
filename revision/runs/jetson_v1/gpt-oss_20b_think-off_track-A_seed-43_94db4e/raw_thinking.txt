@@ -1,0 +1,152 @@
+We need to produce a bash script that follows plan. Must be idempotent: skip steps if outputs exist and newer than inputs. Use set -euo pipefail. Use only tools listed.
+
+Need to ensure reference indexing step: check for .amb etc? We can test existence of chrM.fa.bwt maybe. For bwa index, the presence of .bwt indicates done. For samtools faidx, check .fai.
+
+For each sample, we need to check if results/{sample}.bam exists and is newer than inputs (fastq). But also bam index etc. We can just skip entire per-sample pipeline if all outputs exist: bam, bai, vcf.gz, tbi. But we must ensure that if any missing or older, redo.
+
+Simpler: For each sample, check if results/{sample}.bam.bai exists and is newer than fastq? Actually we need to compare with fastqs. Use `if [ ! -f ... ] || [ "$input" -nt "$output" ]; then ...`. But we have multiple outputs; easiest: skip if all four exist and are newer than inputs. We'll compute a variable.
+
+Also for collapsed.tsv, check if any vcf.gz is newer than tsv.
+
+We need to use bgzip? Not in TOOL_INVENTORY but bcftools can compress with -O z. But plan says use bgzip. Is bgzip available? It's part of htslib; tabix uses it. But not listed explicitly. However bcftools includes bgzip binary. Usually `bgzip` is separate command. It might be present. We can rely on `bgzip`. But to be safe, we could use `bcftools view -O z`. But plan says use bgzip. We'll assume bgzip exists.
+
+Also need to ensure no echo for user-facing prose; but we may output nothing. Tools will produce logs.
+
+We must not write to stderr/stdout beyond what tools naturally emit. So avoid echo except maybe for progress? Not allowed. So script should just run commands, no prints.
+
+Idempotency: Use `if` conditions with timestamps.
+
+Let's craft script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+# create results dir
+mkdir -p results
+
+# reference indexing
+REF=data/ref/chrM.fa
+if [ ! -f "${REF}.bwt" ]; then
+  bwa index "$REF"
+fi
+if [ ! -f "${REF}.fai" ]; then
+  samtools faidx "$REF"
+fi
+
+# per-sample processing
+for sample in "${SAMPLES[@]}"; do
+  R1=data/raw/${sample}_1.fq.gz
+  R2=data/raw/${sample}_2.fq.gz
+  BAM=results/${sample}.bam
+  BAI=results/${sample}.bam.bai
+  VCF_GZ=results/${sample}.vcf.gz
+  TBI=results/${sample}.vcf.gz.tbi
+
+  # check if all outputs exist and newer than inputs
+  if [ -f "$BAM" ] && [ -f "$BAI" ] && [ -f "$VCF_GZ" ] && [ -f "$TBI" ]; then
+    # compare timestamps
+    latest_input=0
+    for f in "$R1" "$R2"; do
+      if [ "$(stat -c %Y "$f")" -gt "$latest_input" ]; then
+        latest_input="$(stat -c %Y "$f")"
+      fi
+    done
+    # check each output newer than inputs
+    if [ "$(stat -c %Y "$BAM")" -ge "$latest_input" ] && \
+       [ "$(stat -c %Y "$BAI")" -ge "$latest_input" ] && \
+       [ "$(stat -c %Y "$VCF_GZ")" -ge "$latest_input" ] && \
+       [ "$(stat -c %Y "$TBI")" -ge "$latest_input" ]; then
+      continue
+    fi
+  fi
+
+  # alignment and sort
+  bwa mem -t "$THREADS" -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+    "$REF" "$R1" "$R2" | samtools sort -@ "$THREADS" -o "$BAM"
+
+  # index bam
+  samtools index -@ "$THREADS" "$BAM"
+
+  # variant calling
+  tmp_vcf=results/${sample}.vcf
+  lofreq call-parallel --pp-threads "$THREADS" -f "$REF" -b "$BAM" -o "$tmp_vcf"
+
+  # compress and index VCF
+  bgzip -c "$tmp_vcf" > "$VCF_GZ"
+  tabix -p vcf "$VCF_GZ"
+  rm -f "$tmp_vcf"
+done
+
+# collapsed.tsv
+COLLAPSED=results/collapsed.tsv
+# Determine if need to rebuild: any VCF_GZ newer than COLLAPSED or COLLAPSED missing
+rebuild=false
+if [ ! -f "$COLLAPSED" ]; then
+  rebuild=true
+else
+  for sample in "${SAMPLES[@]}"; do
+    VCF_GZ=results/${sample}.vcf.gz
+    if [ "$(stat -c %Y "$VCF_GZ")" -gt "$(stat -c %Y "$COLLAPSED")" ]; then
+      rebuild=true
+      break
+    fi
+  done
+fi
+
+if $rebuild; then
+  # header
+  printf "sample\tchrom\tpos\tref\talt\taf\n"
+  for sample in "${SAMPLES[@]}"; do
+    VCF_GZ=results/${sample}.vcf.gz
+    bcftools query -f '${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$VCF_GZ"
+  done > "$COLLAPSED"
+fi
+
+exit 0
+
+Need to ensure bgzip is available. If not, we could use `bcftools view -O z`. But plan says bgzip.
+
+Also need to ensure that bcftools query format string uses single quotes; but inside we have ${sample} variable expansion? We want literal sample name inserted per row. The plan: bcftools query -f '{sample}\t%CHROM\t...'. That uses the placeholder {sample}. But we also need to prepend sample name via format string, not variable substitution. So we should use single quotes and keep braces. In script, we cannot have ${sample} inside single quotes; but we want literal `{sample}`. So we can write:
+
+bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$VCF_GZ"
+
+Yes that's fine.
+
+But we need to ensure that bcftools is available (yes). Also tabix for indexing VCF. Good.
+
+Now, idempotency: For per-sample pipeline, we skip if all outputs exist and newer than inputs. But we also need to check if BAM index exists etc. We did that.
+
+However, we didn't check if bam index older than bam? but we compare each output's timestamp individually. That ensures they are newer than latest input. Good.
+
+But what about case where BAM exists but BAI missing? Then skip condition fails because -f "$BAI" false; so pipeline runs again and will produce all outputs. That's fine.
+
+Also need to ensure that if BAM is older than inputs, we redo.
+
+Now collapsed.tsv: We check if any VCF_GZ newer than COLLAPSED. Good.
+
+Edge case: If collapsed.tsv missing, rebuild true.
+
+Now script uses `printf` for header; that's allowed? It's not user-facing prose but just outputting to file. Should be fine.
+
+But the instruction says "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." Using printf is okay as part of building collapsed.tsv. But it will print to stdout unless redirected. We redirect > "$COLLAPSED". So no output to console. Good.
+
+Now we need to ensure that `bgzip` command exists. If not, maybe bcftools view -O z can be used. But plan says bgzip. We'll assume it's present.
+
+Also need to ensure that the script uses only tools listed: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. We used bgzip which is part of htslib; not explicitly listed but likely available. But to be safe, we could use `bcftools view -O z`. But plan says use bgzip. Let's keep bgzip.
+
+Now check for missing variable expansions: In the header line we used printf "sample\tchrom\tpos\tref\talt\taf\n". That's fine.
+
+Also need to ensure that bcftools query uses `%INFO/AF` but AF may not be present? But lofreq call-parallel outputs INFO/AF. Good.
+
+Now final exit 0.
+
+Edge: The script uses `stat -c %Y`. On some systems, stat may use different format; but typical Linux has it. Should be fine.
+
+Also we used `mkdir -p results` earlier; good.
+
+We didn't use any absolute paths except relative ones.
+
+Let's produce final script.

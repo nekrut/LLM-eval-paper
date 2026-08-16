@@ -1,0 +1,259 @@
+We need to produce a bash script that follows constraints.
+
+Key points:
+
+- Use set -euo pipefail.
+- Idempotent: skip steps if outputs exist and are newer than inputs. We can use `if` checks with timestamps or simply check existence of final output file; but we must also consider dependencies. For simplicity, we can check for each sample's .bam.bai etc.
+
+But to be safe, we should check that all required files exist before performing step. For example, if results/{sample}.bam exists and is newer than raw fastq? But the requirement: "skip if the index files already exist" for reference indexing. For per-sample steps, skip if final output exists (e.g., .vcf.gz.tbi). That ensures idempotency.
+
+Also we must not write to stdout/stderr beyond tool outputs; no echo. So we cannot use echo for progress messages. But we can still use `printf`? It's allowed but prints to stdout. The requirement says "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." That means we should avoid printing anything ourselves. So we can't print header lines or status. We just run commands.
+
+Thus script will be silent unless tools produce output.
+
+We need to ensure no extraneous prints: `printf` would also print, so avoid.
+
+We'll rely on commands that don't output unless errors.
+
+Ok.
+
+Implementation plan:
+
+- Define THREADS=4
+- sample list array.
+- Create results dir if not exist: mkdir -p results
+
+Reference indexing:
+
+Check if data/ref/chrM.fa.fai exists; if not run samtools faidx. Also check for bwa index files: .amb etc. We can test existence of one file like chrM.fa.bwt.
+
+If either missing, run both commands.
+
+Per-sample loop:
+
+For each sample in list:
+
+- Define bam=results/${sample}.bam
+- bai=results/${sample}.bam.bai
+- vcf=results/${sample}.vcf.gz
+
+Check if vcf.tbi exists; if yes skip entire per-sample pipeline. But we also need to ensure that .bam and .bai exist? The requirement: "skip if the index files already exist" for reference indexing. For per-sample, they say "guard each artifact with an existence check (e.g., skip if results/{sample}.vcf.gz.tbi already exists and is newer than its inputs)". So we can just check vcf.tbi; if present, assume all earlier steps done.
+
+But to be safe, maybe also check .bam.bai. But we can rely on vcf.tbi being final output.
+
+Thus:
+
+if [ -f "$vcf.tbi" ]; then continue; fi
+
+Then run pipeline:
+
+bwa mem -t 4 -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ $THREADS -o "$bam"
+
+Then samtools index -@ $THREADS "$bam"
+
+lofreq call-parallel --pp-threads $THREADS --verbose --ref data/ref/chrM.fa --out "${vcf%.gz}" --sig --bonf "$bam"
+
+But we need to output .vcf uncompressed. Then compress with bgzip.
+
+We must use bgzip from htslib? Not listed but tabix is part of htslib; bgzip may be available as `bgzip`. It's not in TOOL_INVENTORY list, but maybe it's present because tabix uses it. But we can use `bcftools view -O z` to compress. However they explicitly say "Compress with bgzip (not bcftools view -O z)". So we need bgzip command. Is bgzip available? Usually part of htslib, but not listed. But maybe it's present as `bgzip`. We'll assume it is.
+
+We can run:
+
+bgzip -c "${vcf%.gz}" > "$vcf"
+
+tabix -p vcf "$vcf"
+
+rm "${vcf%.gz}"
+
+Now collapsed.tsv: we need to generate if missing or any input VCF newer than tsv. We can check timestamps: if results/collapsed.tsv exists, compare with each sample's .vcf.gz; if any is newer, rebuild.
+
+Simpler: always rebuild? But that would violate idempotency? It might still be fine because it will just overwrite same content. But we want to avoid unnecessary work. We can check:
+
+if [ -f results/collapsed.tsv ]; then
+
+  for sample in ...; do
+    if [ "${sample}.vcf.gz" -nt results/collapsed.tsv ]; then rebuild=true; break; fi
+  done
+
+But need to use full path: results/${sample}.vcf.gz.
+
+If not exist, rebuild.
+
+Rebuild:
+
+Use bcftools query for each sample and append to temp file. Then add header.
+
+Implementation:
+
+tmp=$(mktemp)
+
+for sample in ...; do
+  bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> "$tmp"
+done
+
+Then create final file: echo -e "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv; cat "$tmp" >> results/collapsed.tsv; rm "$tmp"
+
+But we cannot use echo. We can use printf to write header, but that prints to stdout. But we need to write to file. We can redirect: printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+
+printf writes to stdout but redirected to file; that's fine.
+
+But we must not produce output to terminal. Redirecting ensures no output.
+
+Ok.
+
+Now idempotency: if collapsed.tsv exists and is newer than all vcf.gz, skip rebuild.
+
+Implementation:
+
+rebuild=false
+if [ ! -f results/collapsed.tsv ]; then rebuild=true; else
+  for sample in ...; do
+    if [ "results/${sample}.vcf.gz" -nt results/collapsed.tsv ]; then rebuild=true; break; fi
+  done
+fi
+
+If rebuild true, perform steps.
+
+Now script must be self-contained. Use arrays.
+
+Also need to ensure we use correct quoting for read group string: `-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`
+
+Because we want literal backslash-t characters. In bash, inside double quotes, `\\t` becomes `\t`. So the command will pass `@RG\tID:...` to bwa.
+
+Ok.
+
+Also need to ensure that we use correct path for raw fastq: data/raw/${sample}_1.fq.gz etc.
+
+Now about bgzip: we need to compress uncompressed vcf. The output file is results/${sample}.vcf.gz. Use `bgzip -c "${vcf%.gz}" > "$vcf"`
+
+But we must ensure that the intermediate .vcf exists before compression; yes from lofreq call-parallel.
+
+Now about bcftools query: need to use `%INFO/AF` field. The VCF may have AF in INFO. Ok.
+
+Also we need to ensure we don't produce any output beyond tool outputs. But our script uses printf to write header, but redirected to file. That prints nothing to terminal. Good.
+
+We also used `printf` for header; that's fine.
+
+Now we must not use echo or other prints.
+
+Ok.
+
+Edge: We used `printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv`. This writes to file but no output to stdout.
+
+Also we used `cat "$tmp" >> results/collapsed.tsv` which outputs nothing.
+
+Now we need to ensure that the script uses only tools in TOOL_INVENTORY. We use bwa, samtools, lofreq, bgzip, tabix, bcftools, seqkit? Not used. But that's fine.
+
+We also use `mkdir -p`, `touch`, etc. Those are standard shell builtins or coreutils; allowed.
+
+Now we need to ensure that the script uses only tools available in PATH. We rely on bgzip and tabix being present. They are part of htslib, but not listed. But maybe they are installed as part of samtools/htslib. The inventory lists tabix but not bgzip. However bgzip is usually part of htslib; but if not available, we could use `bcftools view -O z`. But requirement says compress with bgzip (not bcftools). So we must assume bgzip exists.
+
+Ok.
+
+Now final script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+samples=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p results
+
+# Reference indexing
+ref_fa=data/ref/chrM.fa
+if [ ! -f "${ref_fa}.fai" ]; then
+  samtools faidx "$ref_fa"
+fi
+if [ ! -f "${ref_fa}.bwt" ]; then
+  bwa index "$ref_fa"
+fi
+
+# Per-sample pipeline
+for sample in "${samples[@]}"; do
+  bam=results/${sample}.bam
+  bai=results/${sample}.bam.bai
+  vcf_gz=results/${sample}.vcf.gz
+  if [ -f "$vcf_gz.tbi" ]; then
+    continue
+  fi
+
+  # Alignment and sorting
+  bwa mem -t $THREADS \
+    -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+    data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+    samtools sort -@ $THREADS -o "$bam"
+
+  # Index BAM
+  samtools index -@ $THREADS "$bam"
+
+  # Variant calling
+  vcf_uncompressed=${vcf_gz%.gz}
+  lofreq call-parallel --pp-threads $THREADS --verbose \
+    --ref "$ref_fa" --out "$vcf_uncompressed" --sig --bonf "$bam"
+
+  # Compress and index VCF
+  bgzip -c "$vcf_uncompressed" > "$vcf_gz"
+  tabix -p vcf "$vcf_gz"
+  rm "$vcf_uncompressed"
+done
+
+# Collapse table
+collapsed=results/collapsed.tsv
+rebuild=false
+if [ ! -f "$collapsed" ]; then
+  rebuild=true
+else
+  for sample in "${samples[@]}"; do
+    if [ "results/${sample}.vcf.gz" -nt "$collapsed" ]; then
+      rebuild=true
+      break
+    fi
+  done
+fi
+
+if $rebuild; then
+  tmp=$(mktemp)
+  for sample in "${samples[@]}"; do
+    bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> "$tmp"
+  done
+  printf "sample\tchrom\tpos\tref\talt\taf\n" > "$collapsed"
+  cat "$tmp" >> "$collapsed"
+  rm "$tmp"
+fi
+
+exit 0
+
+Check for any syntax errors: In the if condition `if [ "results/${sample}.vcf.gz" -nt "$collapsed" ]; then` we need to use `$` before variable. Should be `[ "results/${sample}.vcf.gz" -nt "$collapsed" ]`. But quoting: we should use `${sample}` inside quotes.
+
+Also in the if condition, we used `if [ ! -f "$collapsed" ]; then rebuild=true; else ... fi`. That's fine.
+
+But we need to ensure that variable `rebuild` is defined as a boolean string. In bash, `rebuild=false` sets string false. Then later `if $rebuild; then` will evaluate the string as command name? Actually `if $rebuild; then` will try to execute command named "false" or "true". That works because `false` and `true` are commands that exit with status 1 or 0. So it's fine.
+
+But we used `rebuild=true` inside loop, but we didn't export variable. It's fine.
+
+Now check the if condition: `[ "results/${sample}.vcf.gz" -nt "$collapsed" ]`. The left side should be a file path; we need to use `$` before sample? We already have `${sample}`. So it's correct.
+
+But we used `if [ ! -f "$collapsed" ]; then rebuild=true; else ... fi`. Good.
+
+Now check the `bwa mem` command: we used `-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"` inside double quotes. The backslashes will escape t? In bash, within double quotes, `\\t` becomes `\t`. So the string passed to bwa is `@RG\tID:M117-bl\tSM:M117-bl\tLB:M117-bl\tPL:ILLUMINA`. Good.
+
+Now check that we didn't use any echo. We used printf only for header; that's fine.
+
+We used `printf "sample\tchrom\tpos\tref\talt\taf\n" > "$collapsed"` which writes to file but no output to terminal.
+
+We used `cat "$tmp" >> "$collapsed"`.
+
+All good.
+
+Now ensure we didn't use any other commands not in inventory: We used `mkdir`, `touch`? No. We used `mktemp`. That's coreutils; allowed.
+
+Used `bgzip`; assume present.
+
+Used `tabix`; present.
+
+Used `samtools`, `bwa`, `lofreq`, `bcftools`.
+
+All good.
+
+Now final script ready.

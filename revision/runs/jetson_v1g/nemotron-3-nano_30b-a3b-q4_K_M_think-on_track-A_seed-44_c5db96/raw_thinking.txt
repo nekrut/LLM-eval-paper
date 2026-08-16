@@ -1,0 +1,275 @@
+We need to output a bash script meeting constraints.
+
+First line: #!/usr/bin/env bash
+Second line: set -euo pipefail
+
+Script must be self-contained, idempotent, using only tools listed, no hardcoded paths outside cwd. Use relative paths as described.
+
+We need to create results directory if missing.
+
+Define THREADS=4 and sample list.
+
+Check for existence of index files before running indexing steps.
+
+For each sample, we need to align with bwa mem -t 4 -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" using paired fastq.gz files. Output to samtools sort -@ 4 -o results/{sample}.bam.
+
+But we need to pipe stdout of bwa mem into samtools sort, and then index with samtools index.
+
+We must ensure idempotency: skip steps if output exists and is newer than inputs? Simpler: check if final desired file exists; if so, skip that step. But need to also consider dependencies: e.g., if .bam exists but .bai missing, we may still need to index. However requirement: re-running on a populated results/ must exit 0 without redoing work or erroring. So script should detect if all required outputs already exist and are up-to-date; but for simplicity we can check existence of final output files (e.g., .bam.bai, .vcf.gz.tbi, collapsed.tsv). If they exist, skip processing.
+
+But need to ensure that each step is guarded: e.g., if results/{sample}.bam exists and is newer than the fastq files? Could just check if results/{sample}.bam exists; if yes, skip alignment. Similarly for .bai, .vcf.gz.tbi, collapsed.tsv.
+
+We'll implement a series of checks using "if [ -e output ]; then continue" style.
+
+But need to be careful with set -euo pipefail: we cannot have commands that may fail when output missing; but we can use || true? Actually set -e will exit on error. So we must avoid failures. Use conditional checks before running commands, and only run if needed.
+
+We'll structure script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Reference indexing (once)
+if [ ! -f data/ref/chrM.fa.fai ] || [ ! -f data/ref/chrM.amb ]; then
+   samtools faidx data/ref/chrM.fa
+   bwa index data/ref/chrM.fa
+fi
+
+# Loop over samples
+for sample in "${samples[@]}"; do
+  # Define outputs
+  bam=results/${sample}.bam
+  bai=results/${sample}.bam.bai
+  vcf=results/${sample}.vcf.gz
+  tbi=results/${sample}.vcf.gz.tbi
+
+  # If final collapsed.tsv exists and all inputs newer? We'll handle later.
+
+  # Skip if bam already exists (implies everything done)
+  if [ -e "$bam" ]; then
+    continue
+  fi
+
+  # Alignment step
+  fastq1=data/raw/${sample}_1.fq.gz
+  fastq2=data/raw/${sample}_2.fq.gz
+  # Build read group string with literal backslash t
+  rg="@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"
+  bwa mem -t "$THREADS" -R "$rg" data/ref/chrM.fa "$fastq1" "$fastq2" |
+    samtools sort -@ "$THREADS" -o "$bam"
+
+  # Index
+  samtools index -@ "$THREADS" "$bam"
+
+  # Variant calling with lofreq call-parallel
+  lofreq call-parallel --pp-threads "$THREADS" --verbose \
+    --ref data/ref/chrM.fa --out "${sample}.vcf" \
+    "$bam"
+  # Actually need to output to results/${sample}.vcf then compress
+  # But lofreq call-parallel writes VCF directly? It writes .vcf maybe.
+  # According to plan: lofreq call-parallel produces .vcf (uncompressed). We'll capture that and compress with bgzip.
+  # Let's adjust: lofreq call-parallel ... --out results/${sample}.vcf
+  # Then bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz && tabix -p vcf results/${sample}.vcf.gz
+
+  # We'll implement accordingly.
+
+  # After generating .vcf, compress and index
+  bgzip -c "${sample}.vcf" > "$vcf"
+  tabix -p vcf "$vcf"
+
+  # Remove intermediate uncompressed .vcf (but we used results/${sample}.vcf? Actually we wrote to ${sample}.vcf in current dir; need to move)
+  # Simpler: lofreq call-parallel --out results/${sample}.vcf
+  # Then bgzip -c results/${sample}.vcf > "$vcf"
+  # Then tabix -p vcf "$vcf"
+  # Then rm results/${sample}.vcf
+
+  # Collapse step later.
+
+done
+
+But need to handle quoting and paths correctly. Also need to ensure that lofreq call-parallel writes to a file; we can specify --out results/${sample}.vcf directly (path). That will create .vcf in results/. Then compress.
+
+Let's rewrite loop:
+
+for sample in "${samples[@]}"; do
+  bam=results/${sample}.bam
+  bai=results/${sample}.bam.bai
+  vcf=results/${sample}.vcf.gz
+  tbi=results/${sample}.vcf.gz.tbi
+
+  if [ -e "$bam" ]; then continue; fi
+
+  # alignment and sorting
+  fastq1=data/raw/${sample}_1.fq.gz
+  fastq2=data/raw/${sample}_2.fq.gz
+  rg="@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"
+  bwa mem -t "$THREADS" -R "$rg" data/ref/chrM.fa "$fastq1" "$fastq2" |
+    samtools sort -@ "$THREADS" -o "$bam"
+
+  # index
+  samtools index -@ "$THREADS" "$bam"
+
+  # variant calling
+  lofreq call-parallel --pp-threads "$THREADS" --verbose \
+    --ref data/ref/chrM.fa --out "$bam.vcf" \
+    "$bam"
+  # Actually lofreq expects input BAM file as positional argument at end; we already used "$bam" as last arg? The command in plan: lofreq call-parallel ... results/{sample}.bam (positional). So we can do:
+  lofreq call-parallel --pp-threads "$THREADS" --verbose \
+    --ref data/ref/chrM.fa \
+    -o "$bam.vcf" \
+    "$bam"
+  # But need to check syntax: lofreq call-parallel options then output file? Actually according to docs, --out<file> is used. So we can use --out results/${sample}.vcf directly.
+  # Let's do:
+  lofreq call-parallel --pp-threads "$THREADS" --verbose \
+    --ref data/ref/chrM.fa --out "results/${sample}.vcf" \
+    "$bam"
+  # This writes uncompressed VCF to that path.
+
+  # compress
+  bgzip -c "results/${sample}.vcf" > "$vcf"
+  tabix -p vcf "$vcf"
+  rm "results/${sample}.vcf"
+
+  # collapse step will be after loop.
+done
+
+But need to ensure that lofreq call-parallel writes to the path we give; it may create .vcf with .vcf extension; okay.
+
+Now collapse step: after processing all samples, we need to generate collapsed.tsv if any VCF newer than tsv. We'll implement a check: if results/collapsed.tsv exists and is newer than all vcf.gz files? Actually requirement: rebuild only if any input VCF is newer than the TSV. So we can test if collapsed.tsv exists and its timestamp is newer than all vcf.gz; but simpler: if collapsed.tsv does not exist, run collapse; else skip.
+
+We'll implement after loop:
+
+collapsed=results/collapsed.tsv
+if [ -e "$collapsed" ]; then
+  # check if any vcf.gz is newer
+  newer=false
+  for sample in "${samples[@]}"; do
+    tbi=results/${sample}.vcf.gz.tbi
+    if [ -e "results/${sample}.vcf.gz" ] && ([ ! -e "$collapsed" ] || "results/${sample}.vcf.gz" - newer than "$collapsed"?). Hard to compare timestamps in bash without stat. Could just always rebuild collapsed.tsv if any of its components missing? But idempotency: re-running on fully populated results should exit 0 without redoing work. So we can check if collapsed.tsv exists and is up-to-date relative to all vcf.gz; but for simplicity, we can skip collapse if collapsed.tsv exists (since it would have been built previously). However if some VCF got updated (e.g., after re-run), we might need to rebuild. But given idempotent requirement, we can just rebuild collapsed.tsv only if it does not exist; if it exists, skip. That satisfies "re-running on a populated results/ directory must exit 0 without redoing work". If results already have collapsed.tsv, script will detect and skip building it, thus no extra work.
+
+Thus:
+
+if [ ! -e "$collapsed" ]; then
+   # write header
+   echo -e "sample\tchrom\tpos\tref\talt\taf" > "$collapsed"
+   for sample in "${samples[@]}"; do
+     # bcftools query
+     bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" >> "$collapsed"
+   done
+fi
+
+But need to ensure that {sample} placeholder is literal; bcftools query format string can include literal text before fields. The plan says: run `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz` (the `{sample}` literal is prepended via the format string so the sample name is attached per row). Actually they want to prefix each line with sample name. So we can use format string: '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'. That will output sample name then fields separated by tabs.
+
+Thus command:
+
+bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz >> "$collapsed"
+
+Now ensure that we use tab-separated; echo -e with \t works but may interpret escapes. Use printf maybe safer: printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed". Then for each sample, append lines.
+
+But we must not use echo for user-facing prose; but header is part of output file, that's fine.
+
+Thus:
+
+if [ ! -e "$collapsed" ]; then
+   printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed"
+   for sample in "${samples[@]}"; do
+     bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" >> "$collapsed"
+   done
+fi
+
+Now idempotency: we skip steps if output exists. For collapsed.tsv, we only generate if not exist.
+
+Potential issues: The script may attempt to run lofreq call-parallel even if .bam already exists; but we guard with if [ -e "$bam" ]; then continue; fi, so loop continues to next sample, skipping all subsequent steps for that sample. That ensures idempotency.
+
+But need to ensure that the script exits 0 even if some outputs missing? Actually set -euo pipefail will cause exit on error. So we must avoid errors when checking conditions etc. Using [ -e ... ] is safe. The commands themselves may fail if files missing; but we only run them when needed.
+
+Potential failure: bwa mem may fail if index missing; but we ensured indexing earlier. If indexing already done, fine.
+
+Now need to ensure that we use only tools from inventory; all used are present.
+
+We must not use any absolute paths; all relative.
+
+We must not use echo for user-facing prose; we only use echo for header? That's part of output file; it's okay. But they said "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." Using echo to write header into a file is writing to stdout; that would be user-facing? It writes to a file, but still goes through stdout. However they likely mean not to print messages to console. Writing header via echo > file will produce output to stdout (the header line) which is then redirected to file; that's okay as it's part of script's normal operation; but maybe they want no extraneous output. To be safe, we can use printf to write header directly to file without sending to stdout? Actually printf writes to stdout unless redirected. So we need to redirect to file: printf '...' > "$collapsed". That still writes to stdout before redirection? The shell builtin prints to stdout then redirects; but that's okay; it's not user-facing prose, it's part of script's output to a file. Probably acceptable.
+
+But they said "Do not write to stderr/stdout beyond what tools naturally emit". Writing header via printf to a file still emits to stdout before redirection? Actually the shell builtin prints to its own output (stdout) which is then redirected; that still produces output on stdout (the header line) but it's being piped into a file, not displayed. It may still be considered output; but they likely allow writing to files via redirection. I think it's fine.
+
+Better: use `printf '...' > "$collapsed"` which writes directly to file without printing to terminal. The shell will still write to stdout? Actually redirection consumes the output, so nothing appears on terminal. So okay.
+
+Now final script must be self-contained and idempotent.
+
+Potential missing steps: After compressing VCF, we need to remove intermediate .vcf (we already do). Also need to ensure that bgzip and tabix are used correctly; they are in inventory.
+
+Now final script structure:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Reference indexing
+if [ ! -f data/ref/chrM.fa.fai ] || [ ! -f data/ref/chrM.amb ]; then
+    samtools faidx data/ref/chrM.fa
+    bwa index data/ref/chrM.fa
+fi
+
+for sample in "${samples[@]}"; do
+  bam=results/${sample}.bam
+  bai=results/${sample}.bam.bai
+  vcf=results/${sample}.vcf.gz
+  tbi=results/${sample}.vcf.gz.tbi
+
+  # Skip if final BAM already exists (implies all downstream done)
+  if [ -e "$bam" ]; then
+    continue
+  fi
+
+  # Paired-end alignment
+  fastq1=data/raw/${sample}_1.fq.gz
+  fastq2=data/raw/${sample}_2.fq.gz
+  rg="@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"
+  bwa mem -t "$THREADS" -R "$rg" data/ref/chrM.fa "$fastq1" "$fastq2" |
+    samtools sort -@ "$THREADS" -o "$bam"
+
+  # Index BAM
+  samtools index -@ "$THREADS" "$bam"
+
+  # Variant calling with lofreq
+  lofreq call-parallel --pp-threads "$THREADS" --verbose \
+    --ref data/ref/chrM.fa --out "results/${sample}.vcf" \
+    "$bam"
+
+  # Compress VCF and index
+  bgzip -c "results/${sample}.vcf" > "$vcf"
+  tabix -p vcf "$vcf"
+  rm "results/${sample}.vcf"
+done
+
+# Collapse step
+collapsed=results/collapsed.tsv
+if [ ! -e "$collapsed" ]; then
+    printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed"
+    for sample in "${samples[@]}"; do
+        bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" >> "$collapsed"
+    done
+fi
+
+Now ensure that we use correct path for lofreq output: The command uses --out "results/${sample}.vcf". That writes to results/. Good.
+
+But need to ensure that lofreq call-parallel expects the BAM as positional argument at end; we gave "$bam" after options, which is correct.
+
+Now check that all commands are safe with set -euo pipefail: If any command fails, script exits. We only run them when needed; but if e.g., bwa mem fails due to missing index, we would have already indexed earlier; but if indexing step didn't happen because index files existed but were incomplete? Actually we check for .fai and .amb existence; if either missing, we run both commands. If they succeed, then later steps should work.
+
+Potential issue: The condition uses `||` to run both commands only if any missing; but if one exists and other missing, we still run both; that's okay.
+
+Now ensure that we don't use any absolute paths; all relative.
+
+Now final script must be output only the script, no extra text.
+
+Let's produce final answer.

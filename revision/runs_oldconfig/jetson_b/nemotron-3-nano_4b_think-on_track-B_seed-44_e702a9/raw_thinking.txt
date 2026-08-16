@@ -1,0 +1,189 @@
+We need to produce a bash script that does per-sample variant calling on paired-end MiSeq amplicon samples mapped to chrM (16569 bp). Output results/{sample}.bam, .bai, .vcf.gz, .vctbi, and collapsed.tsv with columns sample chrom pos ref alt af.
+
+We must be idempotent: if results already exist, skip steps. Use only tools listed. No absolute paths; use relative to cwd.
+
+Workflow:
+
+1. For each sample (M117-bl, M117-ch, M117C1-bl, M117C1-ch):
+   - fastqc the two .fq.gz files? Not required but maybe for QC. But output not needed.
+   - bwa mem chrM.fa paired-end reads to produce .bam
+   - samtools index .bam -> .bai
+   - bcftools view -m vcf .bam > results/{sample}.vcf.gz
+   - tabix -p vcf results/{sample}.vcf.gz.tbi
+
+2. Collapse table: need to produce collapsed.tsv with sample chrom pos ref alt af.
+
+We can use bcftools query? Or seqkit? We'll generate a TSV per sample then combine.
+
+Simplify: Use bcftools query -T< vcf > temp.tsv then aggregate.
+
+But we must be idempotent: if results already have .bam etc, skip.
+
+Implementation steps:
+
+- Create results directory (mkdir -p results)
+- For each sample:
+   - Check if results/{sample}.bam exists; if yes continue.
+   - fastqc? Not needed for output but maybe we can skip.
+   - bwa mem chrM.fa "${sample}_1. fq.gz" "${sample}_2.fq.gz" > results/${sample}.bam
+   - samtools index results/${sample}.bam
+   - bcftools view -m vcf results/${sample}.bam > results/${sample}.vcf.gz
+   - tabix -p vcf results/${sample}.vcf.gz.tbi
+
+- Then generate collapsed.tsv: Use seqkit to extract variant info? Or use bcftools query.
+
+We'll create a temporary file per sample with TSV columns.
+
+Use bcftools query -T results/{sample}.vcf.gz > tmp.tsv
+
+But need header: sample chrom pos ref alt af. The query output includes those columns.
+
+Then combine all into collapsed.tsv using seqkit or awk.
+
+Simplify: Use seqkit to aggregate? Or just use awk to merge.
+
+We'll produce a temporary file per sample with header, then cat them into results/collapsed.tsv.
+
+But need header only once. So we can generate each sample's TSV without header (seqkit -e maybe). Let's use bcftools query -T outputs header? Actually bcftools query -T prints header line: "sample chrom pos ref alt af". Good.
+
+So we can cat all results/*.vcf.gz.tbi? No, need to combine the TSVs.
+
+We'll create a temporary file per sample with header. Then use seqkit to aggregate? Or just use awk to merge.
+
+Simpler: Use seqkit -e to extract variant info and output TSV without header; then cat all into results/collapsed.tsv after adding header line.
+
+But we need idempotent: if collapsed already exists, skip writing.
+
+Implementation:
+
+- After per-sample processing, check if results/collapsed.tsv exists. If not, create it.
+- For each sample:
+   - bcftools query -T results/${sample}.vcf.gz > tmp_${sample}.tsv
+   - seqkit -e tmp_${sample}.tsv > tmp_${sample}_noheader.tsv (maybe)
+But we need header only once.
+
+Better: Use seqkit to aggregate all TSVs into one with header.
+
+seqkit -e results/*.vcf.gz? Not sure.
+
+Maybe use seqkit -e to extract variant info from VCF and output TSV without header. Then cat them.
+
+Let's do:
+
+tmp.tsv=$(seqkit -e results/${sample}.vcf.gz > tmp.tsv)
+
+But we need per sample.
+
+Simplify: Use bcftools query -T for each, then seqkit to aggregate all into one file with header.
+
+We'll create a temporary aggregated file.
+
+Pseudo:
+
+tmp_agg=$(mktemp)
+for s in samples; do
+   bcftools query -T results/${s}.vcf.gz >> $tmp_agg
+done
+
+seqkit -e $tmp_agg > results/collapsed.tsv
+
+But need header only once. The first line of each query is header, so we will have duplicate headers.
+
+We can remove duplicates: seqkit -e may handle? Or use awk to keep unique.
+
+Simpler: Use seqkit -e to output TSV without header (since it extracts variant info). Then cat all into results/collapsed.tsv and prepend header line.
+
+Implementation:
+
+seqkit -e results/${sample}.vcf.gz > tmp_${sample}.tsv
+
+Then after loop, create final file:
+
+{
+ echo "sample\tchrom\tpos\tref\talt\taf"
+ cat tmp_*.tsv
+} > results/collapsed.tsv
+
+But need to ensure no header duplicates.
+
+Now idempotent: if collapsed already exists, skip writing.
+
+Check existence before creating.
+
+Now script must be self-contained with first two lines as required.
+
+Let's write script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# create results dir
+mkdir -p results
+
+samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+for s in "${samples[@]}"; do
+  bam=${results}/${s}.bam
+  if [[ -f $bam ]]; then continue; fi
+
+  # map reads
+  bwa mem data/ref/chrM.fa ${s}_1.fq.gz ${s}_2.fq.gz > $bam
+  samtools index $bam
+
+  # variant call
+  bcftools view -m vcf $bam > results/${s}.vcf.gz
+  tabix -p vcf results/${s}.vcf.gz.tbi
+
+done
+
+# generate collapsed.tsv
+if [[ ! -f results/collapsed.tsv ]]; then
+  tmp_agg=$(mktemp)
+  for s in "${samples[@]}"; do
+    bcftools query -T results/${s}.vcf.gz >> $tmp_agg
+  done
+  seqkit -e $tmp_agg > results/collapsed.tsv.tmp
+  # prepend header
+  {
+    echo "sample\tchrom\tpos\tref\talt\taf"
+    cat results/collapsed.tsv.tmp
+  } > results/collapsed.tsv
+
+  rm -f $tmp_agg results/collapsed.tsv.tmp
+fi
+
+But need to ensure seqkit -e works on VCF? It expects TSV input. We are feeding it the query output which is TSV with header. seqkit -e may ignore header and produce variant rows.
+
+Let's test: seqkit -e file.tsv will output variant info without header.
+
+Thus we can do:
+
+seqkit -e $tmp_agg > results/collapsed.tsv.tmp
+
+Then prepend header.
+
+Now script must not write to stderr beyond tools. Using mktemp is fine.
+
+But need to ensure idempotent: if collapsed already exists, skip writing. We check existence before creating.
+
+Also need to ensure that per-sample processing is skipped if .bam exists (idempotent). Good.
+
+Potential issue: bcftools query -T may output header line; seqkit -e will ignore it and produce rows only. That's fine.
+
+Now final script must have first two lines exactly as required:
+
+First line: #!/usr/ bin/env bash? Wait they wrote "1#!/usr/ bin/env bash". Actually they said: First line must be: #!/usr/ bin/env bash
+
+But typical shebang is "#!/usr/bin/env bash". However they wrote with slash after usr? The instruction: "First line must be: #!/usr/ bin/env bash"
+
+That seems odd. Probably they meant "#!/usr/bin/env bash". But they explicitly said first line must be that string. So we output exactly:
+
+#!/usr/ bin/env bash
+
+But that is not a valid shebang; but follow instruction.
+
+Second line: set -euo pipefail
+
+Thus script starts with those two lines.
+
+Now produce final answer: only the script, no markdown.

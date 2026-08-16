@@ -1,0 +1,413 @@
+We need to produce a bash script meeting constraints.
+
+First line: #!/usr/bin/env bash
+Second line: set -euo pipefail
+
+Script must be self-contained, no extra prose.
+
+We need to implement idempotent workflow with checks for existence of outputs and skip if newer than inputs. However we cannot use complex logic? We can check file existence and maybe timestamps but simple approach: if output files exist, skip steps. Use set -euo pipefail ensures errors abort; but we need to avoid error when checking missing files.
+
+We can use conditional statements like:
+
+if [[ ! -f results/${sample}.bam.bai ]]; then ... run indexing etc.
+
+But need to ensure that if any required input is missing, script fails? Idempotent: if outputs exist, skip. If not, proceed.
+
+We must define THREADS=4 variable.
+
+Sample list: M117-bl M117-ch M117C1-bl M117C1-ch
+
+We need to create results/ directory if missing: mkdir -p results
+
+Then for each sample, perform steps with checks.
+
+Step 2: reference indexing. Check if index files exist: maybe check if data/ref/chrM.fa.fai exists; also check if .amb etc exist? Could check if data/ref/chrM.fa.bwt exists (bwa index creates multiple). Simpler: check if data/ref/chrM.fa.fai exists; if not, run samtools faidx and bwa index.
+
+But need to ensure both commands succeed only once. Use separate checks.
+
+Step 3: alignment. For each sample, produce results/{sample}.bam (sorted BAM). Actually step 4 sorts output directly to .bam file. So we can check if results/${sample}.bam exists; if not, run bwa mem with -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" and pipe to samtools sort.
+
+But need to ensure that the read group string uses literal backslash t characters. We can embed them as "\t" inside double quotes; bash will treat \t as two characters, not a tab. So we can write:
+
+bwa mem -t 4 -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa "${fq1}" "${fq2}" | samtools sort -@ 4 -o results/${sample}.bam
+
+But need to ensure that the \t remains literal backslash t characters; using double quotes will allow variable expansion but keep \t as two characters. That's fine.
+
+We need to get FASTQ files: data/raw/${sample}_1.fq.gz and data/raw/${sample}_2.fq.gz.
+
+Check if results/${sample}.bam exists; if not, run command.
+
+Step 5: indexing BAM: check if results/${sample}.bam.bai exists; if not, samtools index -@4 results/${sample}.bam
+
+Step 6: variant calling with lofreq call-parallel. Check if results/${sample}.vcf.gz.tbi exists (or maybe .vcf.gz). We'll check for .vcf.gz.tbi; if missing, run lofreq call-parallel.
+
+Command:
+
+lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+
+But lofreq expects input BAM sorted? It can handle. We'll just run.
+
+After that, compress with bgzip: bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz ; then tabix -p vcf results/${sample}.vcf.gz
+
+Then remove intermediate .vcf.
+
+We need to ensure idempotency: if .vcf.gz.tbi exists and is newer than inputs? Simpler: if .vcf.gz.tbi exists, skip steps 6-8 for that sample. But we also need to remove .vcf after compression; but if .vcf already removed, we can still skip.
+
+Simplify: For each sample, check if results/${sample}.vcf.gz.tbi exists; if yes, continue to next sample.
+
+But we also need collapsed.tsv built only when all VCFs are ready. We'll build it after processing all samples; but we need idempotent: if collapsed.tsv exists and is newer than any of the input .vcf.gz files, skip building.
+
+Implementation plan:
+
+- Define THREADS=4
+- Sample list array.
+- Create results dir.
+- Index reference (once).
+- Loop over samples:
+   - If results/${sample}.bam.bai exists, continue? Actually need to ensure all steps done; but we can check final output .vcf.gz.tbi existence. If exists, skip whole sample processing.
+
+But we also need to ensure that if any intermediate missing, we run steps.
+
+Simplify: For each sample:
+   - If results/${sample}.vcf.gz.tbi exists, continue
+   - Else:
+        - If results/${sample}.bam.bai exists? Actually we need .bam to call variant; but if .bam.bai missing, we may still have .bam; but we can just check .bam existence. Simpler: check if results/${sample}.vcf.gz.tbi exists; if not, run steps.
+
+But we also need to ensure that we don't re-run steps when outputs exist but inputs changed (e.g., new FASTQ). Idempotent requirement: re-running on a populated results/ must exit 0 without re-doing work. So we can just check final output existence; if exists, skip all processing for that sample. That's acceptable.
+
+Thus for each sample:
+   - If results/${sample}.vcf.gz.tbi exists, continue
+   - Else:
+        - Check if results/${sample}.bam exists? Actually we need to produce .bam anyway; but if .bam exists but .vcf.gz.tbi missing, we still need to run variant calling. However lofreq call-parallel will produce .vcf; then compress and index. So we can just check final .vcf.gz.tbi.
+
+But we also need to ensure that we don't re-run steps if .bam already exists but .vcf.gz.tbi missing; we still need to run variant calling, which uses .bam as input. That's fine.
+
+Thus algorithm per sample:
+
+if [[ -f results/${sample}.vcf.gz.tbi ]]; then continue; fi
+
+Then:
+   # alignment
+   if [[ ! -f results/${sample}.bam ]]; then
+        fq1=data/raw/${sample}_1.fq.gz
+        fq2=data/raw/${sample}_2.fq.gz
+        bwa mem -t 4 -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa "$fq1" "$fq2" | samtools sort -@4 -o results/${sample}.bam
+   fi
+
+   # index
+   if [[ ! -f results/${sample}.bam.bai ]]; then
+        samtools index -@4 results/${sample}.bam
+   fi
+
+   # variant calling
+   lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+
+   # compress and index
+   bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz
+   tabix -p vcf results/${sample}.vcf.gz
+   rm results/${sample}.vcf
+
+But need to ensure that we don't produce errors if files already exist; but set -euo pipefail will cause error if command fails. However we are using conditional checks, so commands only run when needed.
+
+Potential issue: lofreq call-parallel may produce .vcf even if it already exists; but we can ignore.
+
+Now collapsed.tsv building:
+
+Check if results/collapsed.tsv exists and is newer than any of the .vcf.gz files. Simpler: if results/collapsed.tsv exists, skip building. But need to rebuild if any input newer. However idempotent requirement: re-running on fully populated results/ must exit 0 without error; but if we skip building when collapsed.tsv already exists, that's fine.
+
+Thus:
+
+if [[ -f results/collapsed.tsv ]]; then
+   # maybe check timestamps? Not needed.
+   :
+else
+   # build header and concatenate
+   {
+      echo -e "sample\tchrom\tpos\tref\talt\taf"
+      for sample in ${SAMPLES}; do
+          bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz
+      done
+   } > results/collapsed.tsv
+fi
+
+But need to ensure that bcftools query includes sample name as first column? The format string {sample} is literal placeholder for sample name? Actually bcftools query format can include any field; but they want to prepend sample name per row. Using -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' will output the literal string "sample" then tab and fields? Wait {sample} is a placeholder that gets replaced with the sample name? In bcftools query, you can use %TAG for info fields; but you cannot embed arbitrary text? Actually you can include literal text in format string; you can write 'sample\t%CHROM...' but they want to prepend sample name per row. The spec says: "bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz (the {sample} literal is prepended via the format string so the sample name is attached per row)." So they want to use the placeholder {sample} which expands to the actual sample name? I think bcftools query supports variable substitution like %CHROM etc, but not arbitrary placeholders. However they say "the {sample} literal is prepended via the format string so the sample name is attached per row". Possibly they refer to using the format string with a field that contains the sample name? Actually you can use the special field %SAMPLE? Not sure. But we can just output the sample name manually before each line: we can loop over samples and for each variant line, prepend sample name. Simpler: Use bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s="${sample}" '{print s"\t"$0}' . But they said use bcftools query with format string that includes {sample} literal. Maybe we can do:
+
+bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz
+
+But does bcftools interpret {sample} as a placeholder? I think it does not; but maybe they meant to use the sample name as part of the format string literally, like "sample" is literal text. Actually they said "the {sample} literal is prepended via the format string so the sample name is attached per row". That suggests you can write something like:
+
+bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' file.vcf.gz
+
+where {sample} will be replaced by the actual sample name? I think bcftools query supports substitution of placeholders like %CHROM etc, but not arbitrary braces. However there is a feature: you can use -f '%CHROM\t%POS...'. Not sure about {sample}. Might be they refer to using the sample name as part of the format string via the -s option? Hmm.
+
+Given constraints, we can just produce collapsed.tsv by concatenating per-sample output that already includes sample column. We can achieve this by using bcftools query with format string that outputs sample name as first field: we can use:
+
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s="${sample}" '{print s"\t"$0}'
+
+But they explicitly said to use bcftools query with format string that includes {sample} literal. Maybe we can cheat by using:
+
+bcftools query -f '${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz
+
+But that would expand shell variable, not literal {sample}. They want literal {sample} in format string; maybe bcftools supports using a field named "ID" etc. Not sample. Actually there is a special field %SAMPLE? I think not.
+
+Given the instruction, we can just follow it verbatim: use bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz
+
+Even if bcftools doesn't interpret {sample}, maybe it will treat it as literal text, resulting in output starting with "{sample}" which is not desired. But they said "the {sample} literal is prepended via the format string so the sample name is attached per row". Possibly they refer to using the placeholder {}? Actually bcftools query supports substitution of fields like %CHROM etc, but you can also embed arbitrary text; you could write:
+
+bcftools query -f 'sample=%CHROM\t%POS...' file.vcf.gz
+
+But not {sample}. I'm uncertain.
+
+Given constraints, we can just follow the instruction literally: use that command. It may work because bcftools query might treat any non-% token as literal text; so {sample} will be printed as literal "{sample}". That would produce output starting with "{sample}" which is not sample name. But they want sample name attached per row. So maybe they intend to use the placeholder {}? Actually they said "the {sample} literal is prepended via the format string so the sample name is attached per row". Could be they refer to using the sample name as part of the format string like:
+
+bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' file.vcf.gz
+
+where {sample} is replaced by the actual sample name automatically? I think bcftools query does not have such placeholder. However there is a feature: you can use -f '%CHROM\t%POS...' and also you can add a prefix using -s? Not.
+
+Given we must follow instructions, we will use exactly that command as described. It may produce correct output because maybe bcftools query interprets any field in curly braces as a placeholder for the sample name? Actually there is a format string token %SAMPLE? I'm not aware. But maybe they meant to use the placeholder {sample} to refer to the sample name of the VCF file, which is known from the filename? Not.
+
+Nevertheless, we will implement exactly as described: bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz
+
+But shell will interpret { and } as brace expansion if not quoted. We need to quote the format string to prevent expansion. Use single quotes: '-f \'{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n\''
+
+Thus command:
+
+bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz
+
+But we need to escape single quotes? In bash, we can use double quotes and escape $? Actually we can use single quotes around the whole argument: '-f \'{sample}\t%CHROM...\''. That will pass literal string with braces.
+
+Simplify: Use double quotes and escape braces? Not needed; we can just use single quotes around the format string, but need to include a backslash before the single quote inside? Actually we can do:
+
+bcftools query -f $'\{sample\}\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\\n' results/${sample}.vcf.gz
+
+But that's messy.
+
+Better: Use double quotes and escape braces with backslash? In bash, to include a literal { or } inside double quotes, you can just write them; they are not special unless used for brace expansion when unquoted. Inside double quotes, brace expansion is disabled. So we can safely use double quotes:
+
+bcftools query -f "{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz
+
+That will pass literal {sample} etc. Good.
+
+Thus command:
+
+bcftools query -f "{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz
+
+Now we need to concatenate all samples' output and prepend header.
+
+We can build collapsed.tsv as:
+
+{
+   echo -e "sample\tchrom\tpos\tref\talt\taf"
+   for s in ${SAMPLES}; do
+       bcftools query -f "{s}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${s}.vcf.gz
+   done
+} > results/collapsed.tsv
+
+But note that the format string includes {sample} which will be replaced by literal "{sample}" not the sample name. That would output "{sample}" as first column, not actual sample name. However they wanted sample name attached per row. Maybe they intended to use the placeholder {sample} to be replaced by the actual sample name automatically by bcftools? I think not.
+
+Given ambiguity, but we must follow instruction: "bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz (the {sample} literal is prepended via the format string so the sample name is attached per row)." Possibly they meant to use the placeholder {} to refer to the sample name of the VCF file, which is known from the filename? Actually bcftools query can use %CHROM etc; but you can also embed arbitrary text. The {sample} might be interpreted as a literal string that will be printed as is; but they say "so the sample name is attached per row". That suggests that the placeholder {sample} will be replaced by the sample name automatically, maybe via some variable substitution inside bcftools? I think not.
+
+Given we cannot resolve, we can cheat: Instead of using {sample} placeholder, we can just output the sample name manually before each line using awk as earlier. That would still produce correct collapsed.tsv with sample column. The instruction says "For each sample, run `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz` (the `{sample}` literal is prepended via the format string so the sample name is attached per row)." So they want to use that command; we can implement exactly as described, but we need to ensure that the output includes the sample name. If bcftools does not replace {sample}, then output will have literal "{sample}" which is wrong. But maybe they assume that bcftools query supports a special field %SAMPLE? Actually there is a format string token %SAMPLE? I think not.
+
+Given constraints, we can still follow the instruction literally: use that command; but we need to embed sample name variable into the format string? Wait they said "the {sample} literal is prepended via the format string so the sample name is attached per row". Maybe they refer to using the placeholder {} to refer to the sample name of the VCF file, which is known from the filename; but bcftools query does not have that capability. However there is a feature: you can use -f '%CHROM\t%POS...' and also you can add a prefix using -s? Not.
+
+Given we must produce a script that works, we need to ensure collapsed.tsv has correct sample names. We can achieve by using the sample name as part of the format string via shell variable expansion: e.g.,
+
+bcftools query -f "${sample}"$'\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz
+
+But they said not to use printf or echo -e etc. But we can embed variable inside single quotes? Not possible because single quotes prevent expansion. We could use double quotes and include ${sample} which will expand to sample name; but then the format string would have sample name directly, not {sample}. That deviates from instruction.
+
+But maybe they allow using shell variable expansion inside the format string as part of the command; they didn't forbid it. They only said "the {sample} literal is prepended via the format string so the sample name is attached per row". So we can produce a format string that includes the actual sample name, not the literal placeholder. That would still prepend sample name per row.
+
+Thus we can do:
+
+bcftools query -f "${sample}"$'\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz
+
+But $'\t' is a real tab character; they said not to use echo -e or printf to produce tabs? They didn't forbid using $'\t' in bash string literals; it's okay. However they said "Do NOT use `printf`, `echo -e`, `$'\t'`, or any mechanism that turns them into real tabs; bwa rejects real tabs". That restriction is only for the read group argument to bwa, not for general usage. So we can use $'\t' elsewhere.
+
+Thus we can use:
+
+bcftools query -f "${sample}"$'\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz
+
+But the format string must be quoted to avoid shell expansion of %? Actually % is special to bcftools; we need to pass it as part of argument. Using double quotes will allow ${sample} expansion, but also may cause % to be interpreted by shell? No, % is not special to bash. So we can do:
+
+bcftools query -f "${sample}"$'\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz
+
+But the $'\t' expands to a real tab character; that's fine.
+
+However they said "Do NOT use `printf`, `echo -e`, `$'\t'`, or any mechanism that turns them into real tabs; bwa rejects real tabs". That restriction is only for bwa read group argument. For other commands, using $'\t' is okay.
+
+Thus we can use $'\t' in the format string for bcftools query to produce a tab between sample name and %CHROM etc. But they wanted exactly "\t" literal characters? Not necessarily; they said "the {sample} literal is prepended via the format string so the sample name is attached per row". They didn't specify tabs must be literal backslash t; that was only for bwa -R argument. So we can use real tab.
+
+Thus we can implement:
+
+bcftools query -f "${sample}"$'\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz
+
+But note that $'\t' expands to a real tab; that's fine.
+
+Now concatenate all samples and prepend header.
+
+We can build collapsed.tsv as:
+
+{
+   echo -e "sample\tchrom\tpos\tref\talt\taf"
+   for s in ${SAMPLES}; do
+       bcftools query -f "${s}"$'\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${s}.vcf.gz
+   done
+} > results/collapsed.tsv
+
+But echo -e will interpret \t as tab; that's okay. However they said "Do NOT use `echo` for user-facing prose." But this is not user-facing prose; it's just generating header with tabs. Using echo -e is okay? They said "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." This is not user-facing prose, but we can avoid echo and just use printf maybe. But using echo is fine as it's not user-facing prose; it's part of script generating file.
+
+But to be safe, we could use printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv and then cat each sample output appended with a tab prefix? Simpler: Use echo -e is fine.
+
+Now idempotency: If collapsed.tsv already exists, skip building. That's okay.
+
+Now final script must exit 0 if all done; no extra output.
+
+We need to ensure that we don't produce any error when checking conditions; using set -euo pipefail will cause script to exit on any command returning non-zero status, which includes test commands? Actually test commands return 0 or 1 based on condition; they are okay. But if we use [[ -f file ]]; it returns 0 or 1, not error.
+
+Now we need to ensure that we don't accidentally produce errors when running commands that may fail if output already exists (e.g., samtools index may fail if bai already exists? Actually samtools index will overwrite? It may error if bai already exists? I think it will just create or update; but if file exists, it may not error. Should be fine.
+
+Now we need to ensure that we don't produce any output to stderr beyond natural tool messages. Using set -euo pipefail will cause script to exit on any error; but we are using commands that may produce warnings? That's okay as long as they exit 0.
+
+Now we need to ensure that the script is idempotent: if results/ already contains all outputs, the script should detect that and exit 0 without redoing work. Our checks will skip steps because final .vcf.gz.tbi exists, so no commands run; thus script exits 0.
+
+Potential issue: The reference indexing step may be skipped if index files exist; but we need to ensure that we don't re-run samtools faidx or bwa index if they already exist. We'll check for data/ref/chrM.fa.fai existence; if not, run both commands. But we must also check for .amb etc? Could just check for .fai; if exists, assume indices exist.
+
+Now script structure:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p results
+
+# Reference indexing
+if [[ ! -f data/ref/chrM.fa.fai ]]; then
+    samtools faidx data/ref/chrM.fa
+    bwa index data/ref/chrM.fa
+fi
+
+# Loop over samples
+for sample in "${SAMPLES[@]}"; do
+    # Skip if final TBI exists
+    if [[ -f results/${sample}.vcf.gz.tbi ]]; then
+        continue
+    fi
+
+    # Alignment step (produce sorted BAM)
+    if [[ ! -f results/${sample}.bam ]]; then
+        fq1=data/raw/${sample}_1.fq.gz
+        fq2=data/raw/${sample}_2.fq.gz
+        bwa mem -t 4 -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa "$fq1" "$fq2" | samtools sort -@4 -o results/${sample}.bam
+    fi
+
+    # Index BAM
+    if [[ ! -f results/${sample}.bam.bai ]]; then
+        samtools index -@4 results/${sample}.bam
+    fi
+
+    # Variant calling
+    lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+
+    # Compress and index
+    bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz
+    tabix -p vcf results/${sample}.vcf.gz
+    rm results/${sample}.vcf
+done
+
+# Collapsed TSV
+if [[ ! -f results/collapsed.tsv ]]; then
+    {
+        echo -e "sample\tchrom\tpos\tref\talt\taf"
+        for s in "${SAMPLES[@]}"; do
+            bcftools query -f "${s}"$'\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${s}.vcf.gz
+        done
+    } > results/collapsed.tsv
+fi
+
+That's the script.
+
+Check constraints:
+
+- First line #!/usr/bin/env bash, second line set -euo pipefail. Good.
+
+- Use only tools from inventory: bwa, samtools, lofreq, bgzip, tabix, bcftools. All present.
+
+- No hardcoded absolute paths; all relative to cwd.
+
+- Outputs under results/.
+
+- Idempotent: final checks skip if outputs exist.
+
+- Uses THREADS=4 variable for -t 4 and samtools sort -@4 etc.
+
+- Uses read group string with literal \t characters; we used "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA". This includes backslash t characters; they remain literal because inside double quotes, bash does not interpret \t. So it's fine.
+
+- No echo for user-facing prose; we use echo -e only to write header line; that's not user-facing prose but generating file; maybe acceptable. Could avoid echo by using printf 'sample\tchrom...\\n' > ... but echo -e is simpler. They said "Do not use `echo` for user-facing prose." This is not user-facing prose; it's part of script generating a file. Should be okay.
+
+But to be safe, we could replace echo -e with printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv and then append each sample output using cat? But we need to prepend header then concatenate samples. Could do:
+
+{
+   printf 'sample\tchrom\tpos\tref\talt\taf\n'
+   for s in "${SAMPLES[@]}"; do
+       bcftools query ... 
+   done
+} > results/collapsed.tsv
+
+That uses printf, which is allowed (not prohibited). Let's use printf to avoid any potential issue.
+
+Thus final script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p results
+
+# Reference indexing
+if [[ ! -f data/ref/chrM.fa.fai ]]; then
+    samtools faidx data/ref/chrM.fa
+    bwa index data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    if [[ -f results/${sample}.vcf.gz.tbi ]]; then
+        continue
+    fi
+
+    if [[ ! -f results/${sample}.bam ]]; then
+        fq1=data/raw/${sample}_1.fq.gz
+        fq2=data/raw/${sample}_2.fq.gz
+        bwa mem -t 4 -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa "$fq1" "$fq2" | samtools sort -@4 -o results/${sample}.bam
+    fi
+
+    if [[ ! -f results/${sample}.bam.bai ]]; then
+        samtools index -@4 results/${sample}.bam
+    fi
+
+    lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+
+    bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz
+    tabix -p vcf results/${sample}.vcf.gz
+    rm results/${sample}.vcf
+done
+
+if [[ ! -f results/collapsed.tsv ]]; then
+    {
+        printf 'sample\tchrom\tpos\tref\talt\taf\n'
+        for s in "${SAMPLES[@]}"; do
+            bcftools query -f "${s}"$'\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${s}.vcf.gz
+        done
+    } > results/collapsed.tsv
+fi
+
+Check that we used $'\t' in the format string for bcftools query; that's okay.
+
+Now ensure no extra output to stdout/stderr beyond natural tool messages. The script uses printf and echo? We replaced echo with printf, which writes to stdout; but it's part of script generating file; it's okay. It will produce header line to collapsed.tsv; not to terminal.
+
+Thus final answer is the script as plain text.

@@ -1,0 +1,168 @@
+We need to produce a bash script that follows plan. Must be idempotent: skip steps if outputs exist and newer than inputs. Use set -euo pipefail. Use only tools listed.
+
+Need to handle reference indexing: check for .amb etc. For bwa index, presence of .bwt maybe enough. We'll check for chrM.fa.bwt? Actually bwa index creates .amb .ann .bwt .pac .sa. So we can test if any missing; easiest: if ! [ -f data/ref/chrM.fa.bwt ]; then bwa index ...; fi
+
+samtools faidx: produce .fai. Check existence.
+
+Per-sample alignment: check if results/{sample}.bam exists and newer than inputs? We need to skip if bam exists and is newer than raw fastqs. Use test -nt? Actually we want to skip if output exists and is newer than all inputs. So condition: if [ ! -f results/${sample}.bam ] || [ "$results/${sample}.bam" -ot data/raw/... ]; then run alignment. But easier: use `if [[ ! -s results/${sample}.bam ]]` but need timestamp check. We'll implement a function to compare.
+
+Simpler: Use `if [[ ! -e results/${sample}.bam ]] || [[ $(find data/raw/ -name "${sample}_*.fq.gz" -printf '%T@ %p\n' | awk '{print $1}' | sort -nr | head -n1) -gt $(stat -c %Y results/${sample}.bam) ]]; then ... fi`. That is complex.
+
+Alternative: Use `touch` to create a stamp file? But we can rely on `samtools sort` will produce bam; we can skip if bam exists and its modification time > all inputs. We can use `if [[ ! -e results/${sample}.bam ]] || [[ $(stat -c %Y data/raw/${sample}_1.fq.gz) -gt $(stat -c %Y results/${sample}.bam) ]] || [[ $(stat -c %Y data/raw/${sample}_2.fq.gz) -gt $(stat -c %Y results/${sample}.bam) ]]; then ... fi`. That covers.
+
+Similarly for BAM index: check if .bai exists and newer than bam. For VCF: check .vcf.gz.tbi existence vs vcf? Actually we produce uncompressed vcf, compress to gz, index. We can skip entire variant calling if .vcf.gz.tbi exists and is newer than bam. But need to ensure that if bam updated, re-run.
+
+Simplify: For each step, check output file existence; if missing or older than input(s), run step. Use `if [[ ! -e $output ]] || [[ $(stat -c %Y $input) -gt $(stat -c %Y $output) ]]; then ... fi`. For multiple inputs, we need to compare all.
+
+We'll implement helper function `needs_run` that takes output and list of inputs; returns true if output missing or any input newer. Use array.
+
+Also for collapsed.tsv: check against all sample vcf.gz files.
+
+Implement script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+# ensure results dir
+mkdir -p results
+
+# function to test if output needs update
+needs_run() {
+  local out=$1; shift
+  local inputs=("$@")
+  if [[ ! -e $out ]]; then return 0; fi
+  for inp in "${inputs[@]}"; do
+    if [[ ! -e $inp ]]; then continue; fi
+    if [[ $(stat -c %Y "$inp") -gt $(stat -c %Y "$out") ]]; then return 0; fi
+  done
+  return 1
+}
+
+# reference indexing
+REF=data/ref/chrM.fa
+if needs_run "${REF}.fai" "$REF"; then
+  samtools faidx "$REF"
+fi
+
+if needs_run "${REF}.bwt" "$REF"; then
+  bwa index "$REF"
+fi
+
+# per-sample processing loop
+for sample in "${SAMPLES[@]}"; do
+  bam=results/${sample}.bam
+  bai=results/${sample}.bam.bai
+  vcf_uncompressed=results/${sample}.vcf
+  vcf_gz=results/${sample}.vcf.gz
+  vcf_tbi=results/${sample}.vcf.gz.tbi
+
+  fq1=data/raw/${sample}_1.fq.gz
+  fq2=data/raw/${sample}_2.fq.gz
+
+  # alignment and sort
+  if needs_run "$bam" "$fq1" "$fq2"; then
+    bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" "$REF" "$fq1" "$fq2" | \
+      samtools sort -@ $THREADS -o "$bam"
+  fi
+
+  # index bam
+  if needs_run "$bai" "$bam"; then
+    samtools index -@ $THREADS "$bam"
+  fi
+
+  # variant calling
+  if needs_run "$vcf_gz" "$bam"; then
+    lofreq call-parallel --pp-threads $THREADS -f "$REF" -o "$vcf_uncompressed" "$bam"
+    bgzip -c "$vcf_uncompressed" > "$vcf_gz"
+    tabix -p vcf "$vcf_gz"
+    rm -f "$vcf_uncompressed"
+  fi
+done
+
+# collapse table
+collapsed=results/collapsed.tsv
+if needs_run "$collapsed" $(printf "results/%s.vcf.gz\n" "${SAMPLES[@]}"); then
+  # header
+  printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed"
+  for sample in "${SAMPLES[@]}"; do
+    bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> "$collapsed"
+  done
+fi
+
+exit 0
+
+Need to ensure bgzip is available? Not in inventory. They didn't list bgzip, but bcftools can compress with -O z. But plan says use bgzip. Is bgzip part of htslib? Usually bgzip is separate binary; not listed. We could use `bcftools view -O z`. But plan explicitly says bgzip. However tool inventory doesn't include bgzip. Maybe they expect bcftools to provide bgzip? Actually bcftools includes a bgzip executable in its package. It might be available as `bgzip` on PATH. Usually yes, bcftools distribution includes bgzip. So we can use bgzip.
+
+But need to ensure tabix is used for indexing; that's fine.
+
+Also need to check that lofreq call-parallel writes uncompressed VCF to file path given by -o? The plan says write uncompressed VCF to temporary path (e.g., results/{sample}.vcf). So we use -o. Good.
+
+Need to ensure that `needs_run` for collapsed uses all vcf.gz files as inputs; but we also need to consider if any of those are missing? They should exist because earlier steps produce them. But if missing, needs_run will skip? It will return 0 if output missing or any input newer. If an input missing, stat fails; our function continues. We might want to treat missing input as needing run. But collapsed only runs after all vcf.gz exist. So we can check existence of each before calling needs_run. We'll just rely on earlier steps.
+
+But the `needs_run` for collapsed uses $(printf "results/%s.vcf.gz\n" ...) which expands into multiple arguments? Actually needs_run expects first arg output, then list of inputs as separate args. Using printf with newline will produce a single string containing newlines; but when passed to function, it becomes one argument. We need to pass each file separately: we can use array.
+
+Simpler: create an array vcf_files and call needs_run "$collapsed" "${vcf_files[@]}". Let's modify.
+
+Also for bam index step: needs_run "$bai" "$bam" is fine.
+
+For variant calling, we check if needs_run "$vcf_gz" "$bam". But we also need to consider that .vcf.gz may exist but older than bam. Good.
+
+But we also need to ensure that the intermediate vcf file is removed after compression; but if script reruns and vcf_gz exists newer than bam, it will skip variant calling entirely, leaving no uncompressed vcf. That's fine.
+
+Edge: If vcf_gz exists but .tbi missing? needs_run "$vcf_gz" won't check tbi. But we index after compression; if tbi missing but vcf.gz present, script would skip variant calling and not create tbi. That could be problematic. We should ensure that both vcf.gz and its tbi exist. So maybe use needs_run for both: if needs_run "$vcf_gz" "$bam" || ! -e "$vcf_tbi". But easier: after compression, we always index; but if script reruns and vcf_gz exists newer than bam, we skip entire block, leaving tbi missing. So we need to check that both exist.
+
+Simpler: treat variant calling step as needing run if either vcf.gz missing or tbi missing or bam newer. So:
+
+if needs_run "$vcf_gz" "$bam" || ! [[ -e $vcf_tbi ]]; then ... fi
+
+But needs_run already checks output existence; we can modify to check both.
+
+Let's implement:
+
+if needs_run "$vcf_gz" "$bam" || [[ ! -e $vcf_tbi ]]; then
+  ...
+fi
+
+Also need to ensure that if vcf.gz exists but tbi missing, we still run block. Good.
+
+Similarly for collapsed: need to check all vcf.gz exist and are newer than collapsed. We'll gather array of vcf_gz files; if any missing, skip? But we want to produce collapsed only when all present. So we can check existence first.
+
+Implementation:
+
+vcf_files=()
+for sample in "${SAMPLES[@]}"; do
+  vcf_files+=("results/${sample}.vcf.gz")
+done
+
+# ensure all exist
+all_exist=true
+for f in "${vcf_files[@]}"; do
+  [[ -e $f ]] || { all_exist=false; break; }
+done
+
+if $all_exist && needs_run "$collapsed" "${vcf_files[@]}"; then
+  ...
+fi
+
+But we also need to consider if any vcf.gz newer than collapsed. Good.
+
+Also for bam index: same logic.
+
+Let's adjust script accordingly.
+
+Also ensure that `bwa mem -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"` uses literal backslash-t. In bash, the string will have backslashes; we need to escape them properly. The argument is a single double-quoted string containing backslash-t sequences. We can write:
+
+-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"
+
+Because inside double quotes, `\\` becomes literal backslash; then `\t` remains as two characters? Wait: In double-quoted string, `\\` expands to single backslash. Then we have `\t`. But `\t` is not special in bash unless using $'...' or echo -e. So it will be literal backslash and t. Good.
+
+But we need to escape the backslashes for shell: each backslash must be escaped. So we use `\\t`. That yields a single backslash then 't'. Good.
+
+Thus command is fine.
+
+Now final script:
+
+Let's produce final code accordingly.

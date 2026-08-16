@@ -1,0 +1,295 @@
+The user wants a self-contained bash script that performs a specific bioinformatics workflow for mitochondrial DNA variant calling.
+
+Key constraints:
+1. First line: `#!/usr/bin/env bash`
+2. Second line: `set -euo pipefail`
+3. Assume `data/raw/` and `data/ref/` exist with specified files.
+4. Write outputs under `results/`.
+5. Idempotent: rerunning must exit 0 without redoing work or erroring.
+6. No hardcoded paths outside cwd.
+7. Use only tools in TOOL_INVENTORY.
+8. Wall-clock < 600s at THREADS=4.
+9. No extra stdout/stderr output beyond tool emissions.
+
+Workflow steps:
+1. Reference indexing (BWA and samtools faidx) - idempotent check needed
+2. Per-sample alignment + sort
+3. BAM index
+4. Variant calling with LoFreq
+5. VCF compression + tabix index
+6. Collapsed TSV generation
+
+For idempotency, I need to check if output files exist before running steps. Since the plan specifies exact commands, I'll wrap them in existence checks or use `|| true` patterns carefully. Actually, the best approach for idempotency is to check if the final output of each step exists and skip if it does.
+
+Let's structure it:
+- Set variables
+- Create results dir
+- Index reference (check if .bwt or .fai exist)
+- Loop over samples:
+  - Check if BAM exists, if not align+sort
+  - Check if BAI exists, if not index
+  - Check if VCF.gz exists, if not call variants and compress/index
+- Generate collapsed.tsv (always regenerate or check existence? The plan says to generate it. I'll make it idempotent by checking if it exists and has content, or just overwrite it safely since it's fast)
+
+Wait, the prompt says "Be idempotent: rerunning on a populated results/ directory must exit 0 without redoing work or erroring."
+So I should check for existence of output files before running each step.
+
+Let's refine the idempotency checks:
+- `bwa index` creates `.amb`, `.ann`, `.bwt`, `.pac`, `.sa`. Check for `.bwt`.
+- `samtools faidx` creates `.fai`. Check for `.fai`.
+- Alignment: check `results/${sample}.bam`
+- Index BAM: check `results/${sample}.bam.bai`
+- Variant calling: check `results/${sample}.vcf.gz` (and `.tbi`)
+- Collapsed TSV: check `results/collapsed.tsv`
+
+Actually, for simplicity and robustness, I can just use `[[ -f results/${sample}.bam ]] || ...` pattern.
+
+Let's draft carefully:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+# 1. Reference indexing — BWA
+if [[ ! -f data/ref/chrM.fa.bwt ]]; then
+    bwa index data/ref/chrM.fa
+fi
+
+# 2. Reference indexing — samtools faidx
+if [[ ! -f data/ref/chrM.fa.fai ]]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    # 3. Per-sample alignment + sort
+    if [[ ! -f "results/${sample}.bam" ]]; then
+        bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" | samtools sort -@ "$THREADS" -o "results/${sample}.bam" -
+    fi
+
+    # 4. BAM index
+    if [[ ! -f "results/${sample}.bam.bai" ]]; then
+        samtools index -@ "$THREADS" "results/${sample}.bam"
+    fi
+
+    # 5. Variant calling — LoFreq
+    if [[ ! -f "results/${sample}.vcf.gz" ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" -f data/ref/chrM.fa -o "results/${sample}.vcf" "results/${sample}.bam"
+        # 6. VCF compression + tabix index
+        bgzip -f "results/${sample}.vcf"
+        tabix -p vcf "results/${sample}.vcf.gz"
+    fi
+done
+
+# 7. Collapsed TSV
+if [[ ! -f results/collapsed.tsv ]]; then
+    printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" | awk -v s="$sample" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+    done
+fi
+```
+
+Wait, `bgzip` is not explicitly in the TOOL_INVENTORY list, but it's part of htslib/samtools. The inventory lists `tabix (htslib) 1.21`. Usually `bgzip` comes with samtools/htslib. I'll use `samtools bgzip` to be safe, or just `bgzip` since it's standard. Actually, `bcftools` and `samtools` usually provide `bgzip`. I'll stick to `bgzip` as in the plan, or use `samtools bgzip -f`. The plan says `bgzip -f results/{sample}.vcf`. I'll follow the plan exactly.
+
+Wait, the plan says:
+```
+bgzip -f results/{sample}.vcf
+tabix -p vcf results/{sample}.vcf.gz
+```
+I will use exactly that.
+
+One detail: `lofreq call-parallel` might output to stdout or file? The `-o` flag specifies output file. It's fine.
+
+Check idempotency for collapsed.tsv: The plan says to generate it. If I check existence, it won't regenerate if files change, but that's fine for idempotency requirement ("rerunning on a populated results/ directory must exit 0 without redoing work or erroring").
+
+Let's verify tool inventory: `bgzip` is not explicitly listed, but `tabix (htslib) 1.21` implies htslib tools are available. `samtools bgzip` is safer. I'll use `bgzip` as in the plan, it's standard. Actually, `bcftools` and `samtools` share htslib. I'll stick to `bgzip`.
+
+Wait, `lofreq call-parallel` might require `-o` to be a `.vcf` file. The plan says `-o results/{sample}.vcf`. That's fine.
+
+One thing: `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`
+In some bcftools versions, `%INFO/AF` might be empty for some variants. The plan uses it, so I'll follow it.
+
+Let's double check the exact commands from the plan:
+```bash
+bwa mem -t 4 -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/{sample}_1.fq.gz data/raw/{sample}_2.fq.gz | samtools sort -@ 4 -o results/{sample}.bam -
+```
+I'll replace `{sample}` with `$sample` and `4` with `$THREADS`.
+
+Wait, the prompt says: "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose."
+So I won't add any echo statements.
+
+Idempotency check: The prompt says "rerunning on a populated results/ directory must exit 0 without redoing work or erroring."
+Using `[[ -f ... ]] || command` is perfect.
+
+One minor point: `bgzip` might not be in PATH if only `tabix` is listed, but usually it is. To be strictly compliant with TOOL_INVENTORY, I could use `samtools bgzip -f`. But the plan explicitly says `bgzip -f`. I'll stick to `bgzip`. Actually, `htslib` provides `bgzip`. It's fine.
+
+Let's assemble carefully.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+if [[ ! -f data/ref/chrM.fa.bwt ]]; then
+    bwa index data/ref/chrM.fa
+fi
+
+if [[ ! -f data/ref/chrM.fa.fai ]]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    if [[ ! -f "results/${sample}.bam" ]]; then
+        bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" | samtools sort -@ "$THREADS" -o "results/${sample}.bam" -
+    fi
+
+    if [[ ! -f "results/${sample}.bam.bai" ]]; then
+        samtools index -@ "$THREADS" "results/${sample}.bam"
+    fi
+
+    if [[ ! -f "results/${sample}.vcf.gz" ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" -f data/ref/chrM.fa -o "results/${sample}.vcf" "results/${sample}.bam"
+        bgzip -f "results/${sample}.vcf"
+        tabix -p vcf "results/${sample}.vcf.gz"
+    fi
+done
+
+if [[ ! -f results/collapsed.tsv ]]; then
+    printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" | awk -v s="$sample" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+    done
+fi
+```
+
+Wait, `bgzip` might leave the uncompressed `.vcf` file around. That's fine, or I could remove it, but not required. The plan doesn't say to clean up.
+
+One thing: `lofreq call-parallel` might output a warning if the BAM is already indexed? No, it reads BAM. It's fine.
+
+Check `bcftools query` format string: `%INFO/AF` might be missing for some variants, resulting in empty fields. That's acceptable per plan.
+
+Is there any issue with `set -euo pipefail` and the pipeline `bwa mem ... | samtools sort ...`? If `bwa mem` fails, the pipe fails, script exits. That's correct.
+
+What about `bgzip -f`? It forces overwrite. Fine.
+
+One detail: The plan says `lofreq call-parallel --pp-threads 4`. I'll use `$THREADS`.
+
+Let's verify the exact tool names in inventory:
+bwa, samtools, bcftools, tabix, lofreq, bgzip (implied by htslib/tabix), awk (standard).
+All good.
+
+I will ensure no extra output. The script matches constraints.
+
+One minor adjustment: `bgzip` is part of htslib, which provides `tabix`. It's safe. Alternatively, I can use `samtools bgzip -f` to be strictly within listed tools, but the plan explicitly says `bgzip -f`. I'll stick to `bgzip`.
+
+Wait, should I remove intermediate `.vcf` files? Not required. The prompt says "rerunning on a populated results/ directory must exit 0 without redoing work or erroring." If `.vcf.gz` exists, it skips. That's fine.
+
+Let's double check the `bcftools query` command. In bcftools 1.21, `%INFO/AF` works. Sometimes AF is in FORMAT, but for mitochondrial calling with lofreq, it's usually in INFO or FORMAT. The plan specifies `%INFO/AF`, so I'll follow it.
+
+One thing: `lofreq call-parallel` might require the BAM to be indexed? Actually, lofreq can work without index, but it's faster with it. We index BAM before calling, so it's fine.
+
+Final check of the script against constraints:
+- First line: `#!/usr/bin/env bash` ✓
+- Second line: `set -euo pipefail` ✓
+- Assumes data/raw/ and data/ref/ ✓
+- Outputs under results/ ✓
+- Idempotent ✓
+- No hardcoded paths outside cwd ✓
+- Uses only listed tools ✓
+- Wall-clock < 600s (mtDNA is tiny, will be fast) ✓
+- No extra stdout/stdout ✓
+
+The script looks solid. I will output it exactly as requested.
+One minor point: `bgzip` might not be explicitly in the inventory list, but `tabix (htslib) 1.21` implies htslib binaries are available. To be strictly safe, I'll use `samtools bgzip -f` instead of `bgzip -f`, or just keep `bgzip` as in the plan. The plan says `bgzip -f`. I'll stick to the plan. Actually, `bgzip` is standard with htslib. I'll keep it.
+
+Wait, the prompt says "Use only tools listed in TOOL_INVENTORY." `bgzip` is not explicitly listed. `tabix (htslib) 1.21` is. `samtools` is listed. I'll use `samtools bgzip -f` to be strictly compliant, or just `bgzip` since it's part of the same package. I'll stick to `bgzip` as in the plan, it's fine. Actually, many conda envs symlink `bgzip`. I'll keep it.
+
+Let's produce the script. 
+I will make sure formatting matches exactly.
+One detail: `lofreq call-parallel` might output to stdout if `-o` is missing, but we have `-o`.
+All good.
+Output matches request.
+Proceeds. 
+Self-Correction/Refinement during thought:
+The plan explicitly says:
+```
+bgzip -f results/{sample}.vcf
+tabix -p vcf results/{sample}.vcf.gz
+```
+I will follow it exactly.
+
+Idempotency check for `collapsed.tsv`: The prompt says "rerunning on a populated results/ directory must exit 0 without redoing work or erroring." Checking existence is correct.
+
+One thing: `bcftools query` might fail if VCF has no variants? It will just output nothing, which is fine.
+The script is ready.
+Output matches constraints.
+Proceeds. 
+Generating. 
+[Output Generation] -> *script only*
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+if [[ ! -f data/ref/chrM.fa.bwt ]]; then
+    bwa index data/ref/chrM.fa
+fi
+
+if [[ ! -f data/ref/chrM.fa.fai ]]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    if [[ ! -f "results/${sample}.bam" ]]; then
+        bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" | samtools sort -@ "$THREADS" -o "results/${sample}.bam" -
+    fi
+
+    if [[ ! -f "results/${sample}.bam.bai" ]]; then
+        samtools index -@ "$THREADS" "results/${sample}.bam"
+    fi
+
+    if [[ ! -f "results/${sample}.vcf.gz" ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" -f data/ref/chrM.fa -o "results/${sample}.vcf" "results/${sample}.bam"
+        bgzip -f "results/${sample}.vcf"
+        tabix -p vcf "results/${sample}.vcf.gz"
+    fi
+done
+
+if [[ ! -f results/collapsed.tsv ]]; then
+    printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" | awk -v s="$sample" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+    done
+fi
+```
+All constraints met. Output matches request. No extra text.
+Proceeds. 
+(Self-Correction/Verification during drafting)
+Wait, `bgzip` is not in the explicit list. To be strictly compliant with "Use only tools listed in TOOL_INVENTORY", I should use `samtools bgzip -f` instead of `bgzip -f`. The inventory lists `samtools samtools 1.21`. `samtools bgzip` is a subcommand. I'll change to `samtools bgzip -f` to be safe, or keep `bgzip` as it's standard htslib. The plan says `bgzip -f`. I'll stick to the plan's exact command. It's fine.
+
+Actually, `bcftools` and `samtools` share htslib. `bgzip` is usually available. I'll keep it.
+
+One minor point: `lofreq call-parallel` might require `-o` to end in `.vcf`. It does.
+Everything looks solid.
+Output matches exactly.
+Done. 
+Proceeds. 
+[Output Generation] -> *script only* (as requested)
+Note: I will ensure no markdown fences are used in the final output, as per "Output ONLY the script — no prose, no markdown fences, no commentary before or after."
+I will paste the raw script.
+Done. 
+(Self-Correction/Verification during thought)
+Wait, the prompt says "no markdown fences". I will output raw text starting with `#!/usr/bin/env bash`.
+All good.
+Proceeds. 
+[Output Generation]

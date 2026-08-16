@@ -1,0 +1,162 @@
+We need to produce a self-contained bash script with first line "#!/usr/bin/env bash" (note they wrote /usr/ bin? Actually they said 1st line must be: #!/usr/ bin/ env bash . That's weird: maybe typo. Should be "#!/usr/bin/env bash". But they explicitly say first line must be: #!/usr/ bin/ env bash . So we must output exactly that string as first line.
+
+Second line set -euo pipefail
+
+Then script content.
+
+We need to use only tools in inventory, no echo for user-facing prose. Use idempotency checks.
+
+We'll write script with variables THREADS=4 SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"
+
+Create results dir: mkdir -p results
+
+Reference indexing: check if .fai and index files exist; if not run samtools faidx and bwa index.
+
+Per sample alignment: loop over samples, generate read group string exactly as described. Use bwa mem -t $THREADS -R "..." input1.gz input2.gz > tmp.sam
+
+Sort: samtools sort -@ $THREADS -o results/${sample}.bam< tmp.sam ; rm tmp.sam
+
+Index: samtools index -@ $THREADS results/${sample}.bam
+
+Variant calling: lofreq call-parallel --pp-threads 4 --ref data/ref/chrM.fa --input results/${sample}.bam --output results/${sample}.vcf > tmp.vcf ; rm tmp.vcf
+
+Compress: bgzip -@ $THREADS results/${sample}.vcf.gz ; tabix -p vcf -@ $THREADS results/${sample}.vcf.gz.tbi ; rm results/${sample}.vcf
+
+Collapse: need to generate collapsed.tsv only if any input VCF newer than TSV.
+
+We'll compute latest timestamp of each sample's .vcf.gz and maybe also .bam? Use bcftools query -f format string.
+
+Simplify: we can just check if results/collapsed.tsv exists and is older than any .vcf.gz; if so rebuild.
+
+But requirement: "Rebuild only if any input VCF is newer than the TSV." So we need to compare timestamps.
+
+We'll compute max_ts=$(stat -c %Y results/*.vcf.gz 2>/dev/null | sort -n | tail -1) but careful.
+
+Simpler: use bcftools query to generate collapsed.tsv directly? But they want to produce via loop.
+
+Implementation:
+
+if [[ ! -s results/collapsed.tsv ]]; then
+   echo "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv
+fi
+
+for sample in $SAMPLES; do
+   vcf=${sample}.vcf.gz
+   if [[ $(stat -c %Y "$vcf") -lt $(stat -c %Y results/collapsed.tsv) ]]; then
+       # rebuild
+       bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$vcf" >> results/collapsed.tsv
+   fi
+done
+
+But need to ensure header only once.
+
+Better: start with header, then loop appends if needed.
+
+Implementation:
+
+if [[ ! -s results/collapsed.tsv ]]; then
+   echo "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv
+fi
+
+for sample in $SAMPLES; do
+   vcf=${sample}.vcf.gz
+   if [[ $(stat -c %Y "$vcf") -lt $(stat -c %Y results/collapsed.tsv) ]]; then
+       bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$vcf" >> results/collapsed.tsv
+   fi
+done
+
+But need to ensure that if any VCF newer, we rebuild entire file (overwrite). Simpler: compute latest timestamp of all .vcf.gz and compare with TSV; if TSV older, recreate.
+
+We'll do:
+
+if [[ -s results/collapsed.tsv ]]; then
+   tsv_ts=$(stat -c %Y results/collapsed.tsv)
+else
+   tsv_ts=0
+fi
+
+latest_vcf=$(stat -c %Y $(ls results/*.vcf.gz 2>/dev/null | sort -n | tail -1) 2>/dev/null)
+
+if [[ $latest_vcf -gt $tsv_ts ]]; then
+   # rebuild
+   echo "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv
+   for sample in $SAMPLES; do
+       vcf=${sample}.vcf.gz
+       bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$vcf" >> results/collapsed.tsv
+   done
+fi
+
+But need to ensure that if any VCF newer, we rebuild entire file (overwrite). That's fine.
+
+Now idempotency: after building, script ends; no further checks needed.
+
+We must not use echo for user-facing prose beyond tools natural output. Using echo only for header line is okay? It's part of script, not user-facing. But they said "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user- facing prose." So using echo inside script is fine.
+
+But we must avoid echo that prints messages.
+
+Now produce final script with first two lines as required.
+
+Let's craft script:
+
+#!/usr/ bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"
+
+mkdir -p results
+
+# Reference indexing (once)
+if [[ ! -f data/ref/chrM.fa.fai ]] || [[ ! -f data/ref/chrM.amb ]] || [[ ! -f data/ref/chrM.ann ]] || [[ ! -f data/ref/chrM.bwt ]] || [[ ! -f data/ref/chrM.pac ]] || [[ ! -f data/ref/chrM.sa ]]; then
+   samtools faidx data/ref/chrM.fa
+   bwa index data/ref/chrM.fa
+fi
+
+# Per-sample processing
+for sample in $SAMPLES; do
+   # Alignment
+   bwa mem -t $THREADS -R ":@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz > results/tmp.sam
+   samtools sort -@ $THREADS -o results/${sample}.bam< results/tmp.sam
+   rm results/tmp.sam
+   samtools index -@ $THREADS results/${sample}.bam
+
+   # Variant calling
+   lofreq call-parallel --pp-threads 4 --ref data/ref/chrM.fa --input results/${sample}.bam --output results/${sample}.vcf > results/tmp.vcf
+   bgzip -@ $THREADS results/${sample}.vcf.gz
+   tabix -p vcf -@ $THREADS results/${sample}.vcf.gz.tbi
+   rm results/${sample}.vcf
+
+done
+
+# Collapse table
+if [[ ! -s results/collapsed.tsv ]]; then
+   echo "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv
+fi
+
+# Determine if any VCF newer than TSV -> rebuild
+if [[ -s results/collapsed.tsv ]]; then
+   tsv_ts=$(stat -c %Y results/collapsed.tsv)
+else
+   tsv_ts=0
+fi
+latest_vcf=$(stat -c %Y $(ls results/*.vcf.gz 2>/dev/null | sort -n | tail -1) 2>/dev/null)
+
+if [[ $latest_vcf -gt $tsv_ts ]]; then
+   echo "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv
+   for sample in $SAMPLES; do
+       vcf=${sample}.vcf.gz
+       bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$vcf" >> results/collapsed.tsv
+   done
+fi
+
+Now check first line: they said "1st line must be: #!/usr/ bin/ env bash". That's weird: maybe they want "#!/usr/bin/env bash"? But they wrote with slash between usr and bin? Actually typical is "#!/usr/bin/env bash". The string "usr/ bin" includes slash. Could be a typo but we must output exactly as given.
+
+Thus first line: #!/usr/ bin/ env bash
+
+Second line: set -euo pipefail
+
+Now script lines after that.
+
+Make sure no extra spaces at end.
+
+Let's produce final answer.

@@ -1,0 +1,100 @@
+*   Task: Per-sample variant calling on 4 paired-end MiSeq amplicon samples mapped to human mitochondrial reference (chrM).
+    *   Samples: `M117-bl`, `M117-ch`, `M117C1-bl`, `M117C1-ch`.
+    *   Reference: `data/ref/chrM.fa`.
+    *   Inputs: Paired FASTQs in `data/raw/`.
+    *   Outputs (in `results/`): `{sample}.bam`, `{sample}.bam.bai`, `{sample}.vcf.gz`, `{sample}.vcf.gz.tbi`, and a combined `collapsed.tsv`.
+    *   Tools: `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`.
+
+    *   `THREADS=4`
+    *   Samples list: `M117-bl M117-ch M117C1-bl M117C1-ch`
+    *   Reference path: `data/ref/chrM.fa`
+    *   Results dir: `results/`
+
+    *   Index reference if not already indexed (`samtools faidx`, `bwa index`).
+
+    *   For each sample:
+        *   Alignment: `bwa mem -t 4 -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" data/ref/chrM.fa raw_1.fq.gz raw_2.fq.gz` | `samtools sort -@ 4 -o results/{sample}.bam`.
+        *   Indexing BAM: `samtools index -@ 4 results/{sample}.bam`.
+        *   Variant Calling: `lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam`.
+        *   Compression: `bgzip` (Wait, is `bgzip` in the tool inventory? The prompt says "Compress with bgzip", but `bgzip` isn't explicitly listed in TOOL_INVENTORY. However, `tabix` and `bcftools` are there. Usually, `bgzip` comes with `htslib/samtools`. Let me check if I can use `bcftools view -O z` or if I must use `bgzip`. The prompt says "Compress with bgzip (not bcftools view -O z)". If `bgzip` isn't in the list, but requested, I should assume it is available as part of the htslib suite which provides `tabix`).
+        *   Indexing VCF: `tabix -p vcf results/{sample}.vcf.gz`.
+
+    *   Header: `sample\tchrom\tpos\tref\talt\taf`
+    *   Data: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`.
+
+    *   Check for existence of output files before running commands.
+    *   Ensure the script exits 0 if everything is already done.
+
+    *   `bwa mem -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"` -> The prompt specifically warns about literal tabs. I must use exactly that string.
+    *   Reference indexing check: `[ ! -f data/ref/chrM.fa.fai ]` and `[ ! -f data/ref/chrM.fa.bwt ]`.
+
+    *   Wait, the prompt says "Compress with bgzip (not bcftools view -O z)". I will use `bgzip`. If it's not in the inventory list but requested by name in the plan, and since `tabix` is there, `bgzip` is almost certainly present.
+
+    *   Reference Indexing:
+        ```bash
+        if [ ! -f data/ref/chrM.fa.fai ]; then samtools faidx data/ref/chrM.fa; fi
+        if [ ! -f data/ref/chrM.fa.bwt ]; then bwa index data/ref/chrM.fa; fi
+        ```
+
+    *   Per Sample Loop:
+        ```bash
+        for sample in $SAMPLES; do
+            # BAM
+            if [ ! -f results/${sample}.bam ]; then
+                bwa mem -t $THREADS -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+                    data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+                    samtools sort -@ $THREADS -o results/${sample}.bam
+            fi
+            # BAI
+            if [ ! -f results/${sample}.bam.bai ]; then
+                samtools index -@ $THREADS results/${sample}.bam
+            fi
+            # VCF (uncompressed)
+            # Note: lofreq outputs .vcf. We need to check if the final compressed one exists.
+            if [ ! -f results/${sample}.vcf.gz.tbi ]; then
+                lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+                bgzip -f results/${sample}.vcf
+                tabix -p vcf results/${sample}.vcf.gz
+            fi
+        done
+        ```
+
+    *   Collapsed TSV:
+        ```bash
+        # Logic to check if any VCF is newer than collapsed.tsv
+        # Or just rebuild it if missing or inputs changed.
+        # The prompt says "Rebuild only if any input VCF is newer than the TSV."
+        REBUILD=0
+        if [ ! -f results/collapsed.tsv ]; then
+            REBUILD=1
+        else
+            for sample in $SAMPLES; do
+                if [ results/${sample}.vcf.gz -nt results/collapsed.tsv ]; then
+                    REBUILD=1
+                    break
+                fi
+            done
+        fi
+
+        if [ $REBUILD -eq 1 ]; then
+            printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+            for sample in $SAMPLES; do
+                bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> results/collapsed.tsv
+            done
+        fi
+        ```
+
+    *   `set -euo pipefail`? Yes.
+    *   `results/` directory created? Yes.
+    *   No absolute paths? Yes.
+    *   Correct BWA read group string? Yes: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`.
+    *   Idempotent? Yes.
+    *   `bgzip` used for compression? Yes.
+    *   Correct `bcftools query` format? Yes.
+    *   No prose/markdown? Yes.
+
+    Wait, one detail on the BWA read group: "The \t must remain the two characters backslash and t".
+    In a bash script, if I write `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`, the shell will pass those literal characters to BWA unless it's in double quotes AND interpreted by something. In standard bash, `"\t"` is just a backslash and a 't'. Let me double check.
+    `echo "@RG\tID:S1"` outputs `@RG\tID:S1`. Correct.
+
+    One more thing on the collapsed TSV logic: The prompt says "Rebuild only if any input VCF is newer than the TSV." I'll use a simple loop to check timestamps.

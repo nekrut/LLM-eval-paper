@@ -1,0 +1,210 @@
+We need to produce a bash script that follows constraints: first line #!/usr/bin/env bash; second set -euo pipefail. Must be idempotent: if results/ already contains outputs, exit 0 without redoing work or erroring.
+
+Thus we need to check for existence of each output file before generating it. For reference indexing, we can check if index files exist (.bwt etc). For samtools faidx, check .fai. For each sample, check bam and bai; vcf.gz and tbi; collapsed.tsv final after all samples.
+
+Also need to use only tools listed: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. We don't need others. For bgzip we can use 'bgzip' from htslib? Not in inventory but tabix is part of htslib; bgzip may be available as part of samtools or bcftools? Usually bgzip is separate but often included with samtools/htslib. But not listed explicitly. We could use 'samtools view -b' etc? For compressing VCF, we can use 'bgzip' if present. Not in inventory list; but maybe 'bgzip' is part of htslib and available. The inventory lists tabix (htslib) 1.21. Usually bgzip is also part of htslib. So assume bgzip exists.
+
+But to be safe, we could use 'samtools view -b' not compress VCF. We need gzipped VCF. Use 'bgzip'. We'll rely on it being available.
+
+Also need to ensure thread usage: bwa mem -t 4; samtools sort -@ 4; lofreq call-parallel --pp-threads 4; bcftools query no threads needed.
+
+We also need to produce collapsed.tsv header and append per sample lines. Use awk.
+
+Make sure script is idempotent: if results/collapsed.tsv exists, skip creation? But we still need to ensure it's correct. We can check if file exists and has content; but easier: after processing all samples, create collapsed.tsv only if not exist. But if it exists from previous run, we should exit 0 without redoing work. So at start of script, we could check if results/collapsed.tsv exists and all sample outputs exist; then exit 0.
+
+Simpler: At top, check for existence of all expected files: reference indexes (.bwt etc), .fai, per-sample bam,bai,vcf.gz,tbi. If all present, exit 0. Else proceed to create missing ones.
+
+But we need to compute which missing; but easier: just run commands with checks before each step. For example:
+
+if [ ! -f data/ref/chrM.fa.bwt ]; then bwa index ... fi
+
+Similarly for samtools faidx.
+
+For each sample, if bam not exist, run alignment+sort. If bai not exist, index bam. If vcf.gz not exist, call lofreq and compress etc.
+
+Finally collapsed.tsv: if not exist, create header and append per sample lines.
+
+But we also need to ensure that if some outputs missing but others present, script will produce them. Good.
+
+Edge: When generating collapsed.tsv, we should use bcftools query for each sample; but if vcf.gz missing, skip? But we only call after all samples processed.
+
+Implementation details:
+
+Define THREADS=4
+SAMPLES array
+
+mkdir -p results
+
+Reference indexing:
+
+if [ ! -f data/ref/chrM.fa.bwt ]; then bwa index ... fi
+
+samtools faidx: check .fai file.
+
+For each sample:
+
+bam_file="results/${sample}.bam"
+bai_file="${bam_file}.bai"
+
+If bam not exist, run alignment+sort. Use -R header with sample id etc.
+
+After that, if bai missing, samtools index.
+
+vcf_gz="results/${sample}.vcf.gz"
+
+If vcf_gz missing, call lofreq and compress:
+
+lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+
+Then bgzip results/${sample}.vcf (force overwrite). Then tabix.
+
+Also need to ensure .tbi exists: tabix will create .tbi. So check if vcf_gz.tbi missing.
+
+After all samples, collapsed.tsv:
+
+collapsed="results/collapsed.tsv"
+
+If not exist, create header and then for each sample, run bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> collapsed
+
+But we need to ensure that if collapsed exists, skip. But we also might want to check if all sample vcf.gz exist; but that's already ensured earlier.
+
+Edge: bcftools query may produce multiple alt lines; fine.
+
+Also need to ensure no extra output to stdout/stderr beyond tool natural outputs. We should not use echo for user messages. Use only commands that produce output as needed. The script itself will produce nothing unless tools print.
+
+We must avoid using 'printf' for header? That prints to stdout, which may be considered user-facing prose. But requirement: "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." Using printf writes to stdout. That's not allowed. So we cannot create collapsed.tsv with printf that outputs to stdout. We need to redirect output to file, but still the command prints to stdout? Actually 'printf' writes to stdout; if we redirect to a file using > results/collapsed.tsv, then nothing goes to console. But the command itself is not considered user-facing prose? It's just generating file content. The requirement says "Do not write to stderr/stdout beyond what tools naturally emit". Using printf may be considered writing to stdout. But it's part of script; but it writes to a file via redirection, so no output to console. That might be acceptable.
+
+But we can also use 'tee' or 'cat <<EOF >file'. That's still writing to stdout? cat with heredoc writes to stdout; redirect to file. So fine.
+
+Thus using printf is okay as long as redirected.
+
+Also bcftools query prints to stdout; we pipe and append to collapsed.tsv, so no console output.
+
+Now ensure script uses only allowed tools: bwa, samtools, lofreq, bgzip, tabix, bcftools. All are in inventory.
+
+We need to use 'bgzip' - but not listed explicitly. But part of htslib; maybe available. If not, we could compress using 'samtools view -b'? No that's for BAM. For VCF compression, we can use 'bcftools norm -Oz -o results/${sample}.vcf.gz results/${sample}.vcf' but bcftools has '-O z'. But we need to index with tabix. So we could use 'bcftools view -Oz -o ...' or 'bgzip'. Let's use 'bgzip', simpler.
+
+Now script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Reference indexing
+if [ ! -f data/ref/chrM.fa.bwt ]; then
+    bwa index data/ref/chrM.fa
+fi
+
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    bam="results/${sample}.bam"
+    bai="${bam}.bai"
+    vcf_gz="results/${sample}.vcf.gz"
+
+    if [ ! -f "$bam" ]; then
+        bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/"${sample}"_1.fq.gz data/raw/"${sample}"_2.fq.gz | samtools sort -@ "$THREADS" -o "$bam" -
+    fi
+
+    if [ ! -f "$bai" ]; then
+        samtools index -@ "$THREADS" "$bam"
+    fi
+
+    if [ ! -f "$vcf_gz" ]; then
+        lofreq call-parallel --pp-threads "$THREADS" -f data/ref/chrM.fa -o results/"${sample}".vcf "$bam"
+        bgzip -f results/"${sample}".vcf
+        tabix -p vcf "$vcf_gz"
+    fi
+done
+
+collapsed="results/collapsed.tsv"
+
+if [ ! -f "$collapsed" ]; then
+    printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed"
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/"${sample}".vcf.gz | awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' >> "$collapsed"
+    done
+fi
+
+exit 0
+
+Check: The script uses printf to write header; redirected. Good.
+
+We used bgzip -f which may produce .gz file; we need to ensure that the output path matches vcf_gz variable. We called bgzip on results/${sample}.vcf, which will create results/${sample}.vcf.gz. That matches vcf_gz. Then tabix uses "$vcf_gz". Good.
+
+Edge: If bgzip fails due to missing file? But we only call if vcf_gz missing; but the .vcf exists after lofreq. So fine.
+
+Now ensure no stray echo or prints. The script itself may produce output from tools (bwa, samtools, etc). That's allowed.
+
+Also need to ensure that 'bgzip' is available. If not, we could use 'samtools view -O z'? Actually bcftools can compress: 'bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf'. That uses bcftools which is in inventory. Let's replace bgzip with bcftools view to be safe.
+
+So:
+
+bcftools view -Oz -o "$vcf_gz" results/"${sample}".vcf
+
+Then tabix.
+
+Thus we avoid bgzip.
+
+Let's modify accordingly.
+
+Also need to remove .vcf file after compression? Not necessary but could keep. But script will leave .vcf; not harmful.
+
+Now final script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+if [ ! -f data/ref/chrM.fa.bwt ]; then
+    bwa index data/ref/chrM.fa
+fi
+
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    bam="results/${sample}.bam"
+    bai="${bam}.bai"
+    vcf_gz="results/${sample}.vcf.gz"
+
+    if [ ! -f "$bam" ]; then
+        bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/"${sample}"_1.fq.gz data/raw/"${sample}"_2.fq.gz | samtools sort -@ "$THREADS" -o "$bam" -
+    fi
+
+    if [ ! -f "$bai" ]; then
+        samtools index -@ "$THREADS" "$bam"
+    fi
+
+    if [ ! -f "$vcf_gz" ]; then
+        lofreq call-parallel --pp-threads "$THREADS" -f data/ref/chrM.fa -o results/"${sample}".vcf "$bam"
+        bcftools view -Oz -o "$vcf_gz" results/"${sample}".vcf
+        tabix -p vcf "$vcf_gz"
+    fi
+done
+
+collapsed="results/collapsed.tsv"
+
+if [ ! -f "$collapsed" ]; then
+    printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed"
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/"${sample}".vcf.gz | awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' >> "$collapsed"
+    done
+fi
+
+exit 0
+
+Check idempotence: If all files exist, script will skip all steps and exit 0. Good.
+
+Now produce final answer with only the script.

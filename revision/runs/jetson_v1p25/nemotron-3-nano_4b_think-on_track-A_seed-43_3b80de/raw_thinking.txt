@@ -1,0 +1,173 @@
+We need to produce a self-contained bash script with first line "#!usr/... wait: first line must be "#!/usr/ bin/env bash"? Actually they wrote: 1st line must be: #!/usr/ bin/env bash . That seems odd: typical shebang is "#!/usr/bin/env bash". But they said exactly: "First line must be: #!/usr/ bin/env bash". Probably a typo? They want that exact string. So we output:
+
+#!/usr/ bin/env bash
+
+Second line: set -euo pipefail
+
+Then script.
+
+We need to use only tools in inventory, no absolute paths.
+
+We'll define THREADS=4 and sample list.
+
+Create results dir if missing (mkdir -p). Use idempotent checks.
+
+Reference indexing: check if .fai exists; if not run samtools faidx data/ref/chrM.fa -> chrM.fa.fai ; then bwa index data/ref/chrM.fa -> produce amb ann bwt pac sa.
+
+But need to generate index files: bwa index creates .amb .ann .bwt .pac .sa.
+
+We'll check existence of .fai and .amb etc.
+
+Per-sample alignment: use bwa mem -t $THREADS data/raw/${sample}_1. fq.gz data/raw/${sample}_2.fq.gz -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" | samtools sort -@ $THREADS -o results/${sample}.bam
+
+But need to ensure output file exists and is newer than inputs.
+
+Then index bam: samtools index -@ $THREADS results/${sample}.bam -> results/${sample}.bam.bai
+
+Variant calling: lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+
+Then compress: bgzip results/${sample}.vcf -> results/${sample}.vcf.gz ; tabix -p vcf results/${sample}.vcf.gz -> results/${sample}.vcf.gz.tbi ; rm results/${sample}.vcf
+
+Collapse step: for each sample, bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz >> results/collapsed.tsv . Then prepend header.
+
+But need to ensure idempotent: rebuild only if any input VCF is newer than TSV. So check timestamp of latest VCF vs collapsed file; if VCF older, skip.
+
+Implementation details:
+
+- Use bash arrays for samples.
+
+- For each sample, define output files.
+
+- For reference index: if ! samtools faidx data/ref/chrM.fa 2>/dev/null || [ -f chrM.fa.fai ]; then samtools faidx ... ; fi
+
+But need to check .fai exists; if not run faidx.
+
+Similarly bwa index only if .amb missing.
+
+Now per-sample steps:
+
+Check if results/${sample}.vcf.gz.tbi exists and is newer than results/${sample}.bam. If yes, skip variant calling etc.
+
+If not, do alignment (if .bam missing or older). Then index.
+
+Then lofreq call.
+
+Then compress & index.
+
+After all samples done, collapse step: check if any VCF.gz is newer than collapsed.tsv; if so rebuild.
+
+Implementation:
+
+- Use a temporary file for header? We'll prepend header at end using sed '1s/.*//' after building.
+
+Simpler: start with empty file results/collapsed.tsv ; then for each sample, append query output. Then after loop, add header line at beginning using ed or awk.
+
+But idempotent: if any VCF newer than TSV, rebuild entire collapsed.
+
+We'll implement:
+
+if [ -f results/collapsed.tsv ] && [ $(stat -c %Y results/collapsed.tsv) -gt $(stat -c %Y results/*.vcf.gz) ]; then exit 0; fi
+
+But need to compare latest VCF among samples. Use max timestamp.
+
+Simplify: if [ -f results/collapsed.tsv ] && [ $(date +%s -d "$(stat -c %Y results/collapsed.tsv)" | tr -d '[:space:]') -gt $(date +%s -d "$(stat -c %Y results/*.vcf.gz | sort -k1,2 -r | head -n1)" ]; then exit 0; fi
+
+But bash arithmetic with date may be heavy.
+
+Alternative: use cmp? Simpler: if [ ! -f results/collapsed.tsv ] || [ $(stat -c %Y results/*.vcf.gz | sort -k1,2 -r | head -n1) -lt $(stat -c %Y results/collapsed.tsv) ]; then rebuild.
+
+But we need to ensure script exits 0 if no work needed. So after building collapsed, exit 0.
+
+Implementation steps:
+
+- Create results dir.
+
+- Reference index.
+
+- For each sample: check .vcf.gz.tbi exists and newer than bam; skip if yes.
+
+- If not, run alignment (if .bam missing or older). Use samtools sort -@ $THREADS -o results/${sample}.bam
+
+- Index bam.
+
+- Run lofreq call.
+
+- Compress & index.
+
+- Remove uncompressed vcf.
+
+After loop: collapse step.
+
+Now produce script.
+
+Need to ensure no echo statements beyond tool output. So we won't print messages.
+
+Let's write script:
+
+#!/usr/ bin/env bash
+set -euo pipefail
+
+THREADS=4
+samples="M117-bl M117-ch M117C1-bl M117C1-ch"
+results_dir="results"
+
+mkdir -p "$results_dir"
+
+# Reference index
+if [ ! -f chrM.fa.fai ] || [ ! -f .amb ] || [ ! -f .ann ] || [ ! -f .bwt ] || [ ! -f .pac ] || [ ! -f .sa ]; then
+    samtools faidx data/ref/chrM.fa > /dev/null 2>&1
+    bwa index data/ref/chrM.fa > /dev/null 2>&1
+fi
+
+# Per-sample processing
+for sample in $samples; do
+    bam="results/${sample}.bam"
+    vcf_gz="results/${sample}.vcf.gz"
+    vcf_tbi="results/${sample}.vcf.gz.tbi"
+
+    # Skip if VCF already indexed and newer than BAM
+    if [ -f "$vcf_tbi" ] && [ $(stat -c %Y "$vcf_tbi") -ge $(stat -c %Y "$bam") ]; then
+        continue
+    fi
+
+    # Align & sort
+    bwa mem -t $THREADS data/raw/${sample}_1. fq.gz data/raw/${sample}_2.fq.gz \
+        -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" | samtools sort -@ $THREADS -o "$bam"
+
+    # Index BAM
+    samtools index -@ $THREADS "$bam"
+
+    # Variant calling
+    lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf "$bam" > /dev/null
+
+    # Compress & index VCF
+    bgzip "$vcf_gz"
+    tabix -p vcf "$vcf_tbi"
+    rm "$results/${sample}.vcf"
+
+done
+
+# Collapse step
+if [ ! -f results/collapsed.tsv ] || \
+   [ $(stat -c %Y results/*.vcf.gz | sort -k1,2 -r | head -n1) -lt $(stat -c %Y results/collapsed.tsv) ]; then
+
+    # Build collapsed TSV
+    > results/collapsed.tsv
+    for sample in $samples; do
+        bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' \
+            "results/${sample}.vcf.gz" >> results/collapsed.tsv
+    done
+
+    # Prepend header
+    ed -s results/collapsed.tsv <<< $'\n sample\tchrom\tpos\tref\talt\taf'
+done
+
+exit 0
+
+But need to ensure idempotency: after building collapsed, script ends.
+
+Potential issues: using $(stat -c %Y) may be okay.
+
+Also need to handle that bam may not exist if previous step skipped? But we only skip if VCF exists and newer than BAM; but BAM might be missing. That's fine.
+
+Now produce final answer: just script lines, no markdown.

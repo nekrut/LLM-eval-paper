@@ -1,0 +1,130 @@
+We need to produce a bash script with first line "#!/usr/bin/env bash" (note they wrote "/usr/ bin/ env bash"? Actually they said: First line must be: #!/usr/ bin/ env bash . That seems odd: typical is "#!/usr/bin/env bash". But they explicitly say that. So we output exactly that string.
+
+Second line: set -euo pipefail
+
+Then script.
+
+We need to process each sample pair, call variants, produce bam.bai.vcf.gz.tbi and collapsed.tsv.
+
+Workflow:
+
+- For each sample (M117-bl, M117-ch, M117C1-bl, M117C1-ch):
+   - Input: raw/ {sample}_1. fq.gz and _2. fq.gz
+   - Use bwa mem chrM.fa paired? Actually bwa mem for paired-end: bwa mem chrM.fa<R1><R2>
+   - Then samtools view -bS -f 0 input.bam? Actually after bwa we get .bam directly.
+   - Then lofreq to call variants: lofreq --input bam --output vcf --ref chrM.af --min-allele-fraction 0.05 maybe? But need af column later.
+
+But lofreq output is VCF with AF. Good.
+
+Then bcftools view -Oz - > vcf.gz.tbi
+
+Also produce .bam.bai (samtools index)
+
+Collect collapsed table: sample chrom pos ref alt af.
+
+We can use awk to extract from VCF? Simpler: after lofreq we have VCF with AF. Use bcftools query -L? But need per-sample collapsed.
+
+Better: loop over samples, for each generate a small TSV line: sample chrM pos ref alt af.
+
+Since reference is chrM only (16569 bp). So chrom = "chrM". Pos = position in VCF. Ref = base from VCF (ref allele). Alt = other allele.
+
+We can use bcftools query -L? Actually we need to extract columns: CHROM, POS, REF, ALT, AF.
+
+Simplify: Use awk on VCF to produce line.
+
+But we must be idempotent: if results already exist, skip processing. So check if results/{sample}.bam exists etc.
+
+Implementation:
+
+for sample in M117-bl M117-ch M117C1-bl M117C1-ch; do
+
+# define raw files
+r1=${sample}_1.fq.gz
+r2=${sample}_2.fq.gz
+
+if [[ -f "results/${sample}.bam" && -f "results/${sample}.vcf.gz.tbi" ]]; then continue; fi
+
+# bwa mem
+bwa mem chrM.fa "${results}/${sample}.bam" "$r1" "$r2"
+
+# samtools index
+samtools index results/${sample}.bam
+
+# lofreq call variants
+lofreq --input results/${sample}.bam --output results/${sample}.vcf.gz --ref chrM.af
+
+# bcftools view -Oz to create .gz.tbi
+bcftools view -Oz results/${sample}.vcf.gz > results/${sample}.vcf.gz.tbi
+
+# index vcf gz
+tabix -p vcf results/${sample}.vcf.gz
+
+# generate collapsed line
+awk -F'\t' 'NR>1 {print $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6}' results/${sample}.vcf.gz >> results/collapsed.tsv
+
+But need header: sample chrM pos ref alt af. So after loop, we can prepend header.
+
+Better: create collapsed.tsv with header then append lines.
+
+Initialize if empty:
+
+if [[ ! -s results/collapsed.tsv ]]; then echo "sample\tchr\tpos\tref\talt\taf" > results/collapsed.tsv; fi
+
+Then for each sample, after generating line, append.
+
+But need to ensure we only add one line per sample (maybe multiple variants). The collapsed table likely expects all variants across samples? Probably per sample collapsed? Actually they said "per sample, plus one collapsed table". So collapsed table includes all variants from all samples. So we just append lines.
+
+Now script must be idempotent: if results already have bam etc., skip processing but still add line to collapsed.tsv? If already present, maybe not needed. But we could check if line exists; but simpler: only generate line if VCF generated (i.e., if sample processed). So if results/${sample}.vcf.gz exists then append.
+
+Simplify:
+
+if [[ -s results/${sample}.vcf.gz ]]; then
+
+line="$(awk 'NR>1 {print $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6}' results/${sample}.vcf.gz | head -n 1)"? Actually VCF may have multiple variants per sample. We want all lines for that sample.
+
+Better: use awk to extract all lines for this sample:
+
+awk -v s="${sample}" 'NR>1 && $2==s {print $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6}' results/${sample}.vcf.gz
+
+But that will output multiple lines.
+
+Simpler: just append all variant lines from VCF to collapsed.tsv (they already have sample column). So we can do:
+
+awk 'NR>1 {print $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6}' results/${sample}.vcf.gz >> results/collapsed.tsv
+
+But header already present.
+
+Thus script:
+
+#!/usr/ bin/env bash
+set -euo pipefail
+
+# create collapsed.tsv header if not exists
+if [[ ! -s results/collapsed.tsv ]]; then echo "sample\tchr\tpos\tref\talt\taf" > results/collapsed.tsv; fi
+
+for sample in M117-bl M117-ch M117C1-bl M117C1-ch; do
+    r1="${sample}_1.fq.gz"
+    r2="${sample}_2.fq.gz"
+
+    # skip if already processed (bam and vcf exist)
+    if [[ -f "results/${sample}.bam" && -s results/${sample}.vcf.gz ]]; then
+        continue
+    fi
+
+    bwa mem chrM.fa "${results}/${sample}.bam" "$r1" "$r2"
+    samtools index results/${sample}.bam
+    lofreq --input results/${sample}.bam --output results/${sample}.vcf.gz --ref chrM.af
+    bcftools view -Oz results/${sample}.vcf.gz > results/${sample}.vcf.gz.tbi
+    tabix -p vcf results/${sample}.vcf.gz
+
+    # append variant lines to collapsed.tsv
+    awk 'NR>1 {print $2 "\t" $3 "\t" $4 "\t" $5 "\t" $6}' results/${sample}.vcf.gz >> results/collapsed.tsv
+done
+
+But need to ensure that if bam exists but vcf not, still process? The condition checks both. If bam exists but vcf missing (maybe previous run failed), we will process again because vcf missing. That's fine.
+
+Now check first line: "#!/usr/ bin/env bash". Should be exactly "#!/usr/ bin/env bash"? Actually they wrote "/usr/ bin/ env bash" with slash between usr and bin? Probably typo but follow instruction: "First line must be: #!/usr/ bin/ env bash". So script first line is that string.
+
+Second line: set -euo pipefail
+
+Now produce final answer: just the script lines.

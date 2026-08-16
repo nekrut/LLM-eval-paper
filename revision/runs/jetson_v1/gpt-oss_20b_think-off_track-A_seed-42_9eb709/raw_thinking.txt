@@ -1,0 +1,257 @@
+We need to produce a bash script that follows plan. Must be idempotent: skip steps if outputs exist and newer than inputs. Use set -euo pipefail. Use only tools listed.
+
+Need to handle reference indexing: check for .amb or .fai etc. For bwa index, presence of .bwt maybe enough. We'll check for chrM.fa.bwt? Actually bwa index produces .amb .ann .bwt .pac .sa. We can test existence of any one file like chrM.fa.bwt.
+
+For samtools faidx: produce .fai. Check if exists.
+
+Per-sample alignment: output results/{sample}.bam. If bam exists and newer than inputs? We'll check if bam exists and its modification time > both FASTQ files. But easier: use `if [ ! -s results/${sample}.bam ]` then run; else skip. But need to ensure idempotent even if older. We can use `-nt` test: `[ ! -f results/${sample}.bam ] || [ "$input" -ot "$output" ]`. We'll compute latest input timestamp.
+
+Simpler: we can use `if [[ ! -s results/${sample}.bam ]] ; then ... fi`. But if bam exists but older, script may skip incorrectly. We need to check if any input newer than output. Use `[[ $(stat -c %Y data/raw/${sample}_1.fq.gz) -gt $(stat -c %Y results/${sample}.bam) || $(stat -c %Y data/raw/${sample}_2.fq.gz) -gt ... ]]`. But that's verbose.
+
+We can use `if [[ ! -s results/${sample}.bam ]] || [[ data/raw/${sample}_1.fq.gz -nt results/${sample}.bam ]] || [[ data/raw/${sample}_2.fq.gz -nt results/${sample}.bam ]]; then ... fi`.
+
+Similarly for index: check if .fai exists and newer than reference? But we can just skip if .fai exists.
+
+For BAM indexing: same logic.
+
+Variant calling: output uncompressed VCF. Check existence of final gz file; but need to ensure intermediate not needed. We can skip if results/${sample}.vcf.gz exists and newer than bam. Use -nt test.
+
+But we also need to produce uncompressed .vcf first, then compress. So we may check if .vcf.gz exists; if yes skip entire variant calling step. But if .vcf.gz missing but .vcf present? That would be inconsistent; but we can just skip if .vcf.gz exists.
+
+Collapse: check if collapsed.tsv exists and newer than all vcf.gz files. Use -nt for each.
+
+Implementation details:
+
+- Set THREADS=4
+- sample list array.
+- Create results dir: mkdir -p results
+
+Reference indexing:
+
+```
+if [ ! -s data/ref/chrM.fa.fai ]; then samtools faidx data/ref/chrM.fa; fi
+if [ ! -s data/ref/chrM.fa.bwt ]; then bwa index data/ref/chrM.fa; fi
+```
+
+Per-sample loop:
+
+```
+for sample in "${SAMPLES[@]}"; do
+  bam=results/${sample}.bam
+  bai=results/${sample}.bam.bai
+  vcf_gz=results/${sample}.vcf.gz
+
+  # alignment
+  if [[ ! -s "$bam" ]] || \
+     [[ data/raw/${sample}_1.fq.gz -nt "$bam" ]] || \
+     [[ data/raw/${sample}_2.fq.gz -nt "$bam" ]]; then
+    bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+      data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+      samtools sort -@ $THREADS -o "$bam"
+  fi
+
+  # index bam
+  if [[ ! -s "$bai" ]] || [[ "$bam" -nt "$bai" ]]; then
+    samtools index -@ $THREADS "$bam"
+  fi
+
+  # variant calling
+  vcf=results/${sample}.vcf
+  if [[ ! -s "$vcf_gz" ]] || [[ "$bam" -nt "$vcf_gz" ]]; then
+    lofreq call-parallel --pp-threads $THREADS \
+      -f data/ref/chrM.fa -b "$bam" -o "$vcf"
+    bgzip -c "$vcf" > "${vcf}.gz"
+    tabix -p vcf "${vcf}.gz"
+    rm -f "$vcf"
+  fi
+done
+```
+
+But we need to ensure that if .vcf.gz exists but older than bam, we re-run. Use `-nt` test.
+
+Also need to handle case where .vcf.gz missing but .vcf present? We can ignore; but our condition will run variant calling only if .vcf.gz missing or older. If .vcf.gz missing but .vcf present (unlikely), the script would still run variant calling again, generating new vcf and compressing.
+
+Now collapse step:
+
+```
+collapsed=results/collapsed.tsv
+if [[ ! -s "$collapsed" ]] || \
+   [[ results/M117-bl.vcf.gz -nt "$collapsed" ]] || \
+   [[ results/M117-ch.vcf.gz -nt "$collapsed" ]] || \
+   [[ results/M117C1-bl.vcf.gz -nt "$collapsed" ]] || \
+   [[ results/M117C1-ch.vcf.gz -nt "$collapsed" ]]; then
+  >"$collapsed"
+  echo -e "sample\tchrom\tpos\tref\talt\taf" >>"$collapsed"
+  for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz >> "$collapsed"
+  done
+fi
+```
+
+But we need to ensure that the header is only once. We can write header first then loop.
+
+Also bcftools query format string: we need to escape single quotes properly. Use double quotes around whole command and single quotes inside? Actually bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/... The script uses double quotes for the entire command; but we can use single quotes to avoid shell expansion: `bcftools query -f '${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`. But inside single quotes, `$sample` will not expand. So need to use double quotes for the format string and escape $ appropriately? We can do:
+
+```
+bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz
+```
+
+But this will expand ${sample} to sample name. The \t inside double quotes will be interpreted as tab by shell, not literal backslash-t. We need literal backslash-t? Wait requirement: In read group string we needed literal backslash-t; but for bcftools query format string, we want actual tab separators in output. So using \t is fine because shell will interpret it as tab if inside double quotes. But we don't want to escape? Actually we want a tab character in the output. Using `\t` within double quotes will be interpreted by shell into a literal tab? In bash, `$'\t'` expands to tab; but plain `\t` inside double quotes is just backslash-t characters, not a tab. So we need to use actual tab or $'\t'. But requirement only for read group string; bcftools query format string can be normal.
+
+Simpler: Use echo -e? Not allowed. We can use printf? Allowed? Tools list includes seqkit etc but not printf? Bash built-in printf is fine. But we want to avoid user-facing prose. We can just write header with tab using $'\t'. That uses backslash-t as escape sequence; that's okay.
+
+But for bcftools query format string, we need actual tab between fields. We can use `-f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`. In double quotes, \t is not expanded to tab by shell; it's just backslash-t characters. So the output will contain literal backslash-t. That's wrong. We need actual tab.
+
+We can use `printf`? But bcftools query expects format string with `%CHROM`, etc. The format string uses `%` placeholders, and we want a tab between them. In bcftools query, you can specify `\t` as literal backslash-t? I think bcftools query interprets `\t` as tab (like many programs). Let's check: bcftools query -f '%CHROM\t%POS\n' prints tab separated. Yes, bcftools uses C-style escapes in format string. So we can use `-f '${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`. The single quotes will prevent shell expansion of $sample; but we need sample name inserted. We can use double quotes and escape the backslashes: `-f "${sample}\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\\n"`. That would produce actual \t in format string? Wait bcftools will interpret `\t` as tab. So we need to pass literal backslash-t to bcftools. In double quotes, `\\t` becomes `\t` after shell processing. Good.
+
+Thus:
+
+```
+bcftools query -f "${sample}\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\\n" results/${sample}.vcf.gz
+```
+
+That should work.
+
+Now header: we can write using printf with tab. Use `printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed"`.
+
+But requirement says no user-facing prose; but printing header is part of output file, not console. So fine.
+
+We must ensure script uses only tools listed. We use samtools, bwa, lofreq, bgzip (bgzip is part of htslib? Not in list but tabix is from htslib and bgzip is usually part of bcftools/htslib; but not explicitly listed. But we can use `bcftools view -O z` to compress. The plan says use bgzip, but bgzip might not be available. We can use `bgzip` if present; but not in list. However tabix is part of htslib and bgzip is usually installed with it. But not guaranteed? In tool inventory, only listed tools: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. No bgzip. So we cannot rely on bgzip. We must use `bcftools view -O z` to compress VCF. But plan says "Compress with bgzip (not bcftools view -O z)". However tool inventory may not include bgzip; but maybe bcftools includes bgzip? Actually bgzip is separate binary from htslib, often installed alongside tabix and samtools. It might be present even if not listed. But to be safe, we can use `bgzip` as it's part of htslib distribution. The tool inventory didn't list it but maybe it's available. But requirement: "Use only tools listed in TOOL_INVENTORY." So bgzip is not listed; cannot use. Must use bcftools view -O z? But plan says not to use that. However we can still comply with tool inventory by using `bgzip` if present, but it's not listed. Might be considered violation.
+
+We need to compress VCF and index. We could use `bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf`. That uses bcftools only. Then tabix index. That satisfies tool inventory. But plan says "Compress with bgzip (not bcftools view -O z)". But we can still compress with bcftools; maybe acceptable? The instruction is part of plan, but tool inventory constraints override? The instructions say: "Use only tools listed in TOOL_INVENTORY." So we must not use bgzip. So we will use bcftools view -Oz.
+
+Thus variant calling step:
+
+```
+lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" -o "$vcf"
+bcftools view -O z -o "${vcf}.gz" "$vcf"
+tabix -p vcf "${vcf}.gz"
+rm -f "$vcf"
+```
+
+Now we need to ensure bcftools view compresses and outputs gz. Good.
+
+Also need to index with tabix.
+
+Now collapse step: Use bcftools query as above.
+
+Edge cases: The INFO/AF field may not exist? But lofreq call-parallel includes AF? It might produce INFO/AF. We'll assume present.
+
+Now script must be idempotent; we used -nt tests.
+
+But we also need to ensure that if .bam exists but older than FASTQs, we re-run alignment and produce new bam. Our condition covers that: `[[ ! -s "$bam" ]] || [[ data/raw/${sample}_1.fq.gz -nt "$bam" ]] || [[ data/raw/${sample}_2.fq.gz -nt "$bam" ]]`. Good.
+
+Similarly for index: check if .bai missing or older than bam.
+
+For variant calling: we check if vcf_gz missing or older than bam. But what about case where vcf_gz exists but older than bam? We re-run. Good.
+
+Now collapse step: we need to check if collapsed.tsv missing or any vcf.gz newer. Use -nt for each file.
+
+Implementation:
+
+```
+if [[ ! -s "$collapsed" ]] || \
+   [[ results/M117-bl.vcf.gz -nt "$collapsed" ]] || \
+   [[ results/M117-ch.vcf.gz -nt "$collapsed" ]] || \
+   [[ results/M117C1-bl.vcf.gz -nt "$collapsed" ]] || \
+   [[ results/M117C1-ch.vcf.gz -nt "$collapsed" ]]; then
+  printf 'sample\tchrom\tpos\tref\talt\taf\n' >"$collapsed"
+  for sample in "${SAMPLES[@]}"; do
+    bcftools query -f "${sample}\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\\n" results/${sample}.vcf.gz >> "$collapsed"
+  done
+fi
+```
+
+But we need to ensure that the header is only once. We write header before loop.
+
+Now script must not produce extraneous output; but bcftools query will print to stdout, which we redirect into file. Good.
+
+Also we should set `THREADS=4` at top.
+
+We also need to create results dir: `mkdir -p results`.
+
+Now final script:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+# Create output directory
+mkdir -p results
+
+# Reference indexing
+if [ ! -s data/ref/chrM.fa.fai ]; then
+  samtools faidx data/ref/chrM.fa
+fi
+if [ ! -s data/ref/chrM.fa.bwt ]; then
+  bwa index data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+  bam=results/${sample}.bam
+  bai=results/${sample}.bam.bai
+  vcf_gz=results/${sample}.vcf.gz
+  vcf=results/${sample}.vcf
+
+  # Alignment
+  if [[ ! -s "$bam" ]] || \
+     [[ data/raw/${sample}_1.fq.gz -nt "$bam" ]] || \
+     [[ data/raw/${sample}_2.fq.gz -nt "$bam" ]]; then
+    bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+      data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+      samtools sort -@ $THREADS -o "$bam"
+  fi
+
+  # BAM index
+  if [[ ! -s "$bai" ]] || [[ "$bam" -nt "$bai" ]]; then
+    samtools index -@ $THREADS "$bam"
+  fi
+
+  # Variant calling
+  if [[ ! -s "$vcf_gz" ]] || [[ "$bam" -nt "$vcf_gz" ]]; then
+    lofreq call-parallel --pp-threads $THREADS \
+      -f data/ref/chrM.fa -b "$bam" -o "$vcf"
+    bcftools view -O z -o "${vcf}.gz" "$vcf"
+    tabix -p vcf "${vcf}.gz"
+    rm -f "$vcf"
+  fi
+done
+
+# Collapse VCFs into TSV
+collapsed=results/collapsed.tsv
+if [[ ! -s "$collapsed" ]] || \
+   [[ results/M117-bl.vcf.gz -nt "$collapsed" ]] || \
+   [[ results/M117-ch.vcf.gz -nt "$collapsed" ]] || \
+   [[ results/M117C1-bl.vcf.gz -nt "$collapsed" ]] || \
+   [[ results/M117C1-ch.vcf.gz -nt "$collapsed" ]]; then
+  printf 'sample\tchrom\tpos\tref\talt\taf\n' >"$collapsed"
+  for sample in "${SAMPLES[@]}"; do
+    bcftools query -f "${sample}\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\\n" results/${sample}.vcf.gz >> "$collapsed"
+  done
+fi
+
+exit 0
+```
+
+Check for any missing semicolons or syntax errors.
+
+We used `[[ ! -s "$bam" ]]` etc. Good.
+
+But we need to ensure that the test `data/raw/${sample}_1.fq.gz -nt "$bam"` is valid: In bash, `-nt` expects two files; but we wrote `data/raw/... -nt "$bam"`. That's fine.
+
+Now check for quoting of read group string: We used `"@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"` which passes literal backslash-t to bwa. Good.
+
+Now ensure that we didn't use any disallowed tools: we used samtools, bwa, lofreq, bcftools, tabix. All in inventory. We also used printf (builtin). That's fine.
+
+We didn't use bgzip. Good.
+
+Now check for idempotency: If results/ already populated with all outputs, script will skip each step because conditions false. For collapse step, if collapsed.tsv exists and newer than all vcf.gz, it will skip. Good.
+
+Edge case: If some output missing but older? The script will regenerate.
+
+Also we need to ensure that the script doesn't produce extraneous output; only tool outputs. We used printf to write header to file; no console output.
+
+Now final answer: Provide script as plain text.

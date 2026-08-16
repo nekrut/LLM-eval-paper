@@ -1,0 +1,416 @@
+We need to produce a self-contained bash script meeting constraints.
+
+Constraints:
+
+- First line: #!/usr/bin/env bash
+- Second line: set -euo pipefail
+- Assume cwd contains data/raw/ and data/ref/
+- Write outputs under results/
+- Idempotent: if results/ populated, exit 0 without redoing work or erroring.
+- No hardcoded paths outside cwd. So we can use relative paths like data/ref/chrM.fa etc.
+- Use only tools listed in TOOL_INVENTORY. Tools available: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. We can use any of these.
+- Must not invoke conda, pip, apt, curl, wget, or any package manager.
+- Total wall-clock under 600 seconds at THREADS=4. Not a constraint we need to enforce in script; just ensure it's feasible.
+- Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose. So we can only output natural tool messages; but we may need to print header line for collapsed.tsv using printf, which writes to stdout. That's okay? It says "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." Using printf is a shell builtin that writes to stdout; it's not a tool like echo? It might be considered writing to stdout manually, but likely allowed because they only forbid echo for user-facing prose. However they said "Do not write to stderr/stdout beyond what tools naturally emit". That suggests we should avoid any extra output besides what the pipeline naturally produces. But we need to create header line and append sample lines; that will produce output to stdout (the script's own output). Is that considered "beyond what tools naturally emit"? The script itself is a tool; its output is natural? Probably they want minimal output, maybe just the final collapsed.tsv file content, not extra prints. But we need to generate header line and sample lines into collapsed.tsv file; that will be written to a file, not printed to terminal. That's fine. However we must avoid using echo for user-facing prose; but we can use printf to write to file. That's okay.
+
+Idempotency: If results/ already contains files, script should exit 0 without redoing work or erroring. So we need to check if all required output files exist before processing each sample? Or at least overall check that collapsed.tsv exists and maybe skip steps? Simpler: At start, check if results/collapsed.tsv exists; if it does, then script can exit 0 (since everything presumably done). But also need to ensure that per-sample outputs are present. Could check for each sample's .bam file existence. If any missing, proceed.
+
+Implementation plan:
+
+- Use set -euo pipefail.
+- Define THREADS=4 variable? Not required but okay.
+- Define SAMPLES array.
+- Ensure results directory exists: mkdir -p results (already in boilerplate). That command will succeed even if dir exists; no error.
+
+- For idempotency, we can check if all final outputs exist: maybe test if results/collapsed.tsv exists and has header? But simpler: If any of the required files are missing, proceed; else skip. At script start, we could check if results/collapsed.tsv exists and is non-empty (has header). If it does, then exit 0.
+
+- Then loop over samples.
+
+- Inside loop:
+
+   - Check if results/{sample}.bam exists; if not, run alignment step.
+
+   - But need to ensure that indexing steps are done only once per sample? Indexing of reference is same for all samples; we can do it before loop, but also idempotent: check if index files exist (e.g., data/ref/chrM.fa.bwt?). Actually bwa index creates .bwt etc. We could check if data/ref/chrM.fa.bwt exists; if not, run bwa index and samtools faidx.
+
+   - However we must avoid re-running indexing each time; but idempotent script can just run them again? That would error because files already exist? Actually bwa index will overwrite? It may replace .bwt files; but it's okay. But they want no redoing work or erroring. So better to check existence and skip.
+
+   - Simpler: At start, if results/collapsed.tsv exists, exit 0. That ensures we don't re-run anything. However need to ensure that indexing steps also not run again; but if collapsed.tsv exists, all outputs exist, so script will exit early. So idempotent.
+
+- Implementation:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+# Idempotency check: if collapsed.tsv exists and is non-empty (has at least header), exit
+if [[ -s results/collapsed.tsv ]]; then
+    exit 0
+fi
+
+# Index reference if not already indexed
+if [[ ! -f data/ref/chrM.fa.bwt ]]; then
+    bwa index data/ref/chrM.fa
+    samtools faidx data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    # Alignment and sorting
+    if [[ ! -f results/${sample}.bam ]]; then
+        bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa \
+            data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+            samtools sort -@ "$THREADS" -o results/${sample}.bam -
+    fi
+
+    # Index BAM
+    if [[ ! -f results/${sample}.bam.bai ]]; then
+        samtools index -@ "$THREADS" results/${sample}.bam
+    fi
+
+    # Variant calling with LoFreq
+    if [[ ! -f results/${sample}.vcf.gz ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+        bgzip -f results/${sample}.vcf
+        tabix -p vcf results/${sample}.vcf.gz
+    fi
+
+    # Append to collapsed.tsv (ensure header only once)
+    if [[ ! -s results/collapsed.tsv ]]; then
+        printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+    fi
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | \
+        awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+```
+
+But need to ensure that we don't produce extra output beyond natural tool messages. Using printf and echo? We used printf, which writes to stdout; but it's writing to a file redirection, not to terminal. That's fine.
+
+Potential issues:
+
+- The bwa mem command uses -R with @RG fields; need to escape tabs? In bash, we can include literal tab as $'\t' or use actual tab character. Use $'\t' maybe. But they used literal "\t" inside double quotes; that will be interpreted by shell as backslash t, not a tab. Should use actual tab characters. We can embed a literal tab using $'\t' or insert a tab via $'\t'. Let's use $'\t'.
+
+- The command: bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa ... This will treat \t as literal backslash t, not a tab. Should use $'\t' to embed actual tab. So we can do:
+
+```
+-R "@RG"$'\t'ID:${sample}$'\t'SM:${sample}$'\t'LB:${sample}$'\t'PL:ILLUMINA"
+```
+
+But that's messy. Simpler: Use double quotes and include actual tabs by inserting them as literal characters? In script we can embed a tab using $'\t'. So:
+
+```
+-R "@RG"$'\t'ID:${sample}$'\t'SM:${sample}$'\t'LB:${sample}$'\t'PL:ILLUMINA"
+```
+
+But need to ensure quoting correct.
+
+Alternatively, we can avoid @RG and just use -R 'ID:${sample};SM:${sample};LB:${sample};PL:ILLUMINA' but they specified format with tabs. Might not be strict.
+
+Given constraints, maybe we can keep as they wrote but using actual tab characters via $'\t'.
+
+Let's construct:
+
+```
+-R "@RG"$'\t'ID:${sample}$'\t'SM:${sample}$'\t'LB:${sample}$'\t'PL:ILLUMINA"
+```
+
+But need to embed within double quotes; we can do:
+
+```
+-R "@RG"$'\t'ID:${sample}$'\t'SM:${sample}$'\t'LB:${sample}$'\t'PL:ILLUMINA"
+```
+
+But that will produce something like @RG    ID:sample    SM:sample ... with actual tabs.
+
+Better to write:
+
+```
+-R $'@RG\tID:'${sample}'\tSM:'${sample}'\tLB:'${sample}'\tPL:ILLUMINA'
+```
+
+But simpler: Use single quotes and include $'\t' inside? Single quotes prevent variable expansion. So we can do:
+
+```
+-R '@RG'$'\t'ID:${sample}$'\t'SM:${sample}$'\t'LB:${sample}$'\t'PL:ILLUMINA
+```
+
+But need double quotes to allow variable expansion. Let's use double quotes and embed $'\t'.
+
+```
+-R "@RG"$'\t'ID:${sample}$'\t'SM:${sample}$'\t'LB:${sample}$'\t'PL:ILLUMINA"
+```
+
+That will expand variables but keep tabs.
+
+But we need to ensure that the whole -R argument is a single string; using concatenation may break quoting. Simpler: Use printf to build the string? Might be overkill.
+
+Given they didn't enforce strict format, maybe we can just use a simpler @RG line without tabs? But they explicitly gave format with tabs. Could just use actual tab characters typed literally in script (hard to type). In plain text, we can include a literal tab by pressing Tab key; but in the answer we need to output script text; we can embed actual tab characters. That's okay.
+
+Thus we can write:
+
+```
+-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"
+```
+
+But that will treat \t as literal backslash t, not a tab. So need to use actual tab character in the script. In the answer, we can include actual tab characters; they will be present as actual tabs. That's okay.
+
+Thus we can write:
+
+```
+-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"
+```
+
+But that includes literal backslash t? Actually if we type a real tab character between @RG and ID, it will be a tab. So we need to include a real tab in the script text. In the answer, we can embed actual tab characters; they will be visible as spaces? But we can just write them.
+
+Given the output is plain text, we can include actual tab characters. That's okay.
+
+Thus final script:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+# Idempotency check
+if [[ -s results/collapsed.tsv ]]; then
+    exit 0
+fi
+
+# Index reference if needed
+if [[ ! -f data/ref/chrM.fa.bwt ]]; then
+    bwa index data/ref/chrM.fa
+    samtools faidx data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    # Alignment and sorting
+    if [[ ! -f results/${sample}.bam ]]; then
+        bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa \
+            data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+            samtools sort -@ "$THREADS" -o results/${sample}.bam -
+    fi
+
+    # Index BAM
+    if [[ ! -f results/${sample}.bam.bai ]]; then
+        samtools index -@ "$THREADS" results/${sample}.bam
+    fi
+
+    # Variant calling with LoFreq
+    if [[ ! -f results/${sample}.vcf.gz ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+        bgzip -f results/${sample}.vcf
+        tabix -p vcf results/${sample}.vcf.gz
+    fi
+
+    # Append to collapsed.tsv (header only once)
+    if [[ ! -s results/collapsed.tsv ]]; then
+        printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+    fi
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | \
+        awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+```
+
+Check constraints:
+
+- First line: #!/usr/bin/env bash (present)
+- Second line: set -euo pipefail (present)
+- Use only tools from inventory: bwa, samtools, lofreq, bgzip, tabix, bcftools, awk (awk is part of coreutils, not listed but likely available; they didn't list awk but it's a standard tool; maybe allowed? They didn't restrict to only listed tools for everything; they said "Use only tools listed in TOOL_INVENTORY." That suggests we cannot use awk if not listed. Indeed awk is not in the inventory. So we must avoid awk. We need to replace awk with something else from inventory, maybe cut? Not needed. Could use sed? Not listed. Could use perl? Not listed. Could use python? Not listed. Could use 'cut'? Not listed. But they didn't list all coreutils; but the instruction says "Use only tools listed in TOOL_INVENTORY." That likely means we cannot invoke any external program not listed, even common ones like awk, cut, grep, sed? Those are typically present but not listed. The safest is to avoid any external command not listed. However they didn't list 'grep', 'cut', 'sed', 'awk'. So we must avoid them. But we need to process the output of bcftools query and prepend sample column. Could use 'paste' or 'printf' with loop? We could use a while read loop to read lines and print with sample prefix, but that would involve bash builtins only.
+
+We can use 'while IFS= read -r line; do echo -e "$sample\t$line"; done' but echo is not listed? echo is a shell builtin, not a tool; it's okay. Using echo may produce extra output to stdout, which might violate "Do not write to stderr/stdout beyond what tools naturally emit". But we can redirect to file.
+
+We can use 'paste' maybe not listed. Let's think: We need to prepend sample column to each line from bcftools query and append to collapsed.tsv. Could use 'printf "%s\t%s\n" "$sample" "$line"' inside a loop reading lines from stdin. That uses only bash builtins and printf (builtin). So we can avoid external tools.
+
+Thus replace awk part with a while read loop using printf.
+
+Implementation:
+
+```
+while IFS= read -r line; do
+    printf '%s\t%s\n' "$sample" "$line"
+done<<(bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz) >> results/collapsed.tsv
+```
+
+But we need to ensure that the loop runs only once per sample. This will read from stdin of bcftools query and output lines prefixed with sample.
+
+We also need to ensure header is added only once; we already have check for collapsed.tsv emptiness.
+
+Thus modify the script accordingly.
+
+Also need to avoid using 'awk' external command.
+
+Now check other parts: Using 'printf' builtin is okay. Using 'while' and 'read' are bash builtins.
+
+We also used 'if [[ -s ... ]]' which uses Bash's built-in test; fine.
+
+We used 'bcftools query' which outputs lines with tabs? It prints fields separated by tabs? Actually bcftools query with -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' will output each line as CHROM POS REF ALT INFO/AF separated by tabs and a newline. That's fine.
+
+Now we need to ensure that the script does not produce any extra stdout beyond natural tool messages. The while loop with printf will write to stdout, but we redirect to file, so it's okay; but still writing to stdout? Actually 'printf' writes to stdout unless redirected. In our command, we have:
+
+```
+done<<(bcftools query ...) >> results/collapsed.tsv
+```
+
+The 'printf' outputs to stdout, which is then redirected via '>> results/...'. That's okay; the redirection consumes output, not printing to terminal.
+
+But the 'while' loop itself may produce no extra output.
+
+Now check other potential external commands: 'bcftools query' is listed. 'bgzip', 'tabix', 'samtools index', 'samtools faidx', 'bwa index', all listed. 'printf' is builtin, okay.
+
+We used 'if [[ ... ]]' which is bash builtin; fine.
+
+Now ensure we don't use 'awk' or external 'cut'.
+
+Now check that we didn't use any other external command like 'sed', 'grep'. No.
+
+Now check that we didn't use 'echo' for user-facing prose; we used printf only for writing to file, not for user messages. That's okay.
+
+Now ensure we didn't use any absolute paths; all relative.
+
+Now ensure idempotency: At start, if collapsed.tsv exists and is non-empty, exit 0. That ensures script exits without redoing work. However what about partial results? If collapsed.tsv exists but some per-sample files missing? That would be weird; but we can still exit early; maybe incomplete. But idempotent requirement: "rerunning on a populated results/ directory must exit 0 without redoing work or erroring." So if results/ is populated (i.e., contains expected files), script should exit 0. Our check only looks at collapsed.tsv; but if that file exists, likely all others exist too. If not, maybe partial; but then script would still run and may produce errors? But we have checks inside loop to skip steps if output exists. So it's safe.
+
+Now ensure we didn't use any tool not in inventory: 'bcftools query' is listed. 'bgzip' is part of samtools package; they listed bgzip? Actually they listed "bgzip" as part of "bgzip -f"? They didn't explicitly list bgzip, but it's part of the same package as tabix and bcftools; likely available. But not in inventory list; however they said "TOOL_INVENTORY (only these are on PATH)". The list includes "tabax"? Actually they listed "tabax"? They listed "tabax"? Let's re-read: TOOL_INVENTORY includes:
+
+- bwa
+- samtools
+- bcftools
+- tabix (htslib) 1.21 [ok]
+- lofreq
+- SnpSift
+- snpEff
+- fastqc
+- seqkit
+- snakemake
+- shellcheck
+- java
+
+They didn't list bgzip explicitly, but bgzip is part of the same htslib as tabix; likely present. But not listed. However they said "Use only tools listed in TOOL_INVENTORY." So we must not use bgzip if not listed. Indeed they didn't list bgzip. So we cannot call bgzip. We need to compress VCF using another tool from inventory. Could use 'gzip'? Not listed. Could use 'seqkit' maybe can compress? seqkit can compress but also may not be used for bgzip. Could use 'samtools view -Oz'? Actually samtools can produce compressed output via '-Oz', but we need to produce .vcf.gz file. We could use 'bgzip' is not allowed; but we could use 'gzip' which is not listed either. However maybe they consider bgzip as part of the same toolset and it's okay? The instruction says "Use only tools listed in TOOL_INVENTORY." So we must restrict to those explicitly listed. Let's check if any of the listed tools can do gzipping: 'samtools' can compress with '-Oz' but that is for outputting to a file; we could use 'samtools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf' but that would require samtools view which is part of samtools. However we need to produce .vcf.gz from .vcf; we can just rename? Actually LoFreq outputs uncompressed VCF to results/{sample}.vcf. Then we need to compress it with bgzip. If we cannot use bgzip, maybe we can use 'gzip' which is not listed. But perhaps they consider bgzip as part of the same toolset and it's okay because it's often installed alongside tabix; but they didn't list it explicitly. However they said "TOOL_INVENTORY (only these are on PATH)". So if bgzip binary is present, it may be considered part of the inventory? They didn't list it, but maybe they omitted for brevity. Usually in such inventories, they include 'bgzip' as part of 'tabix' package; but they listed 'tabax' only. I'd assume bgzip is available and acceptable because it's a standard tool used in many pipelines and likely present. But to be safe, maybe we can avoid using bgzip altogether by using 'gzip -c' which is also not listed. Hmm.
+
+Alternatively, we could skip the bgzip step and just rely on bcftools view -Oz? Actually bcftools can compress output directly: 'bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf'. That uses bcftools, which is listed. Then we can index with tabix (also listed). So we can replace bgzip+tabix steps with a single command using bcftools to compress and index.
+
+But the plan explicitly says:
+
+```
+bgzip -f results/{sample}.vcf
+tabix -p vcf results/{sample}.vcf.gz
+```
+
+But we can adapt as long as we produce .vcf.gz and .tbi (actually tabix creates .tbi index file). Using bcftools view -Oz will create .gz file; then we can use tabix to index it. That's okay.
+
+Thus modify step 5-6:
+
+Instead of lofreq call-parallel producing .vcf, then bgzip and tabix, we can do:
+
+```
+lofreq call-parallel --pp-threads "$THREADS" -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+# compress with bcftools view -Oz (or just use bgzip if allowed)
+bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf
+tabix -p vcf results/${sample}.vcf.gz
+```
+
+But we need to ensure that the .vcf file is removed after compression? Not necessary.
+
+But we must avoid using bgzip if not listed. So use bcftools view -Oz.
+
+Now check that bcftools view can output .gz; yes.
+
+Thus modify script accordingly.
+
+Now also need to adjust the query step: bcftools query works on .vcf.gz directly, so fine.
+
+Now ensure we don't use any external tool not listed.
+
+Now check other steps: 'seqkit' not used; okay.
+
+Now final script must be self-contained and meet constraints.
+
+Let's rewrite script with these changes:
+
+- Use bcftools view -Oz to compress VCF.
+- Remove bgzip step.
+- Keep tabix indexing.
+
+Now also need to ensure that the .vcf file is removed? Not required; but we can keep it; maybe not needed. But we can delete it after compression to avoid clutter, but not necessary.
+
+But we must be careful about idempotency: If results/{sample}.vcf.gz exists, skip steps. So check for .vcf.gz existence.
+
+Now final script:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+# Idempotency check: if collapsed.tsv exists and non-empty, exit
+if [[ -s results/collapsed.tsv ]]; then
+    exit 0
+fi
+
+# Index reference if needed
+if [[ ! -f data/ref/chrM.fa.bwt ]]; then
+    bwa index data/ref/chrM.fa
+    samtools faidx data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    # Alignment and sorting
+    if [[ ! -f results/${sample}.bam ]]; then
+        bwa mem -t "$THREADS" -R "@RG"$'\t'ID:${sample}$'\t'SM:${sample}$'\t'LB:${sample}$'\t'PL:ILLUMINA" data/ref/chrM.fa \
+            data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+            samtools sort -@ "$THREADS" -o results/${sample}.bam -
+    fi
+
+    # Index BAM
+    if [[ ! -f results/${sample}.bam.bai ]]; then
+        samtools index -@ "$THREADS" results/${sample}.bam
+    fi
+
+    # Variant calling with LoFreq and compress
+    if [[ ! -f results/${sample}.vcf.gz ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+        bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf
+        tabix -p vcf results/${sample}.vcf.gz
+    fi
+
+    # Append to collapsed.tsv (header only once)
+    if [[ ! -s results/collapsed.tsv ]]; then
+        printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+    fi
+    # Prefix sample and append each line from bcftools query
+    while IFS= read -r line; do
+        printf '%s\t%s\n' "$sample" "$line"
+    done<<(bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz) >> results/collapsed.tsv
+done
+```
+
+Now check for any disallowed tools: 'while', 'read', 'printf', 'bcftools view', 'tabix', 'bwa', 'samtools', 'lofreq' are all listed. 'bcftools view' is part of bcftools, which is listed. Good.
+
+We used '$'\t'' to embed tab; that's okay.
+
+Now ensure we didn't use any external command like 'awk'. No.
+
+Now check that we didn't use 'echo' for user-facing prose; we only used printf for file writing; not for user messages.
+
+Now check that we didn't write any extra stdout beyond natural tool messages. The script itself may output nothing unless errors; but the while loop's printf writes to stdout which is redirected, so no terminal output. That's fine.
+
+Now ensure idempotency: If collapsed.tsv exists and non-empty, exit 0. That ensures we don't re-run anything. However if results/ contains some files but not collapsed.tsv, script will run; but that may be okay as partial. But the requirement is "rerunning on a populated results/ directory must exit 0 without redoing work or erroring." If results/ is populated (i.e., all expected outputs exist), then collapsed.tsv will exist and be non-empty, so script exits early. So fine.
+
+Now ensure we didn't use any absolute paths; all relative.
+
+Now final check: The first line must be exactly '#!/usr/bin/env bash' with no extra spaces? It can have newline after. That's okay.
+
+Second line must be 'set -euo pipefail'.
+
+We have that.
+
+Now ensure there is a blank line after? Not required.
+
+Now produce final answer: just the script, no markdown fences, no commentary.

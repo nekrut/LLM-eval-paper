@@ -1,0 +1,432 @@
+The user wants a single bash script that performs per-sample variant calling on 4 paired-end MiSeq amplicon samples mapped to the human mitochondrial reference (chrM).
+The script must follow the provided plan exactly.
+It must be idempotent, use only listed tools, and output only the script.
+
+Let's carefully construct the script according to the instructions.
+
+Key points:
+- First line: `#!/usr/bin/env bash`
+- Second line: `set -euo pipefail`
+- Assume `data/raw/` and `data/ref/` exist.
+- Write outputs under `results/`.
+- Idempotent: check if files exist before running, or just run commands that are safe to rerun (like `mkdir -p`, `bgzip -f`, etc.). The plan doesn't explicitly ask for idempotency checks, but I should make it robust. Actually, the prompt says "Be idempotent: rerunning on a populated results/ directory must exit 0 without redoing work or erroring." So I should add checks or use `touch`/`test -f` to skip if done, or just rely on tools being safe. But to be strictly idempotent without redoing work, I'll add simple file existence checks or use `|| true` where appropriate, but the prompt says "without redoing work or erroring". I'll stick closely to the plan but add checks for idempotency if needed, or just let it run since most commands will overwrite safely. Actually, `bwa index` and `samtools faidx` are idempotent if the reference doesn't change. I'll just follow the plan exactly, maybe adding `test -f results/$sample.bam || ...` to avoid redoing work. But the prompt says "follow the ordering and tool choices". I will implement it straightforwardly.
+
+Let's draft it step-by-step.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+# 1. Reference indexing — BWA
+if [ ! -f data/ref/chrM.fa.bwt ]; then
+    bwa index data/ref/chrM.fa
+fi
+
+# 2. Reference indexing — samtools faidx
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+# Collapsed TSV header
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+
+for sample in "${SAMPLES[@]}"; do
+    # 3. Per-sample alignment + sort
+    if [ ! -f "results/${sample}.bam" ]; then
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" | samtools sort -@ ${THREADS} -o "results/${sample}.bam" -
+    fi
+
+    # 4. BAM index
+    if [ ! -f "results/${sample}.bam.bai" ]; then
+        samtools index -@ ${THREADS} "results/${sample}.bam"
+    fi
+
+    # 5. Variant calling — LoFreq
+    if [ ! -f "results/${sample}.vcf" ]; then
+        lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o "results/${sample}.vcf" "results/${sample}.bam"
+    fi
+
+    # 6. VCF compression + tabix index
+    if [ ! -f "results/${sample}.vcf.gz" ]; then
+        bgzip -f "results/${sample}.vcf"
+        tabix -p vcf "results/${sample}.vcf.gz"
+    fi
+
+    # 7. Collapsed TSV
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+```
+
+Wait, `lofreq call-parallel` might require the BAM to be sorted and indexed. The plan says step 4 is BAM index, then step 5 is LoFreq. That's fine.
+Also, `bcftools query` on VCF.gz works directly.
+The prompt says "Be idempotent: rerunning on a populated results/ directory must exit 0 without redoing work or erroring." So the `if [ ! -f ... ]` checks are good.
+But wait, `lofreq call-parallel` might complain if the BAM is not indexed? It usually doesn't strictly require it, but we index it anyway.
+One detail: `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'` might output multiple ALT alleles as comma-separated. The plan says exactly that format. I'll stick to the plan.
+Also, `lofreq call-parallel` might produce a VCF with INFO/AF field. Sometimes it's `AF`. The plan says `%INFO/AF`. I'll follow the plan exactly.
+
+Let's verify the plan's commands:
+```bash
+bwa index data/ref/chrM.fa
+samtools faidx data/ref/chrM.fa
+bwa mem -t 4 -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/{sample}_1.fq.gz data/raw/{sample}_2.fq.gz | samtools sort -@ 4 -o results/{sample}.bam -
+samtools index -@ 4 results/{sample}.bam
+lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam
+bgzip -f results/{sample}.vcf
+tabix -p vcf results/{sample}.vcf.gz
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz | awk -v s={sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+```
+
+I will wrap this in the loop and add idempotency checks as requested. I'll also make sure to use `${THREADS}` or `4` consistently. The plan uses `4`. I'll stick to `4` or `${THREADS}`.
+
+One thing: `lofreq call-parallel` might need `--no-indels` or similar for amplicon data, but the plan doesn't specify it. I'll follow the plan exactly.
+Also, `bcftools query` might output `.` for AF if not present. That's fine.
+The plan says:
+```
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz | awk -v s={sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+```
+I will implement exactly this.
+
+Wait, `lofreq call-parallel` might require the reference to be indexed with `samtools faidx`. We do that in step 2.
+Also, `bwa index` creates `.amb`, `.ann`, `.bwt`, `.pac`, `.sa`.
+`samtools faidx` creates `.fai`.
+
+Idempotency: I'll add checks for each major output file to avoid redoing work.
+But the prompt says "without redoing work or erroring". So checking existence is good.
+
+Let's construct the final script carefully.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+# 1. Reference indexing — BWA
+if [ ! -f data/ref/chrM.fa.bwt ]; then
+    bwa index data/ref/chrM.fa
+fi
+
+# 2. Reference indexing — samtools faidx
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+# Initialize collapsed TSV header once
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+
+for sample in "${SAMPLES[@]}"; do
+    # 3. Per-sample alignment + sort
+    if [ ! -f "results/${sample}.bam" ]; then
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" | samtools sort -@ ${THREADS} -o "results/${sample}.bam" -
+    fi
+
+    # 4. BAM index
+    if [ ! -f "results/${sample}.bam.bai" ]; then
+        samtools index -@ ${THREADS} "results/${sample}.bam"
+    fi
+
+    # 5. Variant calling — LoFreq
+    if [ ! -f "results/${sample}.vcf" ]; then
+        lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o "results/${sample}.vcf" "results/${sample}.bam"
+    fi
+
+    # 6. VCF compression + tabix index
+    if [ ! -f "results/${sample}.vcf.gz" ]; then
+        bgzip -f "results/${sample}.vcf"
+        tabix -p vcf "results/${sample}.vcf.gz"
+    fi
+
+    # 7. Collapsed TSV
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+```
+
+Wait, `lofreq call-parallel` might require the BAM to be sorted by coordinate. `samtools sort` does that.
+Also, `bcftools query` on VCF.gz works fine.
+One minor point: `lofreq call-parallel` might output a VCF with multiple ALT alleles separated by commas. The plan says `%ALT`, which will print them as comma-separated. That's standard.
+The plan says `results/collapsed.tsv` should have columns `sample chrom pos ref alt af`. The awk command prints `s,$0` where `$0` is `chrom\tpos\tref\talt\taf`. So the header matches.
+
+Check idempotency: If `results/` is populated, all `if [ ! -f ... ]` will be false, so it skips to the end. The `printf` for header will overwrite if it exists, which is fine. But to be strictly idempotent without redoing work, I could check if `collapsed.tsv` exists and has content, but overwriting a header is harmless. I'll leave it as is.
+
+Wait, the prompt says "Be idempotent: rerunning on a populated results/ directory must exit 0 without redoing work or erroring."
+I'll add a check for `collapsed.tsv` to avoid rewriting if it exists, just in case. Or just leave it, it's fine.
+
+One thing: `lofreq call-parallel` might need `--no-indels` for amplicon data to avoid false positives, but the plan doesn't specify it. I'll stick strictly to the plan.
+
+Another thing: `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'` might fail if AF is not present in INFO. Sometimes LoFreq puts AF in the FORMAT field or as a separate column. But the plan explicitly says `%INFO/AF`. I will follow the plan exactly.
+
+Let's verify the exact commands from the plan:
+```bash
+bwa index data/ref/chrM.fa
+samtools faidx data/ref/chrM.fa
+bwa mem -t 4 -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/{sample}_1.fq.gz data/raw/{sample}_2.fq.gz | samtools sort -@ 4 -o results/{sample}.bam -
+samtools index -@ 4 results/{sample}.bam
+lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam
+bgzip -f results/{sample}.vcf
+tabix -p vcf results/{sample}.vcf.gz
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz | awk -v s={sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+```
+
+I will replace `{sample}` with `${sample}` and `4` with `${THREADS}` or keep `4`. The plan uses `4`. I'll use `4` to match exactly, or `${THREADS}`. It doesn't matter much. I'll stick to `4` as in the plan.
+
+One detail: `lofreq call-parallel` might require the BAM to be indexed for some versions, but we index it anyway.
+Also, `bcftools query` might need `--no-header`? No, `-f` format string handles it.
+I'll write the script exactly as requested.
+
+Wait, `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'` might output `.` for AF if missing. That's fine.
+The plan says `results/collapsed.tsv` must have header `sample  chrom  pos  ref  alt  af`. The awk command prints `s,$0`. `$0` will be `chrom\tpos\tref\talt\taf`. So the columns match.
+
+I will construct the final script now. I'll make sure it's strictly compliant.
+One minor adjustment: `lofreq call-parallel` might complain if the BAM is not sorted by name or coordinate? It expects coordinate-sorted BAM. `samtools sort` does that.
+Also, `bcftools query` on `.vcf.gz` works directly.
+
+Let's double check the idempotency requirement. "rerunning on a populated results/ directory must exit 0 without redoing work or erroring."
+I'll add checks for each output file to skip if present. This satisfies "without redoing work".
+I'll also ensure `mkdir -p results` is there.
+
+One thing: `bcftools query` might output multiple lines per variant if there are multiple ALT alleles. That's standard VCF behavior. The plan doesn't specify flattening, so I'll leave it.
+
+Final check of the script structure:
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+if [ ! -f data/ref/chrM.fa.bwt ]; then
+    bwa index data/ref/chrM.fa
+fi
+
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+
+for sample in "${SAMPLES[@]}"; do
+    if [ ! -f "results/${sample}.bam" ]; then
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" | samtools sort -@ ${THREADS} -o "results/${sample}.bam" -
+    fi
+
+    if [ ! -f "results/${sample}.bam.bai" ]; then
+        samtools index -@ ${THREADS} "results/${sample}.bam"
+    fi
+
+    if [ ! -f "results/${sample}.vcf" ]; then
+        lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o "results/${sample}.vcf" "results/${sample}.bam"
+    fi
+
+    if [ ! -f "results/${sample}.vcf.gz" ]; then
+        bgzip -f "results/${sample}.vcf"
+        tabix -p vcf "results/${sample}.vcf.gz"
+    fi
+
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+```
+
+Wait, `bcftools query` might fail if `%INFO/AF` is not present in the VCF header. LoFreq typically outputs `AF` in the INFO field. If it's not there, it will output `.`. That's fine.
+Also, `lofreq call-parallel` might require `--no-indels` for amplicon data to avoid false positives from homopolymers, but the plan doesn't specify it. I'll stick to the plan.
+
+One detail: `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'` might print multiple ALT alleles as comma-separated. That's standard.
+The plan says `results/collapsed.tsv` columns: `sample chrom pos ref alt af`.
+I'll keep it exactly as planned.
+
+Is there any risk with `bcftools query` on `.vcf.gz`? No, it handles compressed VCFs natively.
+Should I use `bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz` instead of `bgzip -f`? The plan says `bgzip -f results/{sample}.vcf`. That in-place compression is fine.
+
+One thing: `lofreq call-parallel` might output a VCF with `##INFO=<ID=AF,...>` or similar. `%INFO/AF` will work.
+I'll proceed.
+
+Wait, the prompt says "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." I won't use echo.
+The script looks solid.
+
+Let's verify the exact plan commands again:
+```bash
+bwa index data/ref/chrM.fa
+samtools faidx data/ref/chrM.fa
+bwa mem -t 4 -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/{sample}_1.fq.gz data/raw/{sample}_2.fq.gz | samtools sort -@ 4 -o results/{sample}.bam -
+samtools index -@ 4 results/{sample}.bam
+lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam
+bgzip -f results/{sample}.vcf
+tabix -p vcf results/{sample}.vcf.gz
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz | awk -v s={sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+```
+
+I will replace `{sample}` with `${sample}` and `4` with `${THREADS}` for consistency, or just keep `4`. I'll use `${THREADS}` as defined at the top. The plan uses `4`, but defining `THREADS=4` is in the boilerplate. I'll stick to `4` inside the loop to match the plan exactly, or use `${THREADS}`. It doesn't matter much. I'll use `4` as in the plan steps 3-6.
+
+Actually, the boilerplate says:
+```
+set -euo pipefail
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+```
+So I'll use `${THREADS}`.
+
+One minor point: `bcftools query` might output `.` for AF if missing. That's fine.
+I will produce the script now.
+All constraints met.
+Output only the script.
+No markdown fences.
+First line shebang, second set -euo pipefail.
+Idempotent checks added.
+Ready. 
+Let's generate. 
+Wait, should I check for `collapsed.tsv` existence before overwriting? The plan says `printf ... > results/collapsed.tsv`. I'll keep it as is. It's idempotent enough.
+One thing: `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'` might fail if the VCF doesn't have AF in INFO. LoFreq usually puts it there. If not, it outputs `.`. That's acceptable.
+I'll output the script exactly.
+Proceed. 
+Self-Correction/Refinement during thought:
+The plan says `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`. In some bcftools versions, `%INFO/AF` might need to be `%INFO/AF` or just `%AF` if it's a standard field. But the plan explicitly says `%INFO/AF`. I'll follow it.
+Also, `lofreq call-parallel` might require `--no-indels` for amplicon data, but I won't add it since it's not in the plan.
+I will ensure the script matches the plan exactly.
+
+Final check of the script:
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+if [ ! -f data/ref/chrM.fa.bwt ]; then
+    bwa index data/ref/chrM.fa
+fi
+
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+
+for sample in "${SAMPLES[@]}"; do
+    if [ ! -f "results/${sample}.bam" ]; then
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" | samtools sort -@ ${THREADS} -o "results/${sample}.bam" -
+    fi
+
+    if [ ! -f "results/${sample}.bam.bai" ]; then
+        samtools index -@ ${THREADS} "results/${sample}.bam"
+    fi
+
+    if [ ! -f "results/${sample}.vcf" ]; then
+        lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o "results/${sample}.vcf" "results/${sample}.bam"
+    fi
+
+    if [ ! -f "results/${sample}.vcf.gz" ]; then
+        bgzip -f "results/${sample}.vcf"
+        tabix -p vcf "results/${sample}.vcf.gz"
+    fi
+
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+```
+This looks correct and follows all constraints. I will output it now. 
+One detail: `bcftools query` might output multiple lines per variant if there are multiple ALT alleles. The plan doesn't specify flattening, so it's fine.
+All good.
+Output matches request.
+Proceeds. 
+[Output Generation] -> *script only*
+(Note: I'll make sure no markdown formatting is used as per "Output ONLY the script — no prose, no markdown fences, no commentary before or after.")
+Wait, the prompt says "no markdown fences". I will output raw text.
+Done. 
+Let's produce it. 
+(Self-Correction/Verification during drafting)
+Check `bcftools query` format string: `%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n` is correct per plan.
+Check `lofreq call-parallel`: requires coordinate-sorted BAM. `samtools sort` does that.
+Check idempotency: `if [ ! -f ... ]` prevents redoing work.
+Check paths: all relative to cwd.
+Check tools: only listed ones used.
+Check first two lines: exact.
+All constraints satisfied.
+Output matches. 
+Proceeds. 
+[Final Script Generation] (raw text)
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+if [ ! -f data/ref/chrM.fa.bwt ]; then
+    bwa index data/ref/chrM.fa
+fi
+
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+
+for sample in "${SAMPLES[@]}"; do
+    if [ ! -f "results/${sample}.bam" ]; then
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" | samtools sort -@ ${THREADS} -o "results/${sample}.bam" -
+    fi
+
+    if [ ! -f "results/${sample}.bam.bai" ]; then
+        samtools index -@ ${THREADS} "results/${sample}.bam"
+    fi
+
+    if [ ! -f "results/${sample}.vcf" ]; then
+        lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o "results/${sample}.vcf" "results/${sample}.bam"
+    fi
+
+    if [ ! -f "results/${sample}.vcf.gz" ]; then
+        bgzip -f "results/${sample}.vcf"
+        tabix -p vcf "results/${sample}.vcf.gz"
+    fi
+
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+```
+Wait, the prompt says "no markdown fences". I will strip the ```bash and ```.
+I will output exactly the raw script.
+Done. 
+Proceeds. 
+[Output Generation] (raw)
+#!/usr/bin/env bash
+set -euo pipefail
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+if [ ! -f data/ref/chrM.fa.bwt ]; then
+    bwa index data/ref/chrM.fa
+fi
+
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+
+for sample in "${SAMPLES[@]}"; do
+    if [ ! -f "results/${sample}.bam" ]; then
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" | samtools sort -@ ${THREADS} -o "results/${sample}.bam" -
+    fi
+
+    if [ ! -f "results/${sample}.bam.bai" ]; then
+        samtools index -@ ${THREADS} "results/${sample}.bam"
+    fi
+
+    if [ ! -f "results/${sample}.vcf" ]; then
+        lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o "results/${sample}.vcf" "results/${sample}.bam"
+    fi
+
+    if [ ! -f "results/${sample}.vcf.gz" ]; then
+        bgzip -f "results/${sample}.vcf"
+        tabix -p vcf "results/${sample}.vcf.gz"
+    fi
+
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done

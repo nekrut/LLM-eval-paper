@@ -1,0 +1,787 @@
+The user wants a self-contained bash script that performs a specific bioinformatics workflow for mitochondrial DNA variant calling.
+
+Key requirements:
+1.  Shebang: `#!/usr/bin/env bash`
+2.  Strict mode: `set -euo pipefail`
+3.  Inputs: `data/raw/` (FASTQs), `data/ref/chrM.fa`.
+4.  Outputs: `results/` directory containing BAMs, BAI files, VCFs, TBI files, and a collapsed TSV.
+5.  Idempotency: Check for existence of output files before running steps.
+6.  No absolute paths (except maybe standard system paths implied by tools, but data paths must be relative).
+7.  Tools allowed: bwa, samtools, bcftools, tabix, lofreq, etc.
+8.  Specific constraints on `bwa mem` read group string: literal `\t`.
+9.  No duplicate marking.
+10. Collapse step using `bcftools query`.
+
+Let's break down the steps and implement them in bash.
+
+**Step 1: Globals and Setup**
+-   `THREADS=4`
+-   Samples: `M117-bl M117-ch M117C1-bl M117C1-ch`
+-   Create `results/` directory.
+
+**Step 2: Reference Indexing**
+-   Check if `data/ref/chrM.fa.fai` exists. If not, run `samtools faidx`.
+-   Check if `data/ref/chrM.fa.bwt` (or similar bwa index file) exists. If not, run `bwa index`.
+
+**Step 3-5: Alignment and Sorting per sample**
+-   Loop over samples.
+-   Check if `results/${sample}.bam` exists. If so, skip alignment and sorting? Or check the final artifact of this stage. The prompt says "guard each artifact".
+-   Actually, checking `results/${sample}.vcf.gz.tbi` might be sufficient to skip everything for that sample, but it's safer to check intermediate files or just rely on the final output existence if dependencies are clear. However, the prompt asks to guard *each* artifact.
+-   Let's check `results/${sample}.bam`. If missing, run alignment + sort.
+-   Wait, `bwa mem` pipes to `samtools sort`. So we can't easily check just the BAM existence if we want to skip the pipe. But if the BAM exists, we assume it's valid.
+-   Check `results/${sample}.bam.bai`. If missing, index BAM.
+
+**Step 6: Variant Calling**
+-   Check `results/${sample}.vcf.gz` (or the uncompressed `.vcf` before compression). The plan says output is uncompressed VCF first, then compress.
+-   Actually, checking `results/${sample}.vcf.gz.tbi` is the ultimate check for the sample pipeline completion. But to be granular:
+    -   If `results/${sample}.vcf.gz` exists and `results/${sample}.vcf.gz.tbi` exists, skip calling?
+    -   The plan says "guard each artifact".
+    -   Let's check if `results/${sample}.vcf.gz` exists. If not, run lofreq (produces `.vcf`), then compress/index.
+
+**Step 7: Compression/Indexing**
+-   Compress `.vcf` to `.vcf.gz`.
+-   Index `.vcf.gz`.
+-   Remove `.vcf`.
+
+**Step 8: Collapse**
+-   Check if `results/collapsed.tsv` exists and is newer than all VCFs? Or just check existence. The prompt says "Rebuild only if any input VCF is newer than the TSV". This implies a timestamp check or just checking if it exists. Usually, in these scripts, checking existence is enough for idempotency unless inputs change. But strict interpretation: "Rebuild only if any input VCF is newer than the TSV".
+-   Actually, simpler approach: If `results/collapsed.tsv` does not exist, create it. If it exists, check modification times? That's complex in bash without `find` or `stat`.
+-   Alternative interpretation of "idempotent": If the file exists, assume it's valid unless we have a mechanism to detect staleness. The prompt says "Rebuild only if any input VCF is newer than the TSV". This suggests I should implement that check.
+-   However, usually for these coding tasks, checking existence is the primary idempotency requirement. Let's look at the wording: "guard each artifact with an existence check (e.g. skip if results/{sample}.vcf.gz.tbi already exists and is newer than its inputs)".
+-   Okay, I will implement a function or logic to check if the output file exists and is newer than the critical input files.
+
+**Detailed Logic for Idempotency:**
+For each sample:
+1.  **Alignment**: Input FASTQs + Ref Index -> Output `results/${sample}.bam`.
+    -   Check if `results/${sample}.bam` exists. If yes, skip. (Assuming inputs don't change often in this context, or just strict existence check). The prompt example says "skip if ... already exists and is newer than its inputs". I'll stick to existence checks primarily, maybe add timestamp checks if easy.
+    -   Actually, `bwa mem` output is piped. So we generate BAM directly. If BAM exists, skip.
+2.  **Indexing**: Input `results/${sample}.bam` -> Output `results/${sample}.bam.bai`.
+    -   Check if BAI exists. If yes, skip.
+3.  **Calling**: Input `results/${sample}.bam` + Ref -> Output `results/${sample}.vcf`.
+    -   Wait, the plan says lofreq outputs `.vcf`, then we compress to `.vcf.gz`.
+    -   So check if `results/${sample}.vcf.gz` exists? Or check if `.vcf` exists?
+    -   If I check for `.vcf.gz`, and it exists, I assume the VCF is done.
+    -   But lofreq produces uncompressed.
+    -   Let's follow the plan strictly:
+        -   Run lofreq -> `results/${sample}.vcf`.
+        -   Compress -> `results/${sample}.vcf.gz`.
+        -   Index -> `results/${sample}.vcf.gz.tbi`.
+        -   Remove `.vcf`.
+    -   Idempotency check: If `results/${sample}.vcf.gz` exists, skip calling and compression?
+    -   Wait, if I skip calling, I don't generate the uncompressed VCF. That's fine.
+    -   But what if `.vcf.gz` exists but is corrupt? We assume valid.
+    -   What about the timestamp check? "skip if ... already exists and is newer than its inputs".
+    -   For BAM: Inputs are FASTQs. If BAM is older than FASTQ, rerun.
+    -   For VCF: Input is BAM. If VCF is older than BAM, rerun.
+    -   This seems robust.
+
+**Specific Constraint on Read Group:**
+-   `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`
+-   The `\t` must be literal backslash-t.
+-   In bash, inside double quotes, `\t` is just `\t` unless interpreted by `$'...'` or `echo -e`.
+-   So `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"` should work fine in standard bash.
+
+**Tools:**
+-   `bwa mem`
+-   `samtools sort`
+-   `samtools index`
+-   `lofreq call-parallel`
+-   `bgzip` (part of htslib/samtools usually, or standalone). The inventory lists `tabix` and `bcftools`. `bgzip` is often in the same package. If not available as a command, `samtools bgzip` works. Or `bcftools view -Oz`. But plan says "Compress with `bgzip`". I will use `bgzip` if available, or `samtools bgzip`. Given `tabix` is listed, `bgzip` is likely available.
+-   `tabix`
+-   `bcftools query`
+
+**Ref Indexing:**
+-   `samtools faidx data/ref/chrM.fa`
+-   `bwa index data/ref/chrM.fa`
+-   Check for `.fai` and `.bwt`.
+
+**Collapse Step:**
+-   Header: `sample\tchrom\tpos\tref\talt\taf`
+-   Loop samples, run `bcftools query`.
+-   Concatenate.
+-   Write to file.
+-   Check timestamp of TSV vs VCFs.
+
+**Script Structure:**
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+REF="data/ref/chrM.fa"
+RAW_DIR="data/raw"
+RES_DIR="results"
+
+mkdir -p "$RES_DIR"
+
+# Helper to check if target is newer than source (or exists)
+# Returns 0 if work needs to be done, 1 if skipped
+needs_update() {
+    local target="$1"
+    shift
+    # If target doesn't exist, need update
+    if [[ ! -f "$target" ]]; then
+        return 0
+    fi
+    # Check if any source is newer than target
+    for src in "$@"; do
+        if [[ "$src" -nt "$target" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 2. Reference indexing
+if needs_update "${REF}.fai" "$REF"; then
+    samtools faidx "$REF"
+fi
+
+# bwa index files: .amb, .ann, .bwt, .pac, .sa
+# Check for .bwt as representative
+if needs_update "${REF}.bwt" "$REF"; then
+    bwa index "$REF"
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    R1="${RAW_DIR}/${sample}_1.fq.gz"
+    R2="${RAW_DIR}/${sample}_2.fq.gz"
+    BAM="${RES_DIR}/${sample}.bam"
+    BAI="${RES_DIR}/${sample}.bam.bai"
+    VCF_GZ="${RES_DIR}/${sample}.vcf.gz"
+    TBI="${RES_DIR}/${sample}.vcf.gz.tbi"
+
+    # 3 & 4. Alignment and Sorting
+    # Inputs: R1, R2, Ref Index (bwt)
+    # We check if BAM exists and is newer than inputs.
+    # Note: bwa index files are multiple, checking .bwt is usually enough proxy or check all.
+    # Let's just check existence for simplicity unless strict timestamping is required for every file.
+    # The prompt says "guard each artifact with an existence check (e.g. skip if ... already exists and is newer than its inputs)".
+    
+    # Check BAM
+    if needs_update "$BAM" "$R1" "$R2" "${REF}.bwt"; then
+        bwa mem -t "$THREADS" \
+            -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            "$REF" "$R1" "$R2" | \
+        samtools sort -@ "$THREADS" -o "$BAM" -
+    fi
+
+    # 5. BAM Indexing
+    if needs_update "$BAI" "$BAM"; then
+        samtools index -@ "$THREADS" "$BAM"
+    fi
+
+    # 6. Variant Calling
+    # lofreq outputs uncompressed VCF. Let's call it VCF_TMP
+    VCF_TMP="${RES_DIR}/${sample}.vcf"
+    
+    # We need to check if the final compressed version exists? 
+    # Or check if the uncompressed one needs regeneration?
+    # If VCF_GZ exists, we assume VCF_TMP is not needed or already processed.
+    # But lofreq produces VCF_TMP.
+    # Let's check if VCF_GZ exists. If so, skip calling.
+    # Wait, if I skip calling, I don't generate VCF_TMP. That's fine.
+    # But what if VCF_GZ is old?
+    
+    if needs_update "$VCF_GZ" "$BAM" "$REF"; then
+        # Run lofreq
+        lofreq call-parallel --pp-threads "$THREADS" -f "$REF" -o "$VCF_TMP" "$BAM"
+        
+        # 7. Compress and Index
+        bgzip -c "$VCF_TMP" > "${VCF_GZ}.tmp" && mv "${VCF_GZ}.tmp" "$VCF_GZ"
+        tabix -p vcf "$VCF_GZ"
+        rm -f "$VCF_TMP"
+    fi
+done
+
+# 8. Collapse
+COLLAPSED="${RES_DIR}/collapsed.tsv"
+# Inputs for collapse are all VCF_GZ files
+VCFS=()
+for sample in "${SAMPLES[@]}"; do
+    VCFS+=("${RES_DIR}/${sample}.vcf.gz")
+done
+
+if needs_update "$COLLAPSED" "${VCFS[@]}"; then
+    # Header
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"
+    
+    for sample in "${SAMPLES[@]}"; do
+        VCF_FILE="${RES_DIR}/${sample}.vcf.gz"
+        # bcftools query format: {sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n
+        # Note: The prompt says "the {sample} literal is prepended via the format string".
+        # In bcftools query, you can't easily inject a variable into the format string directly 
+        # unless you use shell expansion or a fixed string.
+        # The prompt example: `bcftools query -f '{sample}\t%CHROM...'`
+        # This implies the literal string "{sample}" might be intended? 
+        # No, "the {sample} literal is prepended ... so the sample name is attached".
+        # This usually means using shell variable expansion inside the format string or just printing it.
+        # But bcftools -f takes a format string. If I write `'{sample}\t...'`, it prints "{sample}".
+        # That's not what we want. We want the actual sample name.
+        # However, the prompt says: "run `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`"
+        # And then "(the {sample} literal is prepended via the format string so the sample name is attached per row)".
+        # This phrasing is slightly ambiguous. Does it mean I should literally type `{sample}` and bcftools replaces it? 
+        # No, bcftools doesn't replace `{sample}` with the filename automatically in that syntax.
+        # It likely means I should use shell expansion to put the sample name there.
+        # OR, it implies using a specific feature.
+        # Let's look at the command provided: `bcftools query -f '{sample}\t%CHROM...'`
+        # If I run this literally, it outputs "{sample}".
+        # Maybe the prompt implies that `{sample}` is a placeholder for me to replace with the actual name?
+        # "the {sample} literal is prepended via the format string" -> This sounds like the user wants the sample name in the output.
+        # If I use shell expansion: `bcftools query -f "${sample}\t%CHROM..."`
+        # That works.
+        # Let's re-read carefully: "run `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`"
+        # This looks like a template command where `{sample}` is a placeholder for the variable.
+        # I will replace `{sample}` with `$sample`.
+        
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$VCF_FILE" >> "$COLLAPSED"
+    done
+fi
+```
+
+**Refining the Read Group String:**
+The prompt is very specific:
+> exact form: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`
+> The `\t` must remain the two characters backslash and `t` — bwa parses them itself. Do NOT use `printf`, `echo -e`, `$'\t'`, or any mechanism that turns them into real tabs; bwa rejects real tabs with “the read group line contained literal <tab> characters”.
+
+In bash, if I write:
+`-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`
+Inside double quotes, `\t` is NOT interpreted as a tab by bash (unless `shopt -s globstar` or something weird, but standard bash treats `\` as literal inside double quotes unless followed by `$`, `` ` ``, `"`, `\`, or newline).
+So `\t` remains `\t`. This satisfies the requirement.
+
+**Refining Idempotency Logic:**
+The prompt says: "guard each artifact with an existence check (e.g. skip if results/{sample}.vcf.gz.tbi already exists and is newer than its inputs)".
+My `needs_update` function does exactly this. It checks if target exists, and if so, compares timestamps with inputs.
+
+**Refining Collapse Step:**
+The prompt says: "Rebuild only if any input VCF is newer than the TSV".
+My logic handles this.
+
+**Refining Tools:**
+-   `bgzip`: Is it in the inventory? The inventory lists `tabix (htslib) 1.21`. `bgzip` is part of htslib. It should be available. If not, `samtools bgzip` is safer since `samtools` is listed. I'll use `bgzip` as requested by the plan ("Compress with `bgzip`"), but fallback to `samtools bgzip` if needed? No, stick to the plan. The plan says "Compress with `bgzip`". I will assume `bgzip` command exists. If it fails, the script exits due to `set -e`. Given `tabix` is there, `bgzip` is highly likely.
+
+**Refining VCF Compression:**
+Plan: "Compress with `bgzip` (not `bcftools view -O z`) producing `results/{sample}.vcf.gz`."
+My code: `bgzip -c "$VCF_TMP" > "${VCF_GZ}.tmp" && mv ...`
+This is correct.
+
+**Refining bcftools query format:**
+The prompt says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`
+It explicitly puts `{sample}` in single quotes in the example command.
+However, it also says "the {sample} literal is prepended via the format string so the sample name is attached per row".
+If I use single quotes `'{sample}\t...'`, the output will literally contain the text `{sample}`.
+This contradicts "so the sample name is attached".
+It's highly probable that `{sample}` in the prompt's command example is a placeholder for the variable `$sample`.
+I will use double quotes and expand `$sample`.
+
+**One detail on `lofreq`:**
+`lofreq call-parallel` might output to stdout or file. The plan says `-o results/{sample}.vcf`.
+So it writes to file.
+
+**One detail on `bwa mem` pipe:**
+`bwa mem ... | samtools sort ... -o results/{sample}.bam -`
+The `-` tells samtools to read from stdin.
+
+**Timestamp Check Logic:**
+`[[ "$src" -nt "$target" ]]` works for files.
+If `target` doesn't exist, `needs_update` returns 0 (true).
+If `target` exists and is newer than all sources, returns 1 (false).
+
+**Corner Case: Reference Indexing**
+Inputs for BAM are FASTQs and Ref Index.
+I check `${REF}.bwt`.
+Is it possible that `.bwt` exists but is old? Yes.
+So checking timestamp of `.bwt` against FASTQs is good.
+But wait, the reference index depends on `chrM.fa`.
+If `chrM.fa` changes, index should be rebuilt.
+My `needs_update` for BAM checks `${REF}.bwt`. It does NOT check `chrM.fa`.
+However, if `chrM.fa` changes, `.bwt` might not change timestamp automatically unless we rebuild it.
+The script rebuilds index if `chrM.fa` is newer than `.bwt`.
+So the chain is:
+1. Check if `.bwt` needs update based on `chrM.fa`. If yes, rebuild.
+2. Check if BAM needs update based on FASTQs and `.bwt`.
+This logic holds.
+
+**Wait, `needs_update` for Ref Index:**
+`if needs_update "${REF}.fai" "$REF"; then ...`
+`if needs_update "${REF}.bwt" "$REF"; then ...`
+This ensures index is fresh relative to reference.
+
+**Wait, `needs_update` for BAM:**
+`if needs_update "$BAM" "$R1" "$R2" "${REF}.bwt"; then ...`
+This ensures BAM is fresh relative to inputs.
+
+**Wait, `needs_update` for VCF:**
+`if needs_update "$VCF_GZ" "$BAM" "$REF"; then ...`
+This ensures VCF is fresh relative to BAM and Ref (lofreq uses ref).
+
+**Wait, `needs_update` for Collapse:**
+`if needs_update "$COLLAPSED" "${VCFS[@]}"; then ...`
+This ensures TSV is fresh relative to VCFs.
+
+**One small issue:**
+`bgzip` might not be in PATH if only `tabix` is listed?
+Inventory: `tabix (htslib) 1.21`.
+Usually `bgzip` is installed alongside `tabix` in htslib packages.
+If `bgzip` command is missing, the script will fail.
+To be safe, I can check if `bgzip` exists or use `samtools bgzip`.
+But the plan explicitly says "Compress with `bgzip`".
+I will trust the environment has it.
+
+**Another small issue:**
+`lofreq call-parallel` output format.
+It outputs VCF.
+The prompt says "Output: results/{sample}.vcf (uncompressed)".
+Then step 7 compresses it.
+
+**Script Construction:**
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Configuration
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+REF="data/ref/chrM.fa"
+RAW_DIR="data/raw"
+RES_DIR="results"
+
+# Create results directory
+mkdir -p "$RES_DIR"
+
+# Function to check if target needs updating based on source files
+# Returns 0 (true) if update is needed, 1 (false) if not
+needs_update() {
+    local target="$1"
+    shift
+    # If target does not exist, it needs to be created
+    if [[ ! -f "$target" ]]; then
+        return 0
+    fi
+    # Check if any source file is newer than the target
+    for src in "$@"; do
+        if [[ "$src" -nt "$target" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Step 2: Reference Indexing
+# samtools faidx
+if needs_update "${REF}.fai" "$REF"; then
+    samtools faidx "$REF"
+fi
+
+# bwa index (check for .bwt as a proxy for the index set)
+if needs_update "${REF}.bwt" "$REF"; then
+    bwa index "$REF"
+fi
+
+# Loop over samples
+for sample in "${SAMPLES[@]}"; do
+    R1="${RAW_DIR}/${sample}_1.fq.gz"
+    R2="${RAW_DIR}/${sample}_2.fq.gz"
+    BAM="${RES_DIR}/${sample}.bam"
+    BAI="${RES_DIR}/${sample}.bam.bai"
+    VCF_GZ="${RES_DIR}/${sample}.vcf.gz"
+    TBI="${RES_DIR}/${sample}.vcf.gz.tbi"
+    VCF_TMP="${RES_DIR}/${sample}.vcf"
+
+    # Step 3 & 4: Alignment and Sorting
+    # Inputs: R1, R2, Reference Index (.bwt)
+    if needs_update "$BAM" "$R1" "$R2" "${REF}.bwt"; then
+        bwa mem -t "$THREADS" \
+            -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            "$REF" "$R1" "$R2" | \
+        samtools sort -@ "$THREADS" -o "$BAM" -
+    fi
+
+    # Step 5: BAM Indexing
+    if needs_update "$BAI" "$BAM"; then
+        samtools index -@ "$THREADS" "$BAM"
+    fi
+
+    # Step 6 & 7: Variant Calling, Compression, Indexing
+    # We check the final compressed VCF. If it exists and is newer than BAM/Ref, skip.
+    if needs_update "$VCF_GZ" "$BAM" "$REF"; then
+        # Call variants (outputs uncompressed VCF)
+        lofreq call-parallel --pp-threads "$THREADS" -f "$REF" -o "$VCF_TMP" "$BAM"
+
+        # Compress with bgzip
+        bgzip -c "$VCF_TMP" > "${VCF_GZ}.tmp" && mv "${VCF_GZ}.tmp" "$VCF_GZ"
+
+        # Index VCF
+        tabix -p vcf "$VCF_GZ"
+
+        # Remove intermediate uncompressed VCF
+        rm -f "$VCF_TMP"
+    fi
+done
+
+# Step 8: Collapse
+COLLAPSED="${RES_DIR}/collapsed.tsv"
+VCFS=()
+for sample in "${SAMPLES[@]}"; do
+    VCFS+=("${RES_DIR}/${sample}.vcf.gz")
+done
+
+if needs_update "$COLLAPSED" "${VCFS[@]}"; then
+    # Write header
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"
+
+    for sample in "${SAMPLES[@]}"; do
+        VCF_FILE="${RES_DIR}/${sample}.vcf.gz"
+        # Query VCF and prepend sample name
+        # Using double quotes to expand $sample variable into the format string
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$VCF_FILE" >> "$COLLAPSED"
+    done
+fi
+```
+
+**Double Check Constraints:**
+-   `set -euo pipefail`: Yes.
+-   Idempotent: Yes, using timestamp checks.
+-   No absolute paths: Yes.
+-   Tools: bwa, samtools, lofreq, bgzip, tabix, bcftools. All in inventory.
+-   Read group format: `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`. In bash double quotes, `\t` is literal backslash-t. Correct.
+-   No `markdup`: Yes.
+-   Collapse columns: `sample chrom pos ref alt af`. Yes.
+-   Header in collapsed.tsv: Yes.
+
+**One potential issue:**
+`bgzip` might not be available as a standalone command in some minimal environments, even if htslib is present. However, the inventory lists `tabix (htslib) 1.21`. Usually `bgzip` is included. If I want to be super safe, I could use `samtools bgzip`. But the plan says "Compress with `bgzip`". I'll stick to `bgzip`.
+
+**Another potential issue:**
+The prompt says "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose."
+My script has no echo statements. Good.
+
+**Timestamp check logic refinement:**
+If `needs_update` returns 0 (true), we run the command.
+If `target` exists and is newer than all sources, it returns 1 (false), we skip.
+This is correct.
+
+**Wait, `bwa index` produces multiple files.**
+I check `${REF}.bwt`. If `.bwt` is up to date, are the others?
+Usually yes, they are generated together.
+If I only check `.bwt`, and somehow `.amb` is missing (unlikely if `.bwt` exists), it might fail later.
+But `bwa index` creates all of them. If `.bwt` exists, the index is likely complete.
+To be safer, I could check for existence of `.amb` as well, or just rely on `.bwt`.
+Given the constraint "guard each artifact", checking the final output of the indexing step (which is a set of files) is tricky.
+Checking `.bwt` is a standard proxy.
+
+**Wait, `lofreq call-parallel` might fail if BAM is not indexed?**
+No, lofreq can work on unsorted/unindexed BAMs usually, but it's good practice to have index.
+My script indexes BAM before calling.
+
+**Wait, `bcftools query` format string.**
+The prompt says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`
+It uses single quotes in the example.
+If I use double quotes `"${sample}\t..."`, bash expands `$sample`.
+Does `bcftools` interpret `\t` inside the format string?
+Yes, `bcftools query` format strings support `\t` for tab.
+So `"${sample}\t%CHROM..."` will result in: `<value_of_sample><tab>%CHROM...`.
+This is correct.
+
+**Final check on Read Group:**
+The prompt warns: "bwa rejects real tabs with 'the read group line contained literal <tab> characters'".
+This confirms that `\t` must be the two characters `\` and `t`.
+In bash, `echo -e "\t"` produces a tab.
+But `-R "@RG\t..."` inside double quotes passes the string `@RG\t...` to bwa.
+Bwa then parses `\t` as a tab separator for its internal fields.
+This is the correct behavior.
+
+**One detail:**
+The prompt says "Do not hardcode any path outside the current working directory."
+My script uses relative paths `data/ref/`, `data/raw/`, `results/`.
+This is compliant.
+
+**One detail:**
+"Total wall-clock must be under 600 seconds at THREADS=4."
+The script is efficient, parallelizes where possible (bwa mem -t 4, samtools sort -@ 4, lofreq --pp-threads 4).
+It should be fast enough for mtDNA (16kb).
+
+**One detail:**
+"Idempotent: rerunning on a populated results/ directory must exit 0 without redoing work or erroring."
+My timestamp checks ensure this.
+
+**One detail:**
+"Write all outputs under results/".
+Yes.
+
+**One detail:**
+"Assume the current working directory contains data/raw/ ... and data/ref/".
+Yes.
+
+**One detail:**
+"First line must be: #!/usr/bin/env bash"
+"Second line must be: set -euo pipefail"
+Yes.
+
+**One detail:**
+"Output ONLY the script — no prose, no markdown fences, no commentary before or after."
+I will output just the code block content.
+
+**Refining the `needs_update` function slightly:**
+If `target` is a directory? No, all targets are files.
+The logic seems solid.
+
+One small edge case: `bgzip -c` writes to stdout. I redirect to `.tmp` then move. This is atomic-ish and safe.
+If `bgzip` fails, the script exits due to `set -e`.
+
+One check on `lofreq`:
+`lofreq call-parallel` might require the BAM to be indexed?
+Documentation says: "Input BAM file must be sorted and indexed."
+My script indexes BAM before calling. Good.
+
+One check on `bcftools query`:
+Does it handle `.vcf.gz` directly? Yes, it supports compressed VCFs.
+
+Final verification of the collapse header:
+`sample\tchrom\tpos\tref\talt\taf`
+My printf: `printf "sample\tchrom\tpos\tref\talt\taf\n"`
+This produces a tab-separated header. Correct.
+
+The script looks ready.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Configuration
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+REF="data/ref/chrM.fa"
+RAW_DIR="data/raw"
+RES_DIR="results"
+
+# Create results directory if missing
+mkdir -p "$RES_DIR"
+
+# Function to check if target needs updating based on source files
+# Returns 0 (true) if update is needed, 1 (false) if not
+needs_update() {
+    local target="$1"
+    shift
+    # If target does not exist, it needs to be created
+    if [[ ! -f "$target" ]]; then
+        return 0
+    fi
+    # Check if any source file is newer than the target
+    for src in "$@"; do
+        if [[ "$src" -nt "$target" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Step 2: Reference Indexing
+# samtools faidx
+if needs_update "${REF}.fai" "$REF"; then
+    samtools faidx "$REF"
+fi
+
+# bwa index (check for .bwt as a proxy for the index set)
+if needs_update "${REF}.bwt" "$REF"; then
+    bwa index "$REF"
+fi
+
+# Loop over samples
+for sample in "${SAMPLES[@]}"; do
+    R1="${RAW_DIR}/${sample}_1.fq.gz"
+    R2="${RAW_DIR}/${sample}_2.fq.gz"
+    BAM="${RES_DIR}/${sample}.bam"
+    BAI="${RES_DIR}/${sample}.bam.bai"
+    VCF_GZ="${RES_DIR}/${sample}.vcf.gz"
+    TBI="${RES_DIR}/${sample}.vcf.gz.tbi"
+    VCF_TMP="${RES_DIR}/${sample}.vcf"
+
+    # Step 3 & 4: Alignment and Sorting
+    # Inputs: R1, R2, Reference Index (.bwt)
+    if needs_update "$BAM" "$R1" "$R2" "${REF}.bwt"; then
+        bwa mem -t "$THREADS" \
+            -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            "$REF" "$R1" "$R2" | \
+        samtools sort -@ "$THREADS" -o "$BAM" -
+    fi
+
+    # Step 5: BAM Indexing
+    if needs_update "$BAI" "$BAM"; then
+        samtools index -@ "$THREADS" "$BAM"
+    fi
+
+    # Step 6 & 7: Variant Calling, Compression, Indexing
+    # We check the final compressed VCF. If it exists and is newer than BAM/Ref, skip.
+    if needs_update "$VCF_GZ" "$BAM" "$REF"; then
+        # Call variants (outputs uncompressed VCF)
+        lofreq call-parallel --pp-threads "$THREADS" -f "$REF" -o "$VCF_TMP" "$BAM"
+
+        # Compress with bgzip
+        bgzip -c "$VCF_TMP" > "${VCF_GZ}.tmp" && mv "${VCF_GZ}.tmp" "$VCF_GZ"
+
+        # Index VCF
+        tabix -p vcf "$VCF_GZ"
+
+        # Remove intermediate uncompressed VCF
+        rm -f "$VCF_TMP"
+    fi
+done
+
+# Step 8: Collapse
+COLLAPSED="${RES_DIR}/collapsed.tsv"
+VCFS=()
+for sample in "${SAMPLES[@]}"; do
+    VCFS+=("${RES_DIR}/${sample}.vcf.gz")
+done
+
+if needs_update "$COLLAPSED" "${VCFS[@]}"; then
+    # Write header
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"
+
+    for sample in "${SAMPLES[@]}"; do
+        VCF_FILE="${RES_DIR}/${sample}.vcf.gz"
+        # Query VCF and prepend sample name
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$VCF_FILE" >> "$COLLAPSED"
+    done
+fi
+```
+The logic seems sound. I will output this script.
+One minor thing: `bgzip` might not be in PATH if the environment is strictly limited to the listed tools and `bgzip` isn't explicitly listed, though `tabix` implies htslib.
+However, `samtools bgzip` is a safer bet if `bgzip` command is missing.
+But the plan says "Compress with `bgzip`".
+I'll stick to `bgzip`. If it's not there, the user environment setup is inconsistent with the tool inventory implication (htslib usually provides both).
+Actually, looking at the inventory: `tabix (htslib) 1.21`. It doesn't explicitly list `bgzip`.
+But `bgzip` is part of htslib.
+To be absolutely safe and compliant with "Use only tools listed in TOOL_INVENTORY", I should check if `bgzip` is considered a separate tool or part of `tabix`/`samtools`.
+Usually, `bgzip` is a binary provided by the htslib package.
+If I want to be 100% compliant with the list, I might use `samtools bgzip`.
+But the plan explicitly says "Compress with `bgzip`".
+I will follow the plan's instruction over my safety concern, assuming the environment is set up correctly for the plan.
+
+Wait, looking at the inventory again:
+`tabix (htslib) 1.21`
+`samtools samtools 1.21`
+`bcftools bcftools 1.21`
+All are htslib based. `bgzip` is definitely available if `tabix` is.
+
+One final check on the Read Group string.
+The prompt says: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`
+My code: `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`
+This is correct.
+
+One final check on `bcftools query` format.
+The prompt says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`
+My code uses double quotes to expand `$sample`.
+This is necessary to get the sample name in the output.
+If I used single quotes, it would print `{sample}` literally.
+The prompt's example likely uses `{sample}` as a placeholder for the variable.
+
+I am confident in the script.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Configuration
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+REF="data/ref/chrM.fa"
+RAW_DIR="data/raw"
+RES_DIR="results"
+
+# Create results directory if missing
+mkdir -p "$RES_DIR"
+
+# Function to check if target needs updating based on source files
+# Returns 0 (true) if update is needed, 1 (false) if not
+needs_update() {
+    local target="$1"
+    shift
+    # If target does not exist, it needs to be created
+    if [[ ! -f "$target" ]]; then
+        return 0
+    fi
+    # Check if any source file is newer than the target
+    for src in "$@"; do
+        if [[ "$src" -nt "$target" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Step 2: Reference Indexing
+# samtools faidx
+if needs_update "${REF}.fai" "$REF"; then
+    samtools faidx "$REF"
+fi
+
+# bwa index (check for .bwt as a proxy for the index set)
+if needs_update "${REF}.bwt" "$REF"; then
+    bwa index "$REF"
+fi
+
+# Loop over samples
+for sample in "${SAMPLES[@]}"; do
+    R1="${RAW_DIR}/${sample}_1.fq.gz"
+    R2="${RAW_DIR}/${sample}_2.fq.gz"
+    BAM="${RES_DIR}/${sample}.bam"
+    BAI="${RES_DIR}/${sample}.bam.bai"
+    VCF_GZ="${RES_DIR}/${sample}.vcf.gz"
+    TBI="${RES_DIR}/${sample}.vcf.gz.tbi"
+    VCF_TMP="${RES_DIR}/${sample}.vcf"
+
+    # Step 3 & 4: Alignment and Sorting
+    # Inputs: R1, R2, Reference Index (.bwt)
+    if needs_update "$BAM" "$R1" "$R2" "${REF}.bwt"; then
+        bwa mem -t "$THREADS" \
+            -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            "$REF" "$R1" "$R2" | \
+        samtools sort -@ "$THREADS" -o "$BAM" -
+    fi
+
+    # Step 5: BAM Indexing
+    if needs_update "$BAI" "$BAM"; then
+        samtools index -@ "$THREADS" "$BAM"
+    fi
+
+    # Step 6 & 7: Variant Calling, Compression, Indexing
+    # We check the final compressed VCF. If it exists and is newer than BAM/Ref, skip.
+    if needs_update "$VCF_GZ" "$BAM" "$REF"; then
+        # Call variants (outputs uncompressed VCF)
+        lofreq call-parallel --pp-threads "$THREADS" -f "$REF" -o "$VCF_TMP" "$BAM"
+
+        # Compress with bgzip
+        bgzip -c "$VCF_TMP" > "${VCF_GZ}.tmp" && mv "${VCF_GZ}.tmp" "$VCF_GZ"
+
+        # Index VCF
+        tabix -p vcf "$VCF_GZ"
+
+        # Remove intermediate uncompressed VCF
+        rm -f "$VCF_TMP"
+    fi
+done
+
+# Step 8: Collapse
+COLLAPSED="${RES_DIR}/collapsed.tsv"
+VCFS=()
+for sample in "${SAMPLES[@]}"; do
+    VCFS+=("${RES_DIR}/${sample}.vcf.gz")
+done
+
+if needs_update "$COLLAPSED" "${VCFS[@]}"; then
+    # Write header
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"
+
+    for sample in "${SAMPLES[@]}"; do
+        VCF_FILE="${RES_DIR}/${sample}.vcf.gz"
+        # Query VCF and prepend sample name
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$VCF_FILE" >> "$COLLAPSED"
+    done
+fi
+```
+The solution seems complete. I'll provide it now.

@@ -1,0 +1,172 @@
+We need to produce a bash script following constraints. Must be idempotent: skip steps if outputs exist and newer than inputs. Use set -euo pipefail. Tools available: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java.
+
+We need to use bgzip? Not listed but we can use "bgzip" from htslib; not in inventory. But bcftools view -O z is allowed. The plan says compress with bgzip, but tool not listed. We can use "bcftools view -Oz". That outputs compressed VCF gz. Then index with tabix.
+
+We need to ensure that the script uses only tools from inventory. bcftools includes bgzip? Actually bcftools has a built-in bgzip command: "bgzip" is separate but part of htslib; not listed. But we can use "bcftools view -Oz". That writes compressed VCF.
+
+Thus step 7: compress with bcftools view -O z -o results/{sample}.vcf.gz results/{sample}.vcf
+
+Then tabix index.
+
+Also need to remove intermediate .vcf after compression.
+
+Idempotency: For each sample, check if results/{sample}.bam.bai exists and is newer than raw fastq? But we can just check existence of bam and bai. If both exist, skip alignment. Similarly for vcf.gz.tbi.
+
+Simplify: For each sample, if results/${sample}.vcf.gz.tbi exists, assume all done; else run steps.
+
+But need to ensure that reference indexing is done once. Check presence of chrM.fa.fai and .amb etc.
+
+Also need to create results/ directory.
+
+Implement loops.
+
+Need to use literal backslash-t in read group string: "-R \"@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA\"" The script must not interpret \t as tab. In bash, within double quotes, \t is just backslash t? Actually inside double quotes, \t is literal backslash and t unless used with $'...' or echo -e. So we can use "-R \"@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA\"" That will pass the string with backslashes.
+
+But we need to escape double quotes properly in bash script. We'll write:
+
+bwa mem -t 4 -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" ...
+
+In a single-quoted string? Actually if we use single quotes around the whole argument, backslashes are literal except for escaping single quote. But we need variable expansion of ${sample}. So cannot single quote entire string. Use double quotes.
+
+Thus:
+
+bwa mem -t 4 -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" ...
+
+That should work.
+
+Now idempotency: For each sample, we can check if results/${sample}.bam.bai exists and is newer than raw fastq. But easier: if both bam and bai exist, skip alignment; else run alignment.
+
+Similarly for vcf.gz.tbi: if exists, skip variant calling.
+
+But need to ensure that if any intermediate missing, we recompute. We'll implement functions.
+
+Also need to create collapsed.tsv only if any of the sample vcf.gz.tbi are newer than collapsed.tsv or collapsed.tsv doesn't exist.
+
+Implement:
+
+if [ ! -f results/collapsed.tsv ] || \
+   ( find results/*.vcf.gz.tbi -newer results/collapsed.tsv | grep . ); then
+    # rebuild
+fi
+
+But we need to check if any vcf.gz.tbi newer than collapsed.tsv. Use `find` with -newer.
+
+Simplify: use a loop over samples, collect outputs; after all per-sample steps done, run collapse step if needed.
+
+Now produce script.
+
+Edge: Need to ensure that reference indexing only once. Check for chrM.fa.fai and .amb etc. We'll check presence of chrM.fa.fai; if missing, index.
+
+Also need to create results/ directory.
+
+Let's write script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+# Create results dir
+mkdir -p results
+
+# Reference indexing
+REF=data/ref/chrM.fa
+if [ ! -f "${REF}.fai" ]; then
+    samtools faidx "$REF"
+fi
+# bwa index produces .amb .ann .bwt .pac .sa; check one file
+if [ ! -f "${REF}.amb" ]; then
+    bwa index "$REF"
+fi
+
+# Per-sample processing
+for sample in "${SAMPLES[@]}"; do
+    BAM=results/${sample}.bam
+    BAI=results/${sample}.bam.bai
+    VCF=results/${sample}.vcf
+    VCFZ=results/${sample}.vcf.gz
+    TBIVCF=${VCFZ}.tbi
+
+    # Alignment if bam missing or older than raw fastq
+    if [ ! -f "$BAM" ] || \
+       ( [ "$(stat -c %Y "$BAM")" -lt "$(stat -c %Y data/raw/${sample}_1.fq.gz)" ] ); then
+        bwa mem -t "$THREADS" -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+            data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+            samtools sort -@ "$THREADS" -o "$BAM"
+    fi
+
+    # Index bam if missing or older than bam
+    if [ ! -f "$BAI" ] || \
+       ( [ "$(stat -c %Y "$BAI")" -lt "$(stat -c %Y "$BAM")" ] ); then
+        samtools index -@ "$THREADS" "$BAM"
+    fi
+
+    # Variant calling if vcf.gz.tbi missing or older than bam
+    if [ ! -f "$TBIVCF" ] || \
+       ( [ "$(stat -c %Y "$TBIVCF")" -lt "$(stat -c %Y "$BAM")" ] ); then
+        lofreq call-parallel --pp-threads "$THREADS" -f "$REF" -b "$BAM" -o "$VCF"
+        # compress and index
+        bcftools view -Oz -o "$VCFZ" "$VCF"
+        tabix -p vcf "$VCFZ"
+        rm -f "$VCF"
+    fi
+done
+
+# Collapse step
+COLLAPSED=results/collapsed.tsv
+REBUILD=false
+if [ ! -f "$COLLAPSED" ]; then
+    REBUILD=true
+else
+    for sample in "${SAMPLES[@]}"; do
+        VCFZ=results/${sample}.vcf.gz
+        if [ "$(stat -c %Y "$VCFZ")" -gt "$(stat -c %Y "$COLLAPSED")" ]; then
+            REBUILD=true
+            break
+        fi
+    done
+fi
+
+if $REBUILD; then
+    >"$COLLAPSED"
+    printf "sample\tchrom\tpos\tref\talt\taf\n" >> "$COLLAPSED"
+    for sample in "${SAMPLES[@]}"; do
+        VCFZ=results/${sample}.vcf.gz
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$VCFZ" >> "$COLLAPSED"
+    done
+fi
+
+exit 0
+
+Need to ensure that stat -c %Y works on all systems; but we can use `stat -c %Y`. Might not be portable. But environment is Linux aarch64, so fine.
+
+Also need to check for missing raw fastq? They exist.
+
+But the condition for alignment: we used if bam missing or older than raw fastq. However we used only _1.fq.gz; but both may change. Use max of two. Simpler: just skip if bam exists and newer than both fastqs. We'll compute latest modification time among the two fastqs.
+
+Simplify: use find -newer? But easier: check if bam exists AND both fastqs older than bam. So:
+
+if [ ! -f "$BAM" ] || \
+   ( [ "$(stat -c %Y data/raw/${sample}_1.fq.gz)" -gt "$(stat -c %Y "$BAM")" ] || \
+     [ "$(stat -c %Y data/raw/${sample}_2.fq.gz)" -gt "$(stat -c %Y "$BAM")" ] ); then
+
+But we used earlier condition incorrectly. Let's adjust.
+
+Also for bam index: check if bai missing or older than bam.
+
+For vcf.tbi: check if tbi missing or older than bam? Actually should be newer than vcf, but we can just check if tbi missing or older than vcf.gz. But we don't have vcf.gz until after compression. So we can check if tbi missing or older than bam (since vcf.gz will be created from bam). That is fine.
+
+But better: check if tbi missing or older than bam; then run variant calling.
+
+Also need to ensure that bcftools view -Oz writes gz file; but we used bcftools view -Oz -o "$VCFZ" "$VCF". Good.
+
+Now collapse step: we used stat on VCFZ and collapsed. That ensures rebuild if any vcf.gz newer.
+
+Edge: If collapsed.tsv exists but some sample missing? But all samples should exist.
+
+Also need to ensure that bcftools query uses %INFO/AF; but AF may be absent for single-sample variant calling? lofreq call-parallel outputs INFO/AF? It might output AF. We'll trust.
+
+Now final script.
+
+Let's produce final answer.

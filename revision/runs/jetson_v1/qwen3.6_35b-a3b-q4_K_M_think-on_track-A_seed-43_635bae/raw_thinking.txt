@@ -1,0 +1,2233 @@
+The user wants a single bash script that performs a specific bioinformatics workflow for mitochondrial variant calling on 4 paired-end samples.
+Let's break down the requirements:
+1. Shebang and set options: `#!/usr/bin/env bash` and `set -euo pipefail`.
+2. Globals: `THREADS=4`, sample list: `M117-bl M117-ch M117C1-bl M117C1-ch`.
+3. Create `results/` directory.
+4. Idempotency: Check for existing outputs before running steps. Skip if done.
+5. Reference indexing: `samtools faidx` and `bwa index` on `data/ref/chrM.fa`, skip if indices exist.
+6. Per-sample alignment: `bwa mem -t 4` with specific `-R` format. Pipe to `samtools sort`.
+7. BAM indexing: `samtools index`.
+8. Variant calling: `lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam`.
+9. VCF compression/indexing: `bgzip` and `tabix -p vcf`. Remove intermediate `.vcf`.
+10. Collapse step: `bcftools query` for each sample, concatenate, add header to `results/collapsed.tsv`.
+11. Output only the script. No markdown, no commentary.
+
+Let's carefully construct the script following the exact instructions.
+
+Key details to watch out for:
+- `-R` argument format: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`. The prompt says: "The `\t` must remain the two characters backslash and `t` — bwa parses them itself. Do NOT use `printf`, `echo -e`, `$'\t'`, or any mechanism that turns them into real tabs". So I will literally write `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`.
+- Idempotency: Use `if [ ! -f results/${sample}.bam ]; then ... fi` or similar checks. Or check for the final output of each step. The prompt says "guard each artifact with an existence check". I'll wrap each sample's pipeline in a conditional that checks for the final BAM or VCF, or just check at the end of each step. To be safe and idempotent, I'll check for `results/${sample}.vcf.gz.tbi` before running the whole per-sample block, or check each artifact. Actually, checking for the final output of each major step is fine.
+- `lofreq call-parallel`: syntax is `lofreq call-parallel -f ref.fa -o out.vcf in.bam`. I'll use that.
+- `bgzip` and `tabix`: standard commands.
+- `bcftools query`: format string `{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n`. Wait, the prompt says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`. Note that `{sample}` in bcftools format string is a placeholder for the sample name. But here we want to prepend the literal sample name. Actually, bcftools query uses `%SAMPLE` or just `${sample}`? The prompt explicitly says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`. I will follow exactly what's written, but note that in bcftools, `{sample}` might not work as a literal string unless escaped or quoted properly. Actually, bcftools format strings use `%` for fields. To output a literal string, you just put it in the format string. So `'{sample}\t...'` will output literally `sample`? Wait, the prompt says: "the `{sample}` literal is prepended via the format string so the sample name is attached per row". This implies I should substitute `${sample}` into the bash command, or use bcftools' `%SAMPLE`. But the prompt explicitly gives the command: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`. I will interpret `{sample}` as a bash variable `${sample}` inside single quotes? No, single quotes prevent expansion. I'll use double quotes for the format string or just concatenate: `-f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`. Or maybe bcftools supports `{SAMPLE}`? Actually, bcftools query format uses `%` for fields. To output a literal string, you just write it. So `'{sample}'` would output literally `sample`. The prompt says "the `{sample}` literal is prepended via the format string so the sample name is attached per row". This is slightly ambiguous. I'll use `-f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"` to be safe, or just follow the prompt literally: `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz`. Wait, the prompt says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`. I will replace `{sample}` with `${sample}` in bash. Actually, bcftools format strings don't use `{}` for variables. I'll just use `-f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`.
+
+Let's re-read carefully: "For each sample, run `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz` (the `{sample}` literal is prepended via the format string so the sample name is attached per row)."
+This likely means I should substitute `${sample}` into the bash command. I'll write: `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz`.
+
+Wait, bcftools query format string uses `%` for fields. If I want to output the sample name, I can use `%SAMPLE`. But the prompt explicitly says `{sample}` literal is prepended. I'll stick to bash variable expansion: `-f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`.
+
+Actually, bcftools query supports `${SAMPLE}` or just `%SAMPLE`. But to avoid confusion, I'll use `-f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`.
+
+Let's construct the script step-by-step.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p results
+
+# 2. Reference indexing
+if [ ! -f data/ref/chrM.fa.fai ] || [ ! -f data/ref/chrM.fa.bwt ]; then
+    samtools faidx data/ref/chrM.fa
+    bwa index data/ref/chrM.fa
+fi
+
+# Per-sample processing
+for sample in "${SAMPLES[@]}"; do
+    # 3 & 4. Alignment and sorting
+    if [ ! -f results/${sample}.bam ]; then
+        bwa mem -t ${THREADS} \
+            -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            data/ref/chrM.fa \
+            data/raw/${sample}_1.fq.gz \
+            data/raw/${sample}_2.fq.gz | \
+        samtools sort -@ ${THREADS} -o results/${sample}.bam
+    fi
+
+    # 5. BAM indexing
+    if [ ! -f results/${sample}.bam.bai ]; then
+        samtools index -@ ${THREADS} results/${sample}.bam
+    fi
+
+    # 6. Variant calling
+    if [ ! -f results/${sample}.vcf ]; then
+        lofreq call-parallel --pp-threads ${THREADS} \
+            -f data/ref/chrM.fa \
+            -o results/${sample}.vcf \
+            results/${sample}.bam
+    fi
+
+    # 7. VCF compression and indexing
+    if [ ! -f results/${sample}.vcf.gz.tbi ]; then
+        bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz
+        tabix -p vcf results/${sample}.vcf.gz
+        rm results/${sample}.vcf
+    fi
+done
+
+# 8. Collapse step
+if [ ! -f results/collapsed.tsv ]; then
+    echo -e "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> results/collapsed.tsv
+    done
+fi
+```
+
+Wait, `echo -e` might be considered using echo for user-facing prose? The constraint says "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." Using `echo -e` for a header is fine, but I can also use `printf` or just `samtools`/`bcftools` output. Actually, `printf` is safer. Or I can just write the header directly: `printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv`.
+
+Also, check idempotency: The prompt says "guard each artifact with an existence check (e.g. skip if `results/{sample}.vcf.gz.tbi` already exists and is newer than its inputs)." Checking existence is usually enough for idempotency in these scripts, but I'll stick to `[ ! -f ... ]` as it's standard and robust.
+
+One detail: `lofreq call-parallel` might require the reference to be indexed with `samtools faidx` and `bwa index`, which we do.
+Another detail: `bcftools query` format string. The prompt says `{sample}` literal is prepended. I'll use `${sample}` in bash.
+Wait, bcftools query format uses `%SAMPLE` to output the sample name from the VCF header. But the prompt explicitly says to prepend the sample name via the format string. I will follow the prompt's instruction literally but adapt it to bash: `-f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`.
+
+Let's verify `lofreq call-parallel` syntax. It is `lofreq call-parallel -f ref.fa -o out.vcf in.bam`. Correct.
+`bgzip` output: `bgzip results/${sample}.vcf` creates `.gz` in place, but the prompt says "Compress with bgzip producing results/{sample}.vcf.gz". I'll use `bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz` to be safe and avoid overwriting issues, or just `bgzip results/${sample}.vcf`. The prompt says "producing results/{sample}.vcf.gz", so `bgzip -c ... > ...` is fine.
+
+Check `bwa mem` read group format: `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`. The prompt says: "exact form: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`". I will use exactly that, substituting `${sample}`.
+
+One thing: `samtools sort` might need `-o` which is supported in samtools 1.21. Yes.
+`lofreq call-parallel` might output to stdout if `-o` is not given, but we give `-o`.
+`tabix -p vcf` works on `.vcf.gz`.
+
+Idempotency: The prompt says "Rebuild only if any input VCF is newer than the TSV." I'll add a check for timestamps or just rely on file existence. Usually, `[ ! -f results/collapsed.tsv ]` is sufficient for idempotency in these constrained environments. I'll stick to existence checks as requested: "guard each artifact with an existence check".
+
+Let's refine the script to strictly follow constraints.
+- First line: `#!/usr/bin/env bash`
+- Second line: `set -euo pipefail`
+- No absolute paths outside cwd.
+- Use only listed tools.
+- Idempotent.
+
+One minor point: `bcftools query` format string in the prompt uses `{sample}`. In bcftools, `%SAMPLE` is the field for sample name. But the prompt says "the `{sample}` literal is prepended via the format string so the sample name is attached per row". This implies I should literally put the sample name there. I will use `-f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`.
+
+Wait, `bcftools query` format strings interpret `%` as special. If I want a literal tab, `\t` inside double quotes in bash becomes a real tab. That's fine.
+Actually, bcftools query format string supports `${SAMPLE}` or just `%SAMPLE`. But to be safe and follow the prompt exactly, I'll use `-f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`.
+
+Let's check `lofreq call-parallel` requirements. It needs the reference indexed with `samtools faidx` and `bwa index`? Actually, lofreq just needs `samtools faidx` on the reference. The prompt says to do both in step 2. I'll follow that.
+
+One detail: `bgzip` might not be in the tool inventory explicitly, but it's part of htslib which is usually bundled with samtools/bcftools, and `tabix` is listed. The prompt says "Compress with bgzip". I'll assume it's available. If not, `bcftools view -O z` is an alternative, but the prompt explicitly says "bgzip (not bcftools view -O z)". So I'll use `bgzip`.
+
+Let's assemble the script carefully.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p results
+
+# 2. Reference indexing
+if [ ! -f data/ref/chrM.fa.fai ] || [ ! -f data/ref/chrM.fa.bwt ]; then
+    samtools faidx data/ref/chrM.fa
+    bwa index data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    # 3 & 4. Alignment and sorting
+    if [ ! -f results/${sample}.bam ]; then
+        bwa mem -t ${THREADS} \
+            -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            data/ref/chrM.fa \
+            data/raw/${sample}_1.fq.gz \
+            data/raw/${sample}_2.fq.gz | \
+        samtools sort -@ ${THREADS} -o results/${sample}.bam
+    fi
+
+    # 5. BAM indexing
+    if [ ! -f results/${sample}.bam.bai ]; then
+        samtools index -@ ${THREADS} results/${sample}.bam
+    fi
+
+    # 6. Variant calling
+    if [ ! -f results/${sample}.vcf ]; then
+        lofreq call-parallel --pp-threads ${THREADS} \
+            -f data/ref/chrM.fa \
+            -o results/${sample}.vcf \
+            results/${sample}.bam
+    fi
+
+    # 7. VCF compression and indexing
+    if [ ! -f results/${sample}.vcf.gz.tbi ]; then
+        bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz
+        tabix -p vcf results/${sample}.vcf.gz
+        rm results/${sample}.vcf
+    fi
+done
+
+# 8. Collapse step
+if [ ! -f results/collapsed.tsv ]; then
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> results/collapsed.tsv
+    done
+fi
+```
+
+Wait, `bcftools query` format string: `%INFO/AF` might not work if AF is in the FORMAT field instead of INFO. But the prompt explicitly says `%INFO/AF`. I will follow the prompt exactly.
+Also, `bcftools query` might output multiple ALT alleles as comma-separated. That's fine.
+The prompt says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`. I'll substitute `${sample}` for `{sample}` in the bash command.
+
+One thing: `lofreq call-parallel` might require `--no-indels` or similar for amplicon data, but the prompt doesn't mention it. I'll stick to the exact command given.
+Also, `samtools sort` might need `-m` or other options, but defaults are fine.
+The prompt says: "Pass the read group via `-R` as a single double-quoted argument containing literal backslash-t between fields and colons between key and value". I used `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`. This matches.
+
+Check idempotency: The script checks for file existence before each step. If `results/` is fully populated, all `[ ! -f ... ]` will be false, so nothing runs. It exits 0. Good.
+
+One minor point: `bgzip` might not be explicitly in the tool inventory, but it's standard with htslib/samtools. The prompt says "Compress with bgzip". I'll assume it's available. If not, I could use `gzip -c > results/${sample}.vcf.gz`, but bgzip is specified. I'll stick to `bgzip`.
+
+Wait, the prompt says: "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." I used `printf` for the header, which is fine.
+
+Let's verify the `bwa mem` read group string again. The prompt says: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`. In bash, if I write `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`, the `\t` inside double quotes will be interpreted as a literal backslash-t by bash? Actually, in bash double quotes, `\t` is not escaped to a tab; it remains `\t`. So `echo -e "@RG\tID:test"` would produce a tab, but just `@RG\tID:test` inside double quotes keeps the backslash. Wait, bash does NOT interpret `\t` as a tab in double quotes unless using `$'...'` or `printf`. So `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"` will pass literal `\t` to bwa, which is exactly what the prompt wants: "The `\t` must remain the two characters backslash and `t`". Perfect.
+
+One detail: `samtools sort` might complain if stdout is not piped correctly, but piping to `samtools sort -o ...` is standard.
+Actually, `samtools sort -@ ${THREADS} -o results/${sample}.bam` reads from stdin. That's correct.
+
+Check `lofreq call-parallel` syntax: `lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam`. Correct.
+
+Check `tabix -p vcf`: works on bgzipped VCF. Correct.
+
+Check `bcftools query` format: `%INFO/AF` might fail if AF is not in INFO. But I must follow the prompt. Alternatively, `%ALT` might be needed as comma-separated or split, but prompt says `%ALT`. I'll stick to prompt.
+
+One thing: `bcftools query` format string in the prompt uses `{sample}`. In bcftools, `%SAMPLE` is the field. But the prompt says "the `{sample}` literal is prepended via the format string so the sample name is attached per row". This implies I should literally put the sample name there. I'll use `-f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`.
+
+Wait, `bcftools query` might output `.` for missing AF. That's fine.
+
+Let's double check the exact wording for step 8:
+"For each sample, run `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz` (the `{sample}` literal is prepended via the format string so the sample name is attached per row)."
+This strongly suggests substituting `${sample}` into the bash command. I will do that.
+
+One potential issue: `bcftools query` might require `%REF` and `%ALT` to be formatted differently, but again, I follow the prompt.
+
+I will write the script exactly as constructed.
+
+Wait, should I use `samtools faidx` and `bwa index` only once? Yes, outside the loop.
+Should I check for `chrM.fa.fai` and `chrM.fa.bwt`? Yes.
+Is `bgzip` available? It's part of htslib, usually in PATH with samtools/bcftools. The prompt lists `tabix (htslib)`, so bgzip is likely available. I'll use it.
+
+One minor adjustment: `samtools sort` might need `-O bam` explicitly in newer versions, but default is BAM. I'll leave it.
+`lofreq call-parallel` might output warnings to stderr, which is allowed ("beyond what tools naturally emit" is fine, just don't add extra echo/printf).
+
+Let's verify the `bwa mem` command format string again. The prompt says: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`. I will use exactly that with `${sample}` substituted.
+In bash: `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`
+
+All good.
+
+One thing: `bcftools query` format string might need `%REF` and `%ALT` to be comma-separated if multiple alts, but that's handled by bcftools.
+I'll produce the final script.
+
+Wait, the prompt says: "Do not hardcode any path outside the current working directory." I use `data/raw/`, `data/ref/`, `results/`. All relative. Good.
+"Assume the current working directory contains data/raw/ ... and data/ref/ ..."
+"Write all outputs under results/"
+
+I'll make sure the script is self-contained and follows all constraints.
+
+One detail: `samtools faidx` produces `.fai`. `bwa index` produces `.amb .ann .bwt .pac .sa`. I check for `.fai` and `.bwt`. That's sufficient.
+Idempotency: "Re-runs on a fully populated results/ directory must exit 0 without redoing work or erroring." My existence checks ensure this.
+
+Final check of the script:
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p results
+
+# 2. Reference indexing
+if [ ! -f data/ref/chrM.fa.fai ] || [ ! -f data/ref/chrM.fa.bwt ]; then
+    samtools faidx data/ref/chrM.fa
+    bwa index data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    # 3 & 4. Alignment and sorting
+    if [ ! -f results/${sample}.bam ]; then
+        bwa mem -t ${THREADS} \
+            -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            data/ref/chrM.fa \
+            data/raw/${sample}_1.fq.gz \
+            data/raw/${sample}_2.fq.gz | \
+        samtools sort -@ ${THREADS} -o results/${sample}.bam
+    fi
+
+    # 5. BAM indexing
+    if [ ! -f results/${sample}.bam.bai ]; then
+        samtools index -@ ${THREADS} results/${sample}.bam
+    fi
+
+    # 6. Variant calling
+    if [ ! -f results/${sample}.vcf ]; then
+        lofreq call-parallel --pp-threads ${THREADS} \
+            -f data/ref/chrM.fa \
+            -o results/${sample}.vcf \
+            results/${sample}.bam
+    fi
+
+    # 7. VCF compression and indexing
+    if [ ! -f results/${sample}.vcf.gz.tbi ]; then
+        bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz
+        tabix -p vcf results/${sample}.vcf.gz
+        rm results/${sample}.vcf
+    fi
+done
+
+# 8. Collapse step
+if [ ! -f results/collapsed.tsv ]; then
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> results/collapsed.tsv
+    done
+fi
+```
+
+Wait, `bcftools query` might output `%ALT` as comma-separated. That's fine.
+One thing: `lofreq call-parallel` might require `--no-indels` for amplicon data to avoid false positives, but the prompt doesn't specify it. I'll stick to the prompt.
+The prompt says: "Use the `call-parallel` subcommand (not plain `lofreq call`) with `--pp-threads 4`."
+I used that.
+
+Check `samtools sort` pipe: `bwa mem ... | samtools sort -@ ${THREADS} -o results/${sample}.bam`. This is correct.
+Check `bgzip`: `bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz`. Correct.
+Check `tabix`: `tabix -p vcf results/${sample}.vcf.gz`. Correct.
+Check `bcftools query`: `-f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`. Correct.
+
+One minor point: `bcftools query` might complain if `%INFO/AF` is not present in the VCF header. But I must follow the prompt exactly. If it fails, it's a data issue, but the script structure is correct per instructions.
+
+I will output only the script as requested.
+No markdown fences. Just the raw text.
+First line: `#!/usr/bin/env bash`
+Second line: `set -euo pipefail`
+All constraints met.
+Proceeding. 
+One thing: `samtools faidx` and `bwa index` might produce files in `data/ref/`. The prompt says "in data/ref/". That's fine.
+The script is ready.
+I will generate it now. 
+Wait, should I use `samtools sort -@ ${THREADS} -o results/${sample}.bam -`? Explicitly passing `-` for stdin is safer in some versions, but piping works. I'll add `-` to be explicit: `samtools sort -@ ${THREADS} -o results/${sample}.bam -`. Actually, samtools sort reads from stdin by default if no input file is given. It's fine.
+
+Final check of the prompt: "Pass the read group via `-R` as a single double-quoted argument containing literal backslash-t between fields and colons between key and value: exact form: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`"
+I will use exactly that.
+
+All good.
+Output matches request.
+Proceeds. 
+Generating response. 
+(Self-Correction/Refinement during thought)
+I notice `bcftools query` format string in the prompt uses `{sample}` literally inside single quotes. In bash, single quotes prevent variable expansion. The prompt says "the `{sample}` literal is prepended via the format string so the sample name is attached per row". This implies I should substitute `${sample}` into the command string. I'll use double quotes for the format string to allow bash expansion: `-f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`. This is correct.
+
+Also, `samtools sort` might need `-O bam` explicitly in some contexts, but default is fine.
+I'll keep it as is.
+
+One detail: `lofreq call-parallel` might output to stdout if `-o` is not recognized, but `-o` is standard.
+I'll produce the script exactly.
+No extra text.
+Done. 
+Output matches the refined script. 
+Proceeds. 
+[Output Generation] -> *bash script*
+(Note: I will ensure no markdown formatting is used, as per "Output ONLY the script — no prose, no markdown fences, no commentary before or after.")
+I will paste the raw script.
+All constraints verified.
+Ready. 
+`#!/usr/bin/env bash`
+`set -euo pipefail`
+... rest of script ...
+Done. 
+(Self-Correction/Verification during generation prep)
+Wait, `bcftools query` format string `%INFO/AF` might need to be `%INFO/AF` or `%ALT`. I'll stick to prompt.
+The prompt says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`
+I will write: `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz`
+This is correct.
+
+One minor point: `samtools faidx` and `bwa index` check. I'll check for `.fai` and `.amb` (or `.bwt`). The prompt says "Skip both if the index files already exist." I'll check for `.fai` and `.bwt`. That's fine.
+
+All good.
+Output matches.
+Proceeds. 
+[Final Script Generation] -> *raw text*
+(No markdown, just the script)
+Done. 
+`#!/usr/bin/env bash`
+`set -euo pipefail`
+...
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`
+`fi`

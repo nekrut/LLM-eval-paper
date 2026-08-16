@@ -1,0 +1,148 @@
+We need to produce a self-contained bash script that follows constraints.
+
+Constraints:
+
+- First line: #!/usr/bin/env bash
+- Second line: set -euo pipefail
+- Assume cwd contains data/raw/ and data/ref/. The reference chrM.fa is decompressed. We need to index it with bwa index and samtools faidx if not already present.
+- Write outputs under results/
+- Idempotent: rerunning on a populated results/ directory must exit 0 without redoing work or erroring. So we should check for existence of each output file before creating. For reference indexing, we can skip if .bwt etc exist? bwa index creates many files; we can test for presence of chrM.fa.bwt maybe. But easier: use `if [ ! -f data/ref/chrM.fa.bwt ]; then bwa index ... fi`. Similarly samtools faidx creates .fai file.
+
+- For each sample, check if results/{sample}.bam exists and is non-empty? We can skip alignment if bam already present. Also skip indexing if bai exists. Skip variant calling if vcf.gz exists. But we need to ensure that if some steps missing but later ones exist, we might still need earlier ones. But idempotent: if all outputs exist, exit 0. If some missing, run necessary steps.
+
+- Use only tools listed: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. We need bgzip? Not in list. But we can use `bgzip` from htslib; but not listed. However tabix is there, and bcftools includes bgzip? Actually bcftools has a command `bcftools view -O z`. But easier: use `bgzip` if available? It's part of htslib; but not in inventory list. We can use `samtools view -b` etc. For compression we could use `gzip -c`, but need .gz format for tabix indexing. Tabix expects bgzipped VCF. We can use `bgzip` from samtools? Actually samtools has a command `samtools view -O z`. But that's for BAM. For VCF, bcftools can compress: `bcftools view -Oz -o results/{sample}.vcf.gz results/{sample}.vcf`. That uses bcftools to compress and output gzipped. Then tabix index.
+
+- Use threads=4.
+
+- Avoid writing to stdout/stderr beyond tool outputs; no echo for user-facing prose. But we may need to print header for collapsed.tsv, but that's a file write. We can use `printf` to file.
+
+- The script should exit 0 if all outputs exist. So at start, check if results/collapsed.tsv exists and all sample files exist? But maybe some missing; then run pipeline.
+
+Simplify: For each step, we will test existence of output before running. That ensures idempotent.
+
+Also need to create results/ directory.
+
+We also need to ensure that collapsed.tsv is created only once after all samples processed. We can generate header and then append per sample.
+
+Implementation plan:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Reference indexing
+if [ ! -f data/ref/chrM.fa.bwt ]; then
+    bwa index data/ref/chrM.fa
+fi
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+# Process each sample
+for sample in "${SAMPLES[@]}"; do
+    bam=results/${sample}.bam
+    bai=results/${sample}.bam.bai
+    vcf=results/${sample}.vcf.gz
+    # Alignment and sort
+    if [ ! -s "$bam" ]; then
+        bwa mem -t $THREADS -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ $THREADS -o "$bam" -
+    fi
+    # BAM index
+    if [ ! -s "$bai" ]; then
+        samtools index -@ $THREADS "$bam"
+    fi
+    # Variant calling
+    vcf_raw=results/${sample}.vcf
+    if [ ! -s "$vcf" ]; then
+        lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -o "$vcf_raw" "$bam"
+        bcftools view -Oz -o "$vcf" "$vcf_raw"
+        tabix -p vcf "$vcf"
+        rm -f "$vcf_raw"
+    fi
+done
+
+# Collapsed TSV
+collapsed=results/collapsed.tsv
+if [ ! -s "$collapsed" ]; then
+    printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed"
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    vcf=results/${sample}.vcf.gz
+    if [ -s "$vcf" ]; then
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$vcf" | awk -v s="$sample" 'BEGIN{OFS="\t"}{print s,$0}' >> "$collapsed"
+    fi
+done
+
+exit 0
+```
+
+But we need to ensure that collapsed.tsv is not appended multiple times if script reruns. We check existence; but if file exists, we skip header and appending? But we still want to append per sample each run? If file already exists from previous run, we should exit without redoing work. So at start after processing samples, we can check if collapsed.tsv exists; if yes, exit 0. That ensures idempotent.
+
+But what if some outputs missing but collapsed.tsv exists? Then script would exit prematurely and not produce missing outputs. But requirement: "rerunning on a populated results/ directory must exit 0 without redoing work or erroring." So only when all outputs exist should we exit early. If any missing, run pipeline. So we need to check that all expected files exist before deciding to skip.
+
+List of expected outputs:
+
+- For each sample:
+    - results/{sample}.bam
+    - results/{sample}.bam.bai
+    - results/{sample}.vcf.gz
+    - results/{sample}.vcf.gz.tbi
+
+- results/collapsed.tsv
+
+So we can check all these. If any missing, run pipeline.
+
+Simplify: At start, set a flag `needs_run=0`. For each expected file, if not exists or empty, set needs_run=1. After that, if needs_run==0, exit 0. Else proceed with pipeline.
+
+But we also need to ensure that collapsed.tsv is created after all samples processed; but if some sample missing, we still run pipeline for those missing ones.
+
+Thus algorithm:
+
+```
+needs_run=0
+for sample in "${SAMPLES[@]}"; do
+    for ext in bam bam.bai vcf.gz vcf.gz.tbi; do
+        file=results/${sample}.${ext}
+        if [ ! -s "$file" ]; then
+            needs_run=1
+        fi
+    done
+done
+if [ -s results/collapsed.tsv ]; then
+    # maybe check header? but assume ok
+else
+    needs_run=1
+fi
+
+if [ $needs_run -eq 0 ]; then
+    exit 0
+fi
+```
+
+But we also need to ensure that if collapsed.tsv exists but some sample outputs missing, we still run pipeline. So the above logic works.
+
+Now implement pipeline as earlier.
+
+Edge: bcftools query may produce multiple lines per variant; that's fine.
+
+Also note that lofreq call-parallel will output .vcf file (uncompressed). We compress with bcftools view -Oz.
+
+We need to remove raw vcf after compression. But if script reruns, we might skip because compressed exists.
+
+Now ensure no echo statements except tool outputs. The script uses printf for header but that's writing to file; not printing to stdout. That's fine.
+
+Also avoid using `echo` for user-facing prose.
+
+Make sure to use `-s` test for non-empty file.
+
+Check that the reference indexing step only runs if index missing.
+
+Now produce final script accordingly.
+
+Let's write final script.

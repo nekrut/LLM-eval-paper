@@ -1,0 +1,442 @@
+The user wants a single bash script that performs a specific bioinformatics workflow: variant calling on mitochondrial DNA amplicon data.
+Let's break down the requirements:
+
+1.  **Shebang and strict mode**: `#!/usr/bin/env bash` and `set -euo pipefail`.
+2.  **Directories**: Assume `data/raw/`, `data/ref/`, write to `results/`.
+3.  **Idempotency**: Skip steps if outputs exist and are newer than inputs, or just check existence of key artifacts. The prompt says "Re-runs on a fully populated results/ directory must exit 0 without redoing work". I'll use file existence checks for the final artifacts to guard each step.
+4.  **Reference indexing**: `samtools faidx` and `bwa index` on `data/ref/chrM.fa`. Skip if indices exist.
+5.  **Alignment**: `bwa mem -t 4` with specific read group string format. Pipe to `samtools sort`.
+6.  **BAM indexing**: `samtools index`.
+7.  **Variant calling**: `lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam`.
+8.  **VCF compression/indexing**: `bgzip` and `tabix`. Remove intermediate `.vcf`.
+9.  **Collapse**: `bcftools query` for each sample, concatenate, add header to `results/collapsed.tsv`.
+10. **Constraints**: No absolute paths outside cwd. Use only listed tools. Under 600s at THREADS=4. No echo/prose.
+
+Let's draft the script step-by-step.
+
+**Globals & Setup**:
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+mkdir -p results
+```
+
+**Reference Indexing**:
+Check if `data/ref/chrM.fa.fai` and `data/ref/chrM.fa.amb` exist. If not, index.
+```bash
+if [[ ! -f data/ref/chrM.fa.fai || ! -f data/ref/chrM.fa.amb ]]; then
+    samtools faidx data/ref/chrM.fa
+    bwa index data/ref/chrM.fa
+fi
+```
+
+**Per-sample loop**:
+I'll iterate over samples. For each, I need to check if the final output `results/{sample}.vcf.gz.tbi` exists. If it does, skip. Otherwise, do the steps.
+
+Wait, the prompt says "Re-runs on a fully populated results/ directory must exit 0 without redoing work". Checking for `.vcf.gz.tbi` is sufficient to guard the whole pipeline per sample.
+
+Let's construct the loop:
+```bash
+for sample in "${SAMPLES[@]}"; do
+    if [[ -f "results/${sample}.vcf.gz.tbi" ]]; then
+        continue
+    fi
+
+    # Alignment
+    bwa mem -t ${THREADS} \
+        -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+        data/ref/chrM.fa \
+        "data/raw/${sample}_1.fq.gz" \
+        "data/raw/${sample}_2.fq.gz" | \
+        samtools sort -@ ${THREADS} -o "results/${sample}.bam" -
+
+    # BAM index
+    samtools index -@ ${THREADS} "results/${sample}.bam"
+
+    # Variant calling
+    lofreq call-parallel --pp-threads ${THREADS} \
+        -f data/ref/chrM.fa \
+        -o "results/${sample}.vcf" \
+        "results/${sample}.bam"
+
+    # VCF compress & index
+    bgzip -c "results/${sample}.vcf" > "results/${sample}.vcf.gz"
+    tabix -p vcf "results/${sample}.vcf.gz"
+    rm "results/${sample}.vcf"
+done
+```
+
+**Collapse step**:
+Check if `results/collapsed.tsv` exists. If not, generate it.
+The format string for `bcftools query` needs to prepend the sample name. The prompt says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`. Wait, `{sample}` in bcftools format string is a placeholder for the sample name from the VCF header. But here we want to prepend the literal sample ID. `bcftools query` allows `%SAMPLE` or just hardcoding it? The prompt says: `(the {sample} literal is prepended via the format string so the sample name is attached per row)`. Actually, bcftools format strings use `%SAMPLE` for the column name, but to prepend a literal string, we can just put it in quotes. Or maybe `bcftools query -f '${sample}\t...'`? No, `${sample}` is bash variable expansion. The prompt says: `bcftools query -f '{sample}\t%CHROM\t...`. I will use bash variable expansion for the sample name inside the format string passed to bcftools.
+Wait, bcftools format strings don't interpret `{sample}` literally unless it's a placeholder. But the prompt explicitly gives the command: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`. I will assume they mean bash interpolation: `-f "${sample}\t%CHROM..."`.
+Actually, bcftools allows `%SAMPLE` to print the sample name. But the prompt says "the {sample} literal is prepended via the format string". I'll just use bash variable expansion: `-f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`.
+Wait, `bcftools query` format strings use `%` for fields. If I want to prepend a literal sample name, I can just do `echo -e "${sample}\t..."` but the prompt says "Do not use echo for user-facing prose", but here it's data generation. Actually, `bcftools query` can take multiple files and print them together, but we need per-sample prepending.
+Let's stick to bash interpolation: `-f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`.
+Wait, the prompt says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`. I will interpret `{sample}` as a bash variable `${sample}`.
+
+Let's construct the collapse step carefully:
+```bash
+if [[ ! -f results/collapsed.tsv ]]; then
+    {
+        echo -e "sample\tchrom\tpos\tref\talt\taf"
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"
+        done
+    } > results/collapsed.tsv
+fi
+```
+Wait, `echo -e` might be considered prose? The prompt says "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." Data generation is fine. But to be safe, I can use `printf`. Or just `bcftools query` with a dummy sample? No.
+Actually, `bcftools query` supports `%SAMPLE` but that prints the column header name. I'll stick to bash variable expansion inside the format string.
+Wait, `bcftools query` format strings interpret `\t` and `\n` literally unless passed via `-f`. Actually, bcftools does interpret `\t` and `\n` in the format string. So `-f "${sample}\t%CHROM..."` works.
+
+Let's verify idempotency for collapsed.tsv. If it exists, skip.
+One detail: `bcftools query` might output nothing if no variants are found. That's fine.
+The prompt says: `(the {sample} literal is prepended via the format string so the sample name is attached per row)`. I will use `${sample}` in bash.
+
+Wait, `bcftools query` format strings: `%INFO/AF` might be empty or missing for some sites. That's standard.
+I'll write the collapse step exactly as requested, using bash variable expansion for `{sample}`.
+
+Let's assemble the script.
+
+Check constraints:
+- First line: `#!/usr/bin/env bash`
+- Second line: `set -euo pipefail`
+- Assume data/raw/ and data/ref/ exist.
+- Write to results/
+- Idempotent
+- No absolute paths outside cwd
+- Only listed tools
+- Under 600s at THREADS=4 (MiSeq chrM is tiny, will be fast)
+- No echo for prose
+
+One thing: `bwa mem` read group string. The prompt says: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`. It explicitly says `\t` must remain two characters backslash and t. So I should NOT use bash variable expansion for the whole string if it contains `\t`, because bash might interpret it? Actually, in double quotes, `\t` is literal unless using `echo -e` or `$'...'`. In `bwa mem -R "@RG\tID:${sample}\tSM:${sample}..."`, bash will pass `\t` literally to bwa. That's correct.
+Wait, the prompt says: "The \t must remain the two characters backslash and t — bwa parses them itself. Do NOT use printf, echo -e, $'\t', or any mechanism that turns them into real tabs". So double-quoting `@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA` is correct.
+
+Let's verify the exact command for bwa:
+`bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz"`
+
+For lofreq:
+`lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o "results/${sample}.vcf" "results/${sample}.bam"`
+
+For bcftools query:
+`bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"`
+
+Wait, `bcftools query` format strings interpret `\t` and `\n`. So `${sample}\t%CHROM...` will work.
+But to be strictly compliant with the prompt's example: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`, I will use bash variable expansion for `{sample}` inside double quotes.
+
+One minor point: `bcftools query` might complain if `%INFO/AF` is missing. It's fine, it outputs empty or `.`.
+I'll add `|| true` to bcftools query just in case it returns non-zero on no variants, but usually it's 0. I'll keep it simple.
+
+Let's draft the full script carefully.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p results
+
+# Reference indexing (once)
+if [[ ! -f data/ref/chrM.fa.fai || ! -f data/ref/chrM.fa.amb ]]; then
+    samtools faidx data/ref/chrM.fa
+    bwa index data/ref/chrM.fa
+fi
+
+# Per-sample processing
+for sample in "${SAMPLES[@]}"; do
+    if [[ -f "results/${sample}.vcf.gz.tbi" ]]; then
+        continue
+    fi
+
+    # Alignment & sorting
+    bwa mem -t ${THREADS} \
+        -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+        data/ref/chrM.fa \
+        "data/raw/${sample}_1.fq.gz" \
+        "data/raw/${sample}_2.fq.gz" | \
+        samtools sort -@ ${THREADS} -o "results/${sample}.bam" -
+
+    # BAM indexing
+    samtools index -@ ${THREADS} "results/${sample}.bam"
+
+    # Variant calling
+    lofreq call-parallel --pp-threads ${THREADS} \
+        -f data/ref/chrM.fa \
+        -o "results/${sample}.vcf" \
+        "results/${sample}.bam"
+
+    # VCF compression & indexing
+    bgzip -c "results/${sample}.vcf" > "results/${sample}.vcf.gz"
+    tabix -p vcf "results/${sample}.vcf.gz"
+    rm "results/${sample}.vcf"
+done
+
+# Collapse step
+if [[ ! -f results/collapsed.tsv ]]; then
+    {
+        printf "sample\tchrom\tpos\tref\talt\taf\n"
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz" || true
+        done
+    } > results/collapsed.tsv
+fi
+```
+
+Wait, `bcftools query` format string: `%INFO/AF` might not exist in all VCFs if AF is not calculated or stored there. But lofreq usually puts it in INFO/AF or FORMAT/AF. The prompt says `%INFO/AF`. I'll stick to the prompt.
+Also, `bcftools query` might output nothing for a sample with no variants. That's fine.
+The prompt says: `(the {sample} literal is prepended via the format string so the sample name is attached per row)`. I used `${sample}` which is correct bash interpolation.
+
+One detail: `samtools sort -o results/${sample}.bam -` might create a `.bam.bai`? No, indexing is separate.
+Wait, `samtools sort` output is BAM. `samtools index` creates BAI.
+The prompt says: `results/{sample}.bam.bai` should exist. `samtools index` does that.
+
+Check idempotency: The script checks for `results/${sample}.vcf.gz.tbi` and `results/collapsed.tsv`. If they exist, it skips. This satisfies "Re-runs on a fully populated results/ directory must exit 0 without redoing work".
+
+One thing: `bwa index` produces `.amb .ann .bwt .pac .sa`. The check `! -f data/ref/chrM.fa.amb` is sufficient.
+What about `samtools faidx` producing `.fai`? Checked.
+
+Is there any risk with `set -euo pipefail` and the pipeline `bwa mem ... | samtools sort ...`? If bwa fails, pipefail catches it. Good.
+What about `bcftools query` returning non-zero if no variants? I added `|| true`. That's safe.
+Actually, `bcftools query` returns 0 even if no records match. But sometimes it returns 1 if file is empty or corrupted. I'll keep `|| true` to be safe, or just remove it since the prompt implies standard workflow. I'll keep it simple without `|| true` unless necessary, but `set -e` might trip on empty output? No, bcftools query exits 0 on success. I'll remove `|| true` to avoid masking errors, but it's fine either way. I'll stick to no `|| true`.
+
+Wait, the prompt says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`. I will use exactly that structure with bash variable expansion.
+`bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"`
+
+One minor point: `printf "sample\tchrom\tpos\tref\talt\taf\n"` is fine.
+The prompt says "Do not use echo for user-facing prose". `printf` for data is fine.
+
+Let's verify the read group string again.
+`-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`
+In bash double quotes, `\t` is literal backslash-t. bwa will parse it. This matches the requirement exactly.
+
+Check paths: `data/ref/chrM.fa`, `data/raw/${sample}_1.fq.gz`, etc. All relative.
+Check tools: bwa, samtools, lofreq, bgzip, tabix, bcftools. All in inventory.
+Check threads: THREADS=4 used consistently.
+Check idempotency: guarded by existence of final artifacts.
+Check output columns: sample chrom pos ref alt af. Matches.
+
+One detail: `lofreq call-parallel` might require `--min-cov` or similar, but prompt gives exact command. I'll follow exactly.
+`lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam`
+
+Wait, `bgzip` is part of htslib, usually available as `bgzip`. The prompt lists `tabix (htslib)`, but not explicitly `bgzip`. However, `bcftools` and `samtools` often bundle it, or it's standard. I'll use `bgzip` as requested in step 7: "Compress with bgzip". If `bgzip` is not on PATH, I could use `bcftools view -O z`, but the prompt explicitly says "Compress with bgzip (not bcftools view -O z)". I'll assume `bgzip` is available or part of htslib tools. Actually, `tabix` and `bgzip` are usually in the same package. I'll use `bgzip`.
+
+Wait, the prompt says: "Compress with bgzip (not bcftools view -O z) producing results/{sample}.vcf.gz."
+I will use `bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz`.
+
+Let's double check the `bcftools query` format string. The prompt says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`.
+In bash, I will write: `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"`
+
+One thing: `bcftools query` might output `%INFO/AF` as `.` or empty. That's fine.
+The prompt says: `(the {sample} literal is prepended via the format string so the sample name is attached per row)`. This implies using `${sample}` in the format string.
+
+All looks solid.
+
+Let's assemble carefully.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p results
+
+# Reference indexing (once)
+if [[ ! -f data/ref/chrM.fa.fai || ! -f data/ref/chrM.fa.amb ]]; then
+    samtools faidx data/ref/chrM.fa
+    bwa index data/ref/chrM.fa
+fi
+
+# Per-sample processing
+for sample in "${SAMPLES[@]}"; do
+    if [[ -f "results/${sample}.vcf.gz.tbi" ]]; then
+        continue
+    fi
+
+    # Alignment & sorting
+    bwa mem -t ${THREADS} \
+        -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+        data/ref/chrM.fa \
+        "data/raw/${sample}_1.fq.gz" \
+        "data/raw/${sample}_2.fq.gz" | \
+        samtools sort -@ ${THREADS} -o "results/${sample}.bam" -
+
+    # BAM indexing
+    samtools index -@ ${THREADS} "results/${sample}.bam"
+
+    # Variant calling
+    lofreq call-parallel --pp-threads ${THREADS} \
+        -f data/ref/chrM.fa \
+        -o "results/${sample}.vcf" \
+        "results/${sample}.bam"
+
+    # VCF compression & indexing
+    bgzip -c "results/${sample}.vcf" > "results/${sample}.vcf.gz"
+    tabix -p vcf "results/${sample}.vcf.gz"
+    rm "results/${sample}.vcf"
+done
+
+# Collapse step
+if [[ ! -f results/collapsed.tsv ]]; then
+    {
+        printf "sample\tchrom\tpos\tref\talt\taf\n"
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"
+        done
+    } > results/collapsed.tsv
+fi
+```
+
+Wait, `bcftools query` format string interpretation: `%INFO/AF` might not be present in lofreq VCFs. LoFreq typically puts AF in the INFO field as `AF`. So `%INFO/AF` is correct per prompt.
+One detail: `bcftools query` might fail if `%INFO/AF` is missing for all records? It usually just outputs empty or `.`. I'll leave it.
+
+Check `samtools sort` command: `samtools sort -@ ${THREADS} -o "results/${sample}.bam" -`
+This reads from stdin and writes to file. Correct.
+
+Check `bwa mem` read group: `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`
+The prompt says: exact form: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`. I used `${sample}` for bash expansion. That's correct.
+
+Check `lofreq call-parallel` command: matches prompt exactly.
+
+Check `bgzip` and `tabix`: matches prompt.
+
+Check `collapsed.tsv` generation: matches prompt.
+
+One minor point: `set -euo pipefail` might cause the script to exit if `bcftools query` returns non-zero for an empty VCF. I'll add `|| true` to be safe, or just rely on standard behavior. I'll keep it without `|| true` as per strict workflow, but it's fine. Actually, `bcftools query` returns 0 even if no records match. I'll leave it.
+
+Wait, the prompt says: "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose."
+I used `printf` for the header. That's fine.
+
+Is there any issue with `samtools sort -o results/${sample}.bam -` creating a BAM file that needs indexing? Yes, `samtools index` does that.
+The prompt says: `results/{sample}.bam.bai` should exist. `samtools index` creates it.
+
+One thing: `bwa mem` might output warnings to stderr. That's fine.
+The script looks complete and compliant.
+
+Let's verify the exact wording for read group: "Pass the read group via -R as a single double-quoted argument containing literal backslash-t between fields and colons between key and value: exact form: -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA""
+My code: `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`
+This matches.
+
+One detail: `samtools faidx` and `bwa index` check. I used `! -f data/ref/chrM.fa.fai || ! -f data/ref/chrM.fa.amb`. This is fine.
+
+Final check of the prompt: "Write all outputs under results/ (relative to cwd)." -> Done.
+"Be idempotent: rerunning on a populated results/ directory must exit 0 without redoing work or erroring." -> Checked via `if [[ -f ... ]]` guards.
+"Do not hardcode any path outside the current working directory." -> All paths are relative.
+"Use only tools listed in TOOL_INVENTORY." -> bwa, samtools, lofreq, bgzip (part of htslib/tabix suite, usually available), tabix, bcftools. All good.
+"Total wall-clock must be under 600 seconds at THREADS=4." -> chrM is 16kb, MiSeq reads are short, pipeline will be very fast.
+"Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." -> Used `printf` for data header, no prose.
+
+One minor adjustment: `bcftools query` might output `%INFO/AF` as `.` or empty string. The prompt says columns are `sample chrom pos ref alt af`. It's fine.
+I will ensure the script is exactly as requested.
+
+Wait, `bgzip` is not explicitly in the TOOL_INVENTORY list, but `tabix (htslib)` is. `bgzip` is typically installed with htslib. The prompt says "Compress with bgzip". I'll assume it's available. If not, I could use `bcftools view -O z`, but the prompt explicitly forbids it: "(not bcftools view -O z)". So `bgzip` must be used.
+
+I will produce the script now.
+One thing: `samtools sort` might create a temporary directory in cwd. That's fine.
+The script is ready.
+I'll format it carefully.
+No extra text.
+Proceeds. 
+Let's double check the `bcftools query` format string. The prompt says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`. I will use `${sample}` for bash interpolation.
+Actually, to be strictly compliant with the prompt's example which uses `{sample}` literally in the text but implies bash variable, I'll stick to `${sample}`.
+
+One detail: `samtools index` might require `-@ 4`? The prompt says `samtools index -@ 4 results/{sample}.bam`. I'll add it.
+`lofreq call-parallel --pp-threads 4 ...` matches prompt.
+All good.
+
+Final script generation. 
+I will make sure there are no markdown fences.
+Output only the script.
+Done. 
+Let's produce it. 
+Self-Correction/Verification during thought:
+- `bgzip` might not be on PATH if only `tabix` is listed, but they come from htslib. I'll use `bgzip` as instructed.
+- `bcftools query` format: `%INFO/AF` might be empty. That's fine.
+- The prompt says: `(the {sample} literal is prepended via the format string so the sample name is attached per row)`. This confirms `${sample}` in bash.
+- I'll add `|| true` to `bcftools query` just in case it fails on empty VCFs, but it's probably fine without. I'll leave it out to keep it clean, as `set -e` will catch real errors anyway. Actually, `bcftools query` returns 0 even with no records.
+- I'll ensure `samtools sort` uses `-o results/${sample}.bam -` correctly.
+- All constraints met.
+
+Proceeds. 
+Output matches request. 
+[Done] 
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p results
+
+# Reference indexing (once)
+if [[ ! -f data/ref/chrM.fa.fai || ! -f data/ref/chrM.fa.amb ]]; then
+    samtools faidx data/ref/chrM.fa
+    bwa index data/ref/chrM.fa
+fi
+
+# Per-sample processing
+for sample in "${SAMPLES[@]}"; do
+    if [[ -f "results/${sample}.vcf.gz.tbi" ]]; then
+        continue
+    fi
+
+    # Alignment & sorting
+    bwa mem -t ${THREADS} \
+        -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+        data/ref/chrM.fa \
+        "data/raw/${sample}_1.fq.gz" \
+        "data/raw/${sample}_2.fq.gz" | \
+        samtools sort -@ ${THREADS} -o "results/${sample}.bam" -
+
+    # BAM indexing
+    samtools index -@ ${THREADS} "results/${sample}.bam"
+
+    # Variant calling
+    lofreq call-parallel --pp-threads ${THREADS} \
+        -f data/ref/chrM.fa \
+        -o "results/${sample}.vcf" \
+        "results/${sample}.bam"
+
+    # VCF compression & indexing
+    bgzip -c "results/${sample}.vcf" > "results/${sample}.vcf.gz"
+    tabix -p vcf "results/${sample}.vcf.gz"
+    rm "results/${sample}.vcf"
+done
+
+# Collapse step
+if [[ ! -f results/collapsed.tsv ]]; then
+    {
+        printf "sample\tchrom\tpos\tref\talt\taf\n"
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"
+        done
+    } > results/collapsed.tsv
+fi
+```
+Wait, `bcftools query` might output `%INFO/AF` as `.` or empty. The prompt says columns are `sample chrom pos ref alt af`. It's fine.
+One minor thing: `samtools sort` might complain if `-o` is used with `-` in some versions, but it's standard. I'll keep it.
+All good.
+Output matches exactly.
+Proceeds. 
+(Self-Correction/Refinement during drafting)
+I notice `bcftools query` format string in the prompt uses `{sample}` literally. In bash, I must use `${sample}`. That's correct.
+The prompt says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`. I will write it as `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"`.
+Everything is consistent.
+Final check of the prompt: "Do not use echo for user-facing prose." -> I used `printf` for data header. That's fine.
+"Re-runs on a fully populated results/ directory must exit 0 without redoing work or erroring." -> The `if [[ -f ... ]]` guards ensure this.
+All constraints satisfied.
+Output generation. 
+[Done] 
+Proceeds. 
+(Note: I will remove the markdown code block fences as requested: "Output ONLY the script — no prose, no markdown fences, no commentary before or after.")
+I will output raw text starting with `#!/usr/bin/env bash`.
+Done. 
+[Output Generation] -> *Proceeds*

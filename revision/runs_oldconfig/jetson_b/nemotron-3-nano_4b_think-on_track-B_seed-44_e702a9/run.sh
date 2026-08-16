@@ -1,0 +1,31 @@
+#!/usr/ bin/env bash
+set -euo pipefail
+
+mkdir -p results
+
+samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+for s in "${samples[@]}"; do
+  bam=${results}/${s}.bam
+  if [[ -f $bam ]]; then continue; fi
+
+  bwa mem data/ref/chrM.fa ${s}_1.fq.gz ${s}_2.fq.gz > $bam
+  samtools index $bam
+
+  bcftools view -m vcf $bam > results/${s}.vcf.gz
+  tabix -p vcf results/${s}.vcf.gz.tbi
+done
+
+if [[ ! -f results/collapsed.tsv ]]; then
+  tmp_agg=$(mktemp)
+  for s in "${samples[@]}"; do
+    bcftools query -T results/${s}.vcf.gz >> $tmp_agg
+  done
+  seqkit -e $tmp_agg > results/collapsed.tsv.tmp
+  {
+    echo "sample\tchrom\tpos\tref\talt\taf"
+    cat results/collapsed.tsv.tmp
+  } > results/collapsed.tsv
+
+  rm -f $tmp_agg results/collapsed.tsv.tmp
+fi

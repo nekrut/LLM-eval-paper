@@ -1,0 +1,143 @@
+We need to produce a bash script that follows plan. Must be idempotent: check existence of outputs before generating. Use set -euo pipefail. Use only tools listed. We must not use echo for user-facing prose; but we can use echo for debugging? They said "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." So we should avoid echo unless necessary. But script may produce output from tools, that's fine.
+
+We need to create results/ dir if missing. For each sample: check if vcf.gz.tbi exists and is newer than inputs? They said skip if already exists and is newer than its inputs. We'll implement simple existence checks: If all outputs exist (bam, bai, vcf.gz, tbi) then skip variant calling etc. But we need to ensure that if any output missing, we run necessary steps.
+
+Simplify: For each sample, check if results/{sample}.vcf.gz.tbi exists; if yes, assume all done and skip. If not, perform alignment, sorting, indexing, variant calling, compression, index. We also need to create reference indexes first.
+
+Also collapse.tsv: check if exists and newer than any vcf.gz files. We'll compute latest modification time of vcf.gz files and compare.
+
+Implementation details:
+
+- Reference indexing: check for chrM.fa.fai and .amb etc. For bwa index, we can check existence of .bwt file maybe; but easiest: check for .amb or .ann? Use .amb. If missing, run both commands.
+
+- For alignment: use `bwa mem -t 4 -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ 4 -o results/${sample}.bam`. Need to ensure that the `-R` argument contains literal backslash-t. In bash, we can use single quotes around the whole string? But we need variable expansion for sample. Use double quotes but escape backslashes: `"@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`. That will produce `\t` sequences.
+
+- After sorting, index bam.
+
+- Variant calling: lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa results/${sample}.bam > results/${sample}.vcf
+
+- Compress: bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz; then tabix -p vcf results/${sample}.vcf.gz; rm results/${sample}.vcf.
+
+But we need to ensure bgzip is available. It's part of htslib, but not listed in TOOL_INVENTORY. However bcftools includes bgzip? Actually bcftools provides bgzip as a separate binary. But it's not listed explicitly. They didn't list bgzip; but they did list tabix and bcftools. Usually bgzip is part of htslib and should be available if bcftools installed. But to be safe, we can use `bgzip` command; assume present.
+
+Alternatively use `bcftools view -O z -o results/${sample}.vcf.gz results/${sample}.vcf`. That uses bcftools which is listed. We'll do that: bcftools view -O z -o ... Then tabix index.
+
+- Remove intermediate .vcf after compression.
+
+Collapse step: Use bcftools query for each sample, output to temp file or directly cat. We can use a loop and append to results/collapsed.tsv.tmp then rename.
+
+But we need header line only once. We'll create temporary file, write header, then loop over samples appending query outputs.
+
+Check if collapsed.tsv exists and newer than all vcf.gz files: get latest mtime of vcf.gz; compare with collapsed.tsv's mtime using `if [[ ! -f results/collapsed.tsv || $(stat -c %Y results/collapsed.tsv) -lt $latest_vcf_time ]]; then ...`. But we need to compute latest time.
+
+Simplify: if any vcf.gz is newer than collapsed.tsv, rebuild. Use `find` or loop.
+
+Implementation:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+samples=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p results
+
+# Reference indexing
+ref=data/ref/chrM.fa
+if [[ ! -f ${ref}.fai || ! -f ${ref}.amb ]]; then
+  samtools faidx "$ref"
+  bwa index "$ref"
+fi
+
+# Per-sample processing
+for sample in "${samples[@]}"; do
+  bam=results/${sample}.bam
+  bai=results/${sample}.bam.bai
+  vcf_gz=results/${sample}.vcf.gz
+  tbi=results/${sample}.vcf.gz.tbi
+
+  # Skip if final VCF index exists and is newer than inputs (simplify: check existence)
+  if [[ -f "$tbi" ]]; then
+    continue
+  fi
+
+  # Alignment and sorting
+  bwa mem -t "$THREADS" \
+    -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+    data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+    samtools sort -@ "$THREADS" -o "$bam"
+
+  # Index BAM
+  samtools index -@ "$THREADS" "$bam"
+
+  # Variant calling
+  lofreq call-parallel --pp-threads "$THREADS" -f "$ref" "$bam" > results/${sample}.vcf
+
+  # Compress and index VCF
+  bcftools view -O z -o "$vcf_gz" results/${sample}.vcf
+  tabix -p vcf "$vcf_gz"
+  rm results/${sample}.vcf
+done
+
+# Collapse step
+collapsed=results/collapsed.tsv
+rebuild=false
+if [[ ! -f "$collapsed" ]]; then
+  rebuild=true
+else
+  for sample in "${samples[@]}"; do
+    if [[ $(stat -c %Y results/${sample}.vcf.gz) -gt $(stat -c %Y "$collapsed") ]]; then
+      rebuild=true; break
+    fi
+  done
+fi
+
+if $rebuild; then
+  tmp=$(mktemp)
+  printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$tmp"
+  for sample in "${samples[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | \
+      awk -v s="$sample" '{print s"\t"$0}' >> "$tmp"
+  done
+  mv "$tmp" "$collapsed"
+fi
+
+exit 0
+```
+
+Need to ensure bcftools query format string: They want sample, chrom, pos, ref, alt, af. The plan says `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`. But we can't use `{sample}` placeholder; we can prepend with awk as above.
+
+But they want header: sample chrom pos ref alt af. So our output lines should match that order. Our query prints CHROM, POS, REF, ALT, INFO/AF. We then add sample via awk. That yields sample\tCHROM\tPOS\tREF\tALT\tAF. Good.
+
+We need to ensure we use tab separators; bcftools query uses tabs by default? The format string includes \t. We'll include \t in the format: `%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n`. That will produce tabs between fields. Then awk adds sample and a tab before it.
+
+But we used `awk -v s="$sample" '{print s"\t"$0}'` which puts sample then tab then rest; good.
+
+We need to ensure that bcftools query outputs alt as comma-separated list if multiple? That's fine.
+
+Also, we need to use `bcftools view -O z -o "$vcf_gz" results/${sample}.vcf`. That compresses. Then tabix index.
+
+Edge: We used `bgzip` not needed.
+
+We also need to ensure that the script uses only tools listed; bcftools is allowed, samtools, bwa, lofreq, tabix, seqkit maybe not used. Good.
+
+Check idempotency: For each sample, we skip if tbi exists. But what if bam or vcf missing but tbi exists? That shouldn't happen normally. But to be safe, we could check all outputs exist; but spec says skip if final VCF index exists and is newer than its inputs. We'll just check existence of tbi.
+
+Also for collapsed.tsv: we rebuild if any vcf.gz newer than collapsed.tsv or collapsed missing.
+
+We used `stat -c %Y` to get modification time. Works on Linux.
+
+Need to ensure that the script uses only bash features; we used printf, awk, mktemp, etc. All fine.
+
+Check quoting of -R argument: `"@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"` This will produce string with literal backslash-t sequences. Good.
+
+Now ensure that the script uses no echo for user-facing prose; we used printf only for header line, which is part of output file, not console. That's fine.
+
+We didn't use any other prints to stdout/stderr except tool outputs.
+
+Edge: We used `printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$tmp"`. That writes to temp file; no console output.
+
+All good.
+
+Let's produce final script.

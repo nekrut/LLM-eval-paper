@@ -1,0 +1,208 @@
+We need to produce a bash script that does per-sample variant calling on 4 paired-end MiSeq amplicon samples mapped to human mitochondrial reference chrM.fa. Output files: results/{sample}.bam, .bai, .vcf.gz, .vcf.gz.tbi, and collapsed.tsv.
+
+Requirements:
+
+- Idempotent: if results/ already populated with all outputs, script should exit 0 without redoing work or erroring.
+- Use only tools listed in TOOL_INVENTORY. No conda, pip, apt, curl, wget, etc. Only those tools are available on PATH.
+- Must not write to stderr/stdout beyond what tools naturally emit; no echo for user-facing prose. So we can use echo for internal messages? The instruction says "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." That means we should avoid printing anything except tool outputs. We can still use echo for debugging but it's not allowed. So script should be silent unless tools produce output.
+
+- Must run under 600 seconds at THREADS=4. Use threads where possible: bwa mem -t 4, samtools sort -@ 4, etc.
+
+- The reference is chrM.fa in data/ref/. We need to index it with samtools faidx and create .fai if not present. Also maybe index for BWA (bwa index). But we can use bwa index if not already done. Idempotent: check existence of index files (.amb, .ann, .bwt, .pac, .sa). If missing, run bwa index.
+
+- For each sample: pair-end reads: <sample>_1.fq.gz and _2.fq.gz in data/raw/. We need to map with bwa mem -t 4. Then pipe to samtools view -Sb - > results/{sample}.bam? Actually we want sorted BAM, so use samtools sort -@ 4 -o results/{sample}.sorted.bam. But output file name specified: results/{sample}.bam (not .sorted). So we can produce unsorted then sort? We can directly pipe to samtools sort and output as results/{sample}.bam. Then index with samtools index.
+
+- After mapping, variant calling: use lofreq call -f data/ref/chrM.fa -b results/{sample}.bam -o results/{sample}.vcf (uncompressed). But we need gzipped VCF. We can pipe to bgzip? bcftools view -O z -o results/{sample}.vcf.gz results/{sample}.vcf? Actually lofreq call outputs VCF; we can compress with bgzip from tabix or use bcftools view -O z. But bcftools view expects input VCF file, output gzipped. So we can run: lofreq call ... | bcftools view -O z -o results/{sample}.vcf.gz -? Wait, lofreq call writes to stdout if no -o specified; we can pipe to bcftools view -O z -o results/... . But bcftools view expects a file or stdin. We can use: lofreq call ... | bcftools view -O z -o results/{sample}.vcf.gz -? Actually bcftools view -O z -o output <stdin> works. So we can pipe.
+
+- Then index VCF with tabix -p vcf results/{sample}.vcf.gz
+
+- Collapsed table: need to combine all per-sample VCFs into a single TSV with columns sample chrom pos ref alt af. We need allele frequency (af). In lofreq VCF, AF is in INFO field? Let's check typical lofreq output: It includes "AF" as INFO field maybe. But we can parse using bcftools query or awk. Use bcftools query -f '%SAMPLE\t%CHROM\t%POS\t%REF\t%ALT[\t%INFO/AF]\n' results/{sample}.vcf.gz? Actually sample column is sample name; but bcftools query will output per variant per sample? For single-sample VCF, we can use: bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%INFO/AF]\n' file. But need sample name as first column. We can add sample name manually.
+
+Simpler: Use awk to parse VCF lines starting with '#', skip header, then for each line extract fields: $1 chrom, $2 pos, $4 ref, $5 alt, and INFO field contains AF=...; we can get AF by regex. Then output sample\tchrom\tpos\tref\talt\taf.
+
+We need to produce collapsed.tsv with header: sample  chrom  pos  ref  alt  af
+
+So script will iterate over samples, for each VCF.gz parse and append to a temporary file, then sort? Not necessary; just concatenate in order of samples. But we must ensure no duplicates across samples? The requirement doesn't say deduplicate; just collapsed table.
+
+We need to be idempotent: if results/{sample}.bam etc exist, skip processing for that sample. Also if reference indexes missing, create them.
+
+Also collapsed.tsv should be created only once after all VCFs processed. If it exists and is up-to-date? We can check existence of collapsed.tsv; but maybe we need to regenerate if any new samples added? But requirement: rerunning on a populated results/ directory must exit 0 without redoing work or erroring. So if collapsed.tsv already exists, we should skip generating again. But what if some sample outputs missing? Then script would exit 0 incorrectly? The instruction says "rerunning on a populated results/ directory must exit 0 without redoing work or erroring." That implies that if all expected outputs exist, just exit. If not all exist, then process missing ones.
+
+Thus we need to check for each sample whether all required files exist; if any missing, perform steps for that sample. After processing all samples, generate collapsed.tsv only if it doesn't exist.
+
+Also ensure no partial output left if script fails? Not necessary but good practice: use temporary file and mv.
+
+Let's list expected outputs per sample:
+
+- results/{sample}.bam
+- results/{sample}.bai (index)
+- results/{sample}.vcf.gz
+- results/{sample}.vcf.gz.tbi
+
+Also we might need to create results/ directory if not exist. Use mkdir -p.
+
+Now script skeleton:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Define arrays of samples
+samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+# Ensure results dir exists
+mkdir -p results
+
+# Reference path
+ref="data/ref/chrM.fa"
+
+# Check if reference index files exist; if not, create them
+if ! [[ -f "${ref}.amb" && -f "${ref}.ann" && -f "${ref}.bwt" && -f "${ref}.pac" && -f "${ref}.sa" ]]; then
+    bwa index "$ref"
+fi
+
+# Check if reference fasta is indexed for samtools (faidx)
+if ! [[ -f "${ref}.fai" ]]; then
+    samtools faidx "$ref"
+fi
+
+# Process each sample
+for sample in "${samples[@]}"; do
+    bam="results/${sample}.bam"
+    bai="results/${sample}.bai"
+    vcf_gz="results/${sample}.vcf.gz"
+    tbi="results/${sample}.vcf.gz.tbi"
+
+    # If all files exist, skip
+    if [[ -f "$bam" && -f "$bai" && -f "$vcf_gz" && -f "$tbi" ]]; then
+        continue
+    fi
+
+    # Input fastq paths
+    fq1="data/raw/${sample}_1.fq.gz"
+    fq2="data/raw/${sample}_2.fq.gz"
+
+    # Map reads with bwa mem, sort, and output BAM
+    bwa mem -t 4 "$ref" "$fq1" "$fq2" | samtools view -Sb - | samtools sort -@ 4 -o "$bam"
+
+    # Index BAM
+    samtools index "$bam"
+
+    # Variant calling with lofreq, compress VCF and index
+    lofreq call -f "$ref" -b "$bam" | bcftools view -O z -o "$vcf_gz" -
+
+    tabix -p vcf "$vcf_gz"
+done
+
+# Generate collapsed.tsv if not exists
+collapsed="results/collapsed.tsv"
+
+if [[ ! -f "$collapsed" ]]; then
+    # Header
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > "$collapsed.tmp"
+    for sample in "${samples[@]}"; do
+        vcf_gz="results/${sample}.vcf.gz"
+        # Parse VCF lines
+        awk -v samp="$sample" '
+            BEGIN{FS="\t"} 
+            /^#/ {next}
+            {
+                chrom=$1; pos=$2; ref=$4; alt=$5;
+                info=$7;
+                match(info, /AF=([^;]+)/, arr);
+                af = (arr[1] != "") ? arr[1] : ".";
+                print samp"\t"chrom"\t"pos"\t"ref"\t"alt"\t"af
+            }
+        ' "$vcf_gz" >> "$collapsed.tmp"
+    done
+    mv "$collapsed.tmp" "$collapsed"
+fi
+
+exit 0
+
+But we need to ensure no echo. We used printf for header; that's fine as tool output? But it's not user-facing prose, but still prints to stdout. The instruction says "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." Using printf may produce output. Might be considered writing to stdout. We should avoid printing anything at all. So we need to create collapsed.tsv without printing header to stdout? But we can redirect to file, but that still writes to stdout? Actually printf writes to stdout; if we redirect > file, it goes to file not stdout. That is acceptable: no output to console. So it's fine.
+
+But we used printf "sample\tchrom..." > "$collapsed.tmp". That's okay because redirected.
+
+Also we used awk printing lines appended to collapsed.tmp. That prints to stdout but redirected >> file; so no console output.
+
+Thus script should be silent except tool outputs.
+
+Now check idempotency: If all sample files exist, loop will skip each sample. But if some missing, it will process them. After processing all samples, we generate collapsed.tsv only if not exists. But what if collapsed.tsv exists but some sample outputs were missing? Then script would exit 0 without generating missing ones? Actually the loop processes missing ones; after that, collapsed.tsv may still exist from previous run. If new sample added, collapsed.tsv will be stale. But requirement: "rerunning on a populated results/ directory must exit 0 without redoing work or erroring." That implies if all outputs exist, skip everything. But if some missing, we should process them and then maybe regenerate collapsed.tsv? The instruction doesn't specify that collapsed.tsv must be regenerated when new samples added; but logically it should reflect current data. However requirement may not consider dynamic addition of samples. We'll keep as is: generate collapsed.tsv only if missing.
+
+But what if collapsed.tsv exists but some sample outputs were missing and just processed? Then collapsed.tsv remains stale. But we can regenerate collapsed.tsv after processing any new sample. So better to set a flag that indicates whether any sample was processed; if yes, regenerate collapsed.tsv. That ensures consistency.
+
+Implement:
+
+processed=false
+
+for sample in ... ; do
+   ...
+   if [[ ! -f "$bam" && ... ]]; then
+       # process
+       processed=true
+   fi
+done
+
+if $processed || [[ ! -f "$collapsed" ]]; then
+    generate collapsed.tsv
+fi
+
+But we need to check condition: if any sample missing, we process; after loop, if processed true or collapsed missing, regenerate.
+
+Let's implement:
+
+processed=false
+
+for sample in ... ; do
+   ...
+   if [[ ! -f "$bam" || ! -f "$bai" || ! -f "$vcf_gz" || ! -f "$tbi" ]]; then
+        # process
+        processed=true
+   fi
+done
+
+if $processed || [[ ! -f "$collapsed" ]]; then
+    ... generate collapsed.tsv
+fi
+
+But we need to use bash boolean: processed=false; later set processed=true. Then test with if $processed; but that will treat string "false" as command? Actually in bash, if $processed will try to execute the value as a command. So better to use:
+
+if [[ "$processed" == true || ! -f "$collapsed" ]]; then
+
+Set processed=false initially.
+
+Ok.
+
+Also we need to ensure that when generating collapsed.tsv, we don't overwrite existing file if no new samples processed? But we already handle condition.
+
+Now check for missing reference index: bwa index may produce .amb etc. We check existence of all five files; if any missing, run bwa index. Good.
+
+samtools faidx: create .fai if missing.
+
+Also need to ensure that results/ directory exists before writing outputs.
+
+Check thread usage: bwa mem -t 4, samtools sort -@ 4, samtools index default uses threads? It can use -@ but we didn't specify; but it's fine. bcftools view -O z no threads needed. tabix indexing is fast.
+
+Now check that lofreq call outputs VCF with header lines starting with '#'. We parse accordingly.
+
+But we need to ensure that AF field exists in INFO. In lofreq, the default output includes "AF" as INFO? Let's confirm typical lofreq output: It may include "AF=0.123". Yes.
+
+Edge case: alt may contain comma-separated multiple alleles; but we just output alt string as is.
+
+Now check that bcftools view -O z -o "$vcf_gz" - reads from stdin and writes gzipped VCF. That should work.
+
+But we need to ensure that bcftools view expects input file or stdin? It can read from stdin if given '-'. So we used '-' as last argument. Good.
+
+Now check that tabix indexing: tabix -p vcf "$vcf_gz" will create .tbi index.
+
+Now final script.
+
+But we need to ensure no stray spaces or tabs causing issues.
+
+Also we should use set -euo pipefail at top; we already have.
+
+We also need to ensure that the script uses correct shebang: #!/usr/bin/env bash
+
+Ok.
+
+Let's produce final script.

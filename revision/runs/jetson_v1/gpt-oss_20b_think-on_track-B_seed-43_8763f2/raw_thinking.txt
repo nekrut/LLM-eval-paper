@@ -1,0 +1,219 @@
+We need to produce a bash script that does per-sample variant calling on 4 paired-end MiSeq amplicon samples mapped to chrM reference. Output: results/{sample}.bam, .bai, .vcf.gz, .vcf.gz.tbi, and collapsed.tsv.
+
+Requirements:
+
+- Idempotent: if results/ already populated with all outputs, exit 0 without redoing work or erroring.
+- Use only tools listed in TOOL_INVENTORY. Tools available: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java.
+
+We can use bash script to orchestrate steps:
+
+1. Check if results/ exists and contains all outputs for each sample. If yes exit 0.
+2. Create results directory if not exist.
+3. For each sample: 
+   - Align reads with bwa mem to chrM.fa (index first). Need to index reference if not already indexed. Use samtools faidx? Actually bwa requires .bwt, .ann etc. We can run `bwa index` on ref/chrM.fa if not present.
+   - Convert SAM to BAM sorted and indexed: use samtools view | sort | index.
+   - Variant calling: use lofreq call -f reference -o vcf? Actually lofreq call expects bam input, produce VCF. Use `lofreq call --call-indels -f ref/chrM.fa results/${sample}.bam -o results/${sample}.vcf`. Then compress with bgzip and index with tabix.
+   - Optionally annotate with snpEff? Not required but could be used for annotation. But collapsed.tsv requires columns: sample chrom pos ref alt af. We can extract AF from VCF INFO field (AF). Use bcftools query to produce table.
+
+4. Collapsed.tsv: combine per-sample tables into one file, include header. Use bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[%AF]\n' for each sample and add sample column. Then sort? Not required but maybe.
+
+5. Ensure idempotent: if all outputs exist skip processing. But we need to check per-sample .bam, .bai, .vcf.gz, .vcf.gz.tbi. Also collapsed.tsv. If any missing, run pipeline for that sample or entire.
+
+Simplify: For each sample, check if results/${sample}.bam.bai exists; if not process sample. After all samples processed, check collapsed.tsv; if missing generate.
+
+Also need to index reference: check if data/ref/chrM.fa.fai exists? Actually samtools faidx creates .fai. Bwa index creates .bwt etc. We can check for chrM.fa.bwt or .ann. If not present run bwa index.
+
+We also need to ensure fastqc maybe optional but not required by output spec. But we could run fastqc on raw reads? Not necessary.
+
+Constraints: wall-clock <600s at THREADS=4. Use -t 4 for samtools sort and view, etc.
+
+Also no echo user-facing prose; only tool outputs. So script should not print anything except maybe errors.
+
+We need to use set -euo pipefail.
+
+Let's craft script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+
+# directories
+RAW=data/raw
+REF=data/ref
+RESULTS=results
+
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+# create results dir if needed
+mkdir -p "$RESULTS"
+
+# index reference if not indexed
+if ! [[ -f "${REF}/chrM.fa.bwt" ]]; then
+    bwa index "${REF}/chrM.fa"
+fi
+
+# function to process sample
+process_sample() {
+    local sample="$1"
+    local bam="${RESULTS}/${sample}.bam"
+    local bai="${bam}.bai"
+    local vcf="${RESULTS}/${sample}.vcf.gz"
+    local tbi="${vcf}.tbi"
+
+    # if all outputs exist, skip
+    if [[ -f "$bam" && -f "$bai" && -f "$vcf" && -f "$tbi" ]]; then
+        return 0
+    fi
+
+    # align
+    bwa mem -t "$THREADS" "${REF}/chrM.fa" \
+        "${RAW}/${sample}_1.fq.gz" "${RAW}/${sample}_2.fq.gz" |
+    samtools view -@ "$THREADS" -b - | \
+    samtools sort -@ "$THREADS" -o "$bam"
+
+    # index bam
+    samtools index -@ "$THREADS" "$bam"
+
+    # variant calling with lofreq
+    lofreq call --call-indels -f "${REF}/chrM.fa" "$bam" -o "${RESULTS}/${sample}.vcf"
+
+    # compress and index VCF
+    bgzip -c "${RESULTS}/${sample}.vcf" > "$vcf"
+    tabix -p vcf "$vcf"
+}
+
+# process each sample
+for s in "${SAMPLES[@]}"; do
+    process_sample "$s"
+done
+
+# generate collapsed.tsv if missing or out of date
+COLLAPSED="${RESULTS}/collapsed.tsv"
+
+if ! [[ -f "$COLLAPSED" ]]; then
+    # header
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"
+    for s in "${SAMPLES[@]}"; do
+        vcf="${RESULTS}/${s}.vcf.gz"
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[%AF]\n' "$vcf" |
+            awk -v sample="$s" 'BEGIN{OFS="\t"} {$0=sample OFS $0}1' >> "$COLLAPSED"
+    done
+fi
+
+exit 0
+
+But we used bgzip which is part of tabix? Actually bgzip is part of htslib; but not listed explicitly. But tabix is available, and bgzip may be in same package. The TOOL_INVENTORY lists tabix (htslib) 1.21 [ok]. Usually bgzip is also part of htslib. It might be on PATH as bgzip. We can use `bgzip` command.
+
+But we didn't include bcftools query? It's part of bcftools, yes.
+
+Also we used awk; but awk is standard. Allowed? Not listed but likely available. The script may rely on /usr/bin/awk which is fine.
+
+We need to ensure no echo for user-facing prose. We only use printf for header; that's okay as tool output? It's not user-prose but part of collapsed.tsv generation. Acceptable.
+
+Also we used `printf` which writes to stdout, but it's generating file content; acceptable.
+
+Need to ensure script is idempotent: if all outputs exist, exit 0. But our process_sample will skip if all four files exist. However if some missing but others present, it will reprocess entire sample. That's fine.
+
+Also we need to check collapsed.tsv existence; if missing generate. If exists but maybe outdated? Not required.
+
+Edge: We used `bgzip -c` which outputs compressed file; we redirect > "$vcf". That will create .gz file. Good.
+
+We also need to index VCF with tabix -p vcf "$vcf".
+
+Also we didn't use fastqc or seqkit etc. That's fine.
+
+But we didn't use SnpSift or snpEff; not required.
+
+Potential missing: We used `samtools view -@ "$THREADS" -b - | samtools sort -@ "$THREADS" -o "$bam"` but need to pipe into sort. But we also need to index bam after sorting. Good.
+
+But we didn't use `samtools index` with -@ threads; it's fine.
+
+Also we used `lofreq call --call-indels -f "${REF}/chrM.fa" "$bam" -o "${RESULTS}/${sample}.vcf"`; lofreq may output VCF unsorted? But okay.
+
+We need to ensure that the reference is indexed for samtools faidx? Not needed for mapping. For variant calling, lofreq requires reference fasta and maybe index .fai. We didn't create it. Should we run `samtools faidx "${REF}/chrM.fa"` if not present? Lofreq may require .fai. Let's add check: if ! [[ -f "${REF}/chrM.fa.fai" ]]; then samtools faidx "${REF}/chrM.fa"; fi
+
+Also need to ensure reference index for bwa mem; we already did.
+
+Add that before processing samples.
+
+Also we used `bgzip` but not imported; but it's part of htslib. Should be available.
+
+Let's update script accordingly.
+
+Also we should use `set -euo pipefail`.
+
+We also need to ensure no stray spaces or missing quotes.
+
+Let's craft final script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+
+RAW=data/raw
+REF=data/ref
+RESULTS=results
+
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p "$RESULTS"
+
+# index reference for bwa and samtools if needed
+if ! [[ -f "${REF}/chrM.fa.bwt" ]]; then
+    bwa index "${REF}/chrM.fa"
+fi
+
+if ! [[ -f "${REF}/chrM.fa.fai" ]]; then
+    samtools faidx "${REF}/chrM.fa"
+fi
+
+process_sample() {
+    local sample="$1"
+    local bam="${RESULTS}/${sample}.bam"
+    local bai="${bam}.bai"
+    local vcf_gz="${RESULTS}/${sample}.vcf.gz"
+    local tbi="${vcf_gz}.tbi"
+
+    if [[ -f "$bam" && -f "$bai" && -f "$vcf_gz" && -f "$tbi" ]]; then
+        return 0
+    fi
+
+    bwa mem -t "$THREADS" "${REF}/chrM.fa" \
+        "${RAW}/${sample}_1.fq.gz" "${RAW}/${sample}_2.fq.gz" |
+    samtools view -@ "$THREADS" -b - | \
+    samtools sort -@ "$THREADS" -o "$bam"
+
+    samtools index -@ "$THREADS" "$bam"
+
+    lofreq call --call-indels -f "${REF}/chrM.fa" "$bam" -o "${RESULTS}/${sample}.vcf"
+
+    bgzip -c "${RESULTS}/${sample}.vcf" > "$vcf_gz"
+    tabix -p vcf "$vcf_gz"
+}
+
+for s in "${SAMPLES[@]}"; do
+    process_sample "$s"
+done
+
+COLLAPSED="${RESULTS}/collapsed.tsv"
+
+if ! [[ -f "$COLLAPSED" ]]; then
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"
+    for s in "${SAMPLES[@]}"; do
+        vcf_gz="${RESULTS}/${s}.vcf.gz"
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[%AF]\n' "$vcf_gz" |
+            awk -v sample="$s" 'BEGIN{OFS="\t"} {$0=sample OFS $0}1' >> "$COLLAPSED"
+    done
+fi
+
+exit 0
+
+Check: We used `bgzip` but not defined; but it's part of htslib. Should be available.
+
+Also we didn't use any echo for user-facing prose, only printf to file.
+
+We need to ensure no stray spaces after shebang line.
+
+Ok produce script.

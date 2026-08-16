@@ -1,0 +1,204 @@
+We need to produce a self-contained bash script meeting constraints.
+
+Constraints:
+
+- First line: #!/usr/bin/env bash
+- Second line: set -euo pipefail
+- Must be idempotent: if results/ populated, exit 0 without redoing work or erroring.
+- No hardcoded paths outside cwd. Use relative paths.
+- Only tools listed in TOOL_INVENTORY can be used; we have many tools available.
+- Must use only those tools; no external commands like curl etc.
+- Must keep wall-clock under 600 seconds at THREADS=4, but that's just a constraint for runtime; script must be efficient.
+
+We need to produce per-sample variant calling pipeline as described. Use BWA indexing steps (bwa index and samtools faidx). Then alignment with bwa mem and sort to BAM. Then index. Then LoFreq call-parallel. Then bgzip and tabix. Then collapsed.tsv generation.
+
+Need to ensure idempotency: if outputs already exist, skip steps? The requirement: rerunning on a populated results/ directory must exit 0 without redoing work or erroring. So we can check if all required files for each sample exist before processing; if they do, continue to next sample (or just exit). Or we could run only missing steps. Simpler: at top after mkdir -p results, loop over samples and check if results/{sample}.bam.bai exists? Actually need .bam, .bai, .vcf.gz, .tbi, collapsed.tsv. The collapsed.tsv is a single file across all samples; we can generate it only once.
+
+Simplify: At start, create results dir. Then for each sample, check if results/{sample}.bam exists; if yes skip alignment steps? But need to also index and vcf etc. Could just continue to next sample if all required files exist (including .vcf.gz.tbi). So condition: if [ -e "results/${sample}.bam" ] && [ -e "results/${sample}.bam.bai" ] && [ -e "results/${sample}.vcf.gz" ] && [ -e "results/${sample}.vcf.gz.tbi" ]; then continue; fi. Also need collapsed.tsv generation after all samples processed.
+
+But we also need to generate collapsed.tsv only once, after processing all samples (or if already exists). Could check if results/collapsed.tsv exists and has header? Simpler: after loop, generate collapsed.tsv if not existing; but need to ensure it's idempotent. We can just always overwrite with same content; that is fine.
+
+But we must avoid re-running steps that would fail due to missing input files. So we can conditionally run each step only if output does not exist.
+
+Implementation plan:
+
+- Define THREADS=4 (maybe used for tools that accept -@ flag). Use variable.
+
+- SAMPLES array as given.
+
+- mkdir -p results
+
+- For each sample in "${SAMPLES[@]}"; do
+
+   - Check if results/${sample}.bam exists; if yes, skip to next sample (or continue). Actually we need to also check .bai etc. But we can just check if .bam exists; then assume downstream done? Might be safer to check all required files: .bam .bai .vcf.gz .vcf.gz.tbi. If any missing, run steps.
+
+   - Step 3: alignment + sort pipeline: bwa mem ... | samtools sort -@ $THREADS -o results/${sample}.bam - . This will overwrite if file exists; but we want idempotent, so we can just run it only if output missing. So condition: if [ ! -e "results/${sample}.bam" ]; then ... fi
+
+   - Step 4: samtools index -@ $THREADS results/${sample}.bam . If file exists maybe skip? But index may be missing; we can check if .bai exists; if not, run.
+
+   - Step 5: lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam . This will create .vcf (uncompressed). If exists skip.
+
+   - Step 6: bgzip -f results/${sample}.vcf . This creates .vcf.gz. If exists skip.
+
+   - Step 7: tabix -p vcf results/${sample}.vcf.gz . If .tbi exists skip.
+
+- After loop, generate collapsed.tsv: if [ ! -e "results/collapsed.tsv" ]; then create with header; then append per-sample lines. But we need to ensure it's idempotent; we can just overwrite each run: printf header > results/collapsed.tsv; then for each sample do bcftools query ... | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv . This will append even if file exists; but we need to clear previous content? If we always start with header, then append, it's fine. But if script runs again and collapsed.tsv already has data, we might duplicate rows. To avoid duplication, we can check if file exists and skip generation; or we can regenerate each time (overwrites). Simpler: always recreate collapsed.tsv from scratch: printf header > results/collapsed.tsv; then loop over samples again to append. That ensures idempotent.
+
+But we must not redo heavy steps unnecessarily; but generating collapsed.tsv is cheap.
+
+Thus after sample loop, we can generate collapsed.tsv by:
+
+   - printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+
+   - for each sample in "${SAMPLES[@]}"; do
+
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+
+   - This will append rows.
+
+But need to ensure bcftools query works; it uses .vcf.gz index? Actually bcftools query can read compressed VCF directly. It should work.
+
+Potential issues: The order of steps: we need to run lofreq call-parallel which outputs a VCF (maybe .vcf). Then we compress and index. So after step 5, we have .vcf; then step6 bgzip -f results/${sample}.vcf ; step7 tabix -p vcf results/${sample}.vcf.gz . We'll implement these as separate commands.
+
+Now ensure we use only allowed tools: bwa, samtools, lofreq, bgzip, tabix, bcftools, awk, printf, mkdir, set -euo pipefail. All are in inventory.
+
+We must not use echo for user-facing prose; but we can use printf for header line (that's okay). No extra output.
+
+Now write script:
+
+First two lines as required.
+
+Then maybe define THREADS=4 and SAMPLES array.
+
+But the plan says "Boilerplate (top of `run.sh`)" includes those lines. We need to include them exactly? The instruction: "All per-sample steps run in `for sample in "${SAMPLES[@]}"; do ... done`." So we can include that boilerplate as part of script.
+
+We must not hardcode any path outside cwd; but we will reference data/ref/chrM.fa and data/raw/*.fq.gz. That's fine relative to cwd.
+
+Now produce final script.
+
+Potential edge: bwa index command expects reference file; it will create .amb etc. If already indexed, it may overwrite? It may fail if index exists? Actually bwa index will create .amb etc; if they exist, it may not need to run; but we can just run it unconditionally; it's idempotent? Might error if file exists? Usually bwa index overwrites existing indexes? Not sure. But we can check if index files exist; but not required for idempotency? The requirement: rerunning on a populated results/ directory must exit 0 without redoing work or erroring. So we need to avoid errors when running script again. If we run bwa index again on already indexed reference, it may error? Let's check: bwa index will create .amb etc; if they exist, it may just rewrite? I think it will overwrite but not error. But to be safe, we can skip indexing steps if index files exist. However the plan says to run them; but idempotency requirement is about results/ directory, not reference. The reference is under data/ref and presumably static; we can assume it's not changed. So we can just run bwa index and samtools faidx unconditionally; they will likely succeed even if indexes exist (they may rewrite). But to be safe, we can check if .amb etc exist; but not necessary.
+
+But the script must exit 0 without erroring when results/ is populated. If we run indexing steps again, they might produce output files in data/ref/ (like .amb) which are already there; but they may overwrite; that's okay. However if they error due to existing index? I think bwa index will just create indexes; if they exist, it may not error. So fine.
+
+But we must ensure script does not attempt to process samples if results/ already contains all required outputs; we can skip entire loop if all sample .bam files exist. Simpler: at top after mkdir -p results, check if all required output files exist for all samples; if yes, then just generate collapsed.tsv (if missing) and exit 0. But generating collapsed.tsv may need to read .vcf.gz; if they exist we can still generate.
+
+Simplify: At start, create results dir. Then loop over samples; inside loop, check if results/${sample}.bam exists; if yes, continue to next sample (skip processing). That ensures we don't re-run steps for already processed samples. However if collapsed.tsv is missing or outdated, we will still generate it after loop.
+
+Thus script flow:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+for sample in "${SAMPLES[@]}"; do
+  # Skip if BAM already exists (implies downstream done)
+  if [ -e "results/${sample}.bam" ]; then
+    continue
+  fi
+
+  # Step 3: align & sort
+  bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+    samtools sort -@ "$THREADS" -o "results/${sample}.bam" -
+
+  # Step 4: index
+  samtools index -@ "$THREADS" "results/${sample}.bam"
+
+  # Step 5: LoFreq call-parallel
+  lofreq call-parallel --pp-threads "$THREADS" -f data/ref/chrM.fa -o "results/${sample}.vcf" "results/${sample}.bam"
+
+  # Step 6: bgzip
+  bgzip -f "results/${sample}.vcf"
+
+  # Step 7: tabix index
+  tabix -p vcf "results/${sample}.vcf.gz"
+done
+
+# Generate collapsed.tsv (overwrite each run)
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+  bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" | \
+    awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+
+That's the script.
+
+Check constraints:
+
+- No hardcoded absolute paths; all relative.
+- Only tools used are in inventory: bwa, samtools, lofreq, bgzip, tabix, bcftools, awk, printf, mkdir. All present.
+- We use set -euo pipefail at line 2.
+- We use THREADS variable for -@ flags; we set to 4 but not hardcoded elsewhere? It's okay.
+- Idempotent: If results/ populated with .bam files, loop will skip processing; script will still generate collapsed.tsv (overwrites). That's fine; it exits 0.
+
+Potential issue: The bwa mem command uses -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA". This includes tabs; need to escape? In bash, we can include literal tabs inside single quotes? Actually we used double quotes and escaped tabs as $'\t' maybe. But we wrote "\t" which is a backslash-t in double quotes; that will be interpreted as a literal tab character? In bash, within double quotes, \t is not special; it's just backslash t. To insert a tab, we need to use actual tab or $'\t'. So we should use $'\t' or include an actual tab character. Safer: use $'\t' for tab. Let's adjust.
+
+We can write:
+
+-R "@RG$(printf '\t')ID:${sample}$(printf '\t')SM:${sample}$(printf '\t')LB:${sample}$(printf '\t')PL:ILLUMINA"
+
+But that's messy. Simpler: use actual tab characters in the script; we can embed literal tabs (they are allowed). The script must be valid bash; literal tabs are okay. So we can just include a real tab character after @RG etc. But we need to ensure it's present. In the script we can write:
+
+-R "@RG\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"
+
+But that will produce literal characters \ t, not a tab. So we need actual tab. We can embed an actual tab by pressing Tab key; but in plain text representation, we can use $'\t' which expands to a tab. In bash, within double quotes, $'\t' expands to a tab. So we can write:
+
+-R "@RG$'\tSM:${sample}$'\tLB:${sample}$'\tPL:ILLUMINA"
+
+That will produce the correct fields with tabs.
+
+Thus modify step 3 command accordingly.
+
+Similarly for other commands that use -@ threads; we used "$THREADS". That's fine.
+
+Now ensure we use $THREADS variable in bwa mem -t "$THREADS". Good.
+
+Now final script must be a single bash script, no markdown fences, no extra commentary. Provide only the script.
+
+Let's craft final script with proper quoting and escaping.
+
+Full script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+for sample in "${SAMPLES[@]}"; do
+  if [ -e "results/${sample}.bam" ]; then
+    continue
+  fi
+
+  bwa mem -t "$THREADS" -R "@RG$'\t'SM:${sample}$'\t'LB:${sample}$'\t'PL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+    samtools sort -@ "$THREADS" -o "results/${sample}.bam" -
+
+  samtools index -@ "$THREADS" "results/${sample}.bam"
+
+  lofreq call-parallel --pp-threads "$THREADS" -f data/ref/chrM.fa -o "results/${sample}.vcf" "results/${sample}.bam"
+
+  bgzip -f "results/${sample}.vcf"
+
+  tabix -p vcf "results/${sample}.vcf.gz"
+done
+
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+  bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" | \
+    awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+
+Check that we used only allowed tools: bwa, samtools, lofreq, bgzip, tabix, bcftools, awk, printf, mkdir. All good.
+
+Potential issue: lofreq call-parallel expects input BAM and reference; it outputs a VCF file (uncompressed). That's fine.
+
+One more thing: The plan says "bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz | awk -v s={sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv". In our script we used single quotes and double quotes appropriately. We used awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' . That's fine.
+
+Now ensure no stray echo or extra output. The script only outputs via tools; but printf writes to stdout? Actually redirection > results/collapsed.tsv writes to file, not stdout. So it's fine.
+
+Potential issue: The script may produce error messages if any command fails; but set -e will exit on error; but we want idempotent behavior; if a step fails because output already exists? Not relevant. If a step fails for other reason, script would exit with error, which is okay.
+
+Now final answer: Provide only the script.

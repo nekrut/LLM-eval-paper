@@ -1,0 +1,251 @@
+The user wants a single bash script that performs per-sample variant calling on 4 paired-end MiSeq amplicon samples mapped to the human mitochondrial reference (chrM).
+The script must follow the provided plan exactly.
+Let's break down the requirements:
+- First line: `#!/usr/bin/env bash`
+- Second line: `set -euo pipefail`
+- Constants: `THREADS=4`, `SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")`
+- Create output dir: `mkdir -p results`
+- Reference indexing with BWA and samtools faidx, with idempotency guards.
+- Per-sample alignment + sort with BWA mem and samtools sort, with RG string using literal `\t`.
+- BAM index with samtools index.
+- Variant calling with LoFreq.
+- VCF compression + tabix index.
+- Collapsed TSV generation (unconditional).
+- All outputs under `results/`.
+- No hardcoded paths outside cwd.
+- Use only listed tools.
+- Idempotent for steps 1-6, step 7 always runs.
+- Output ONLY the script.
+
+Let's draft the script carefully following the plan.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Step 1: BWA index
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+
+# Step 2: samtools faidx
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+for sample in "${SAMPLES[@]}"; do
+    # Step 3: Alignment + sort
+    [[ -f results/${sample}.bam ]] || {
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+        samtools sort -@ ${THREADS} -o results/${sample}.bam -
+    }
+
+    # Step 4: BAM index
+    [[ -f results/${sample}.bam.bai ]] || samtools index -@ ${THREADS} results/${sample}.bam
+
+    # Step 5: Variant calling
+    [[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] || \
+        lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+
+    # Step 6: VCF compression + tabix index
+    [[ -f results/${sample}.vcf.gz.tbi ]] || {
+        bgzip -f results/${sample}.vcf
+        tabix -p vcf results/${sample}.vcf.gz
+    }
+done
+
+# Step 7: Collapsed TSV
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | \
+        awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+```
+
+Check constraints:
+- First line shebang? Yes.
+- Second line set -euo pipefail? Yes.
+- Constants THREADS=4 and SAMPLES array? Yes.
+- mkdir -p results? Yes.
+- BWA index guard? Yes.
+- samtools faidx guard? Yes.
+- Per-sample loop for steps 3-6? Yes.
+- RG string uses literal `\t` inside double quotes? Yes: `"-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA""` -> Wait, the plan says: `bwa mem -t 4 -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" data/ref/chrM.fa ...`
+I need to make sure the double quotes are correct. In bash, `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"` works because `\t` is not interpreted by bash in double quotes, it's passed literally to bwa. The plan explicitly says: "Use the literal two characters `\t` (backslash + t) inside the double-quoted string."
+So `-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"` is correct.
+
+Check step 3 guard: `[[ -f results/${sample}.bam ]] || { bwa mem ... | samtools sort ... ; }` -> The plan says wrap in braces. I'll do exactly that.
+Check step 5 guard: `[[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] || lofreq call-parallel ...`
+Check step 6 guard: `[[ -f results/${sample}.vcf.gz.tbi ]] || { bgzip -f results/${sample}.vcf && tabix -p vcf results/${sample}.vcf.gz ; }`
+Check step 7: unconditional, header with printf, loop with bcftools query and awk.
+
+One minor point: `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'` -> The plan says keep inside single quotes. I will do that.
+`awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}'` -> The plan says `awk -v s={sample}` but in bash it should be `-v s=$sample` or `-v s="${sample}"`. I'll use `-v s="$sample"`.
+
+Let's verify the exact wording from the plan for step 3:
+`bwa mem -t 4 -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/{sample}_1.fq.gz data/raw/{sample}_2.fq.gz | samtools sort -@ 4 -o results/{sample}.bam -`
+I will substitute `{sample}` with `${sample}` and `4` with `${THREADS}`.
+
+Wait, the plan says:
+`bwa mem -t 4 -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/{sample}_1.fq.gz data/raw/{sample}_2.fq.gz | samtools sort -@ 4 -o results/{sample}.bam -`
+I'll stick to `${THREADS}` and `${sample}`.
+
+Check step 5: `lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam`
+I'll use `${THREADS}`.
+
+Check step 7: `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz | awk -v s={sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv`
+I'll use `${sample}`.
+
+One detail: `samtools sort -@ ${THREADS} -o results/${sample}.bam -`
+The plan says `samtools sort -@ 4 -o results/{sample}.bam -`. I'll use `${THREADS}`.
+
+Let's assemble carefully.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Step 1: BWA index
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+
+# Step 2: samtools faidx
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+for sample in "${SAMPLES[@]}"; do
+    # Step 3: Alignment + sort
+    [[ -f results/${sample}.bam ]] || {
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+        samtools sort -@ ${THREADS} -o results/${sample}.bam -
+    }
+
+    # Step 4: BAM index
+    [[ -f results/${sample}.bam.bai ]] || samtools index -@ ${THREADS} results/${sample}.bam
+
+    # Step 5: Variant calling
+    [[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] || \
+        lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+
+    # Step 6: VCF compression + tabix index
+    [[ -f results/${sample}.vcf.gz.tbi ]] || {
+        bgzip -f results/${sample}.vcf
+        tabix -p vcf results/${sample}.vcf.gz
+    }
+done
+
+# Step 7: Collapsed TSV
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | \
+        awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+```
+
+Check constraints:
+- "Do not hardcode any path outside the current working directory." -> Checked.
+- "Use only tools listed in TOOL_INVENTORY." -> bwa, samtools, lofreq, bgzip (part of htslib/tabix usually, but tabix is listed, bgzip is standard with it. I'll assume bgzip is available or use `tabix`? Wait, the plan says `bgzip -f results/{sample}.vcf`. I'll stick to `bgzip` as it's standard in htslib and implied by `tabix` inventory. Actually, `bgzip` is usually installed with `htslib`. If not, I could use `gzip -c > ...` but the plan explicitly says `bgzip`. I'll keep `bgzip`.)
+- "Total wall-clock must be under 600 seconds at THREADS=4." -> Not my concern to optimize beyond following plan.
+- "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." -> Checked. No echo used.
+- Idempotency: Steps 1-6 guarded. Step 7 unguarded. Checked.
+- RG string: `"-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA""` -> In bash, double quotes allow variable expansion but pass `\t` literally. This matches the plan's instruction exactly.
+- One minor thing: `samtools sort -@ ${THREADS} -o results/${sample}.bam -` might need `-` at the end to read from stdin. The plan has it.
+- Check `bcftools query` format string: `'%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'` -> matches plan.
+- Check `awk` command: `awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}'` -> matches plan logic.
+- All good.
+
+Wait, should I use `bgzip` or `gzip`? The plan says `bgzip -f results/{sample}.vcf`. I will use `bgzip`. It's standard with htslib/tabix.
+One detail: `samtools index -@ ${THREADS} results/${sample}.bam` -> matches plan.
+Another: `lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam` -> matches plan.
+
+Let's verify the exact text for step 3 guard from plan:
+`[[ -f results/{sample}.bam ]] || { bwa mem ... | samtools sort ... ; }`
+I'll format it exactly as requested.
+
+One thing: `bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ ${THREADS} -o results/${sample}.bam -`
+In bash, `\t` inside double quotes is not interpreted as tab by the shell, it's passed literally to bwa. This is correct per plan.
+
+Check step 7: `printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv` -> matches plan.
+`bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv` -> matches plan.
+
+All steps align with the authoritative plan.
+I will produce the script exactly as drafted.
+No extra text, no markdown fences. Just the raw script.
+Wait, the prompt says "Output ONLY the script — no prose, no markdown fences, no commentary before or after."
+I will output just the bash code.
+
+One minor check: `bgzip` might not be in PATH if only `tabix` is listed, but `bgzip` is part of htslib and usually available. The plan explicitly says `bgzip -f results/{sample}.vcf`. I'll follow it.
+Also, `samtools sort` might complain about `-@` vs `-p` in newer versions, but samtools 1.21 supports `-@`. I'll stick to the plan.
+The plan says `THREADS=4` and uses it. I'll use `${THREADS}` everywhere as requested.
+
+Final check of the script:
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Step 1: BWA index
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+
+# Step 2: samtools faidx
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+for sample in "${SAMPLES[@]}"; do
+    # Step 3: Alignment + sort
+    [[ -f results/${sample}.bam ]] || {
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+        samtools sort -@ ${THREADS} -o results/${sample}.bam -
+    }
+
+    # Step 4: BAM index
+    [[ -f results/${sample}.bam.bai ]] || samtools index -@ ${THREADS} results/${sample}.bam
+
+    # Step 5: Variant calling
+    [[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] || \
+        lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+
+    # Step 6: VCF compression + tabix index
+    [[ -f results/${sample}.vcf.gz.tbi ]] || {
+        bgzip -f results/${sample}.vcf
+        tabix -p vcf results/${sample}.vcf.gz
+    }
+done
+
+# Step 7: Collapsed TSV
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | \
+        awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+```
+
+Looks solid. Matches all constraints and plan exactly. I will output it now.
+One detail: `samtools sort` in 1.21 uses `-@` for threads, which is fine.
+The plan says `bwa mem -t 4 ...`, I used `${THREADS}`. That's fine.
+All good.
+Proceeding. 
+Output matches exactly. No extra text.
+I will make sure there are no markdown fences in the output as requested: "Output ONLY the script — no prose, no markdown fences, no commentary before or after."
+So I will just paste the raw script.
+Done. 
+Let's generate. 
+(Self-Correction/Verification during thought)
+Wait, `bgzip` might not be explicitly listed in TOOL_INVENTORY, but it's standard with htslib/tabix. The plan says to use it. I'll keep it.
+The prompt says "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." -> `printf` is used for header, which is fine.
+All constraints met.
+Output matches request.
+Proceeds. 
+[Output Generation] -> *raw script text*
+Done. 
+(Note: I'll ensure the formatting exactly matches the requested structure without any markdown code blocks as per "no markdown fences".)
+Actually, the prompt says "Output ONLY the script — no prose, no markdown fences, no commentary before or after." So I will literally just output the bash code starting with `#!/usr/bin/env bash`.
+Ready. 
+[Output Generation] -> *Proceeds*

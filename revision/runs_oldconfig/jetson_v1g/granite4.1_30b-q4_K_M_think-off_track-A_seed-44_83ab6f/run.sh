@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+REF=data/ref/chrM.fa
+RAW=data/raw
+OUTDIR=results
+
+mkdir -p "$OUTDIR"
+
+# ---- Reference indexing (once) -------------------------------------------------
+if [[ ! -f "$REF.fai" ]]; then
+    samtools faidx "$REF"
+fi
+if [[ ! -f "$REF.bwt" ]]; then
+    bwa index "$REF"
+fi
+
+# ---- Per-sample processing ------------------------------------------------------
+for SAMPLE in "${SAMPLES[@]}"; do
+    FASTQ1="${RAW}/${SAMPLE}_1.fq.gz"
+    FASTQ2="${RAW}/${SAMPLE}_2.fq.gz"
+    BAM="${OUTDIR}/${SAMPLE}.bam"
+    BAI="${BAM}.bai"
+    VCF="${OUTDIR}/${SAMPLE}.vcf.gz"
+    VTBI="${VCF}.tbi"
+
+    # Skip if final VCF and its index already exist and are newer than inputs
+    if [[ -f "$VTBI" && "$FASTQ1" -ot "$VTBI" && "$FASTQ2" -ot "$VTBI" ]]; then
+        continue
+    fi
+
+    # 3. Alignment with bwa mem (pipe directly to samtools sort)
+    bwa mem -t "$THREADS" \
+        -R "@RG\tID:${SAMPLE}\tSM:${SAMPLE}\tLB:${SAMPLE}\tPL:ILLUMINA" \
+        "$REF" "$FASTQ1" "$FASTQ2" |
+    samtools sort -@ "$THREADS" -o "$BAM"
+
+    # 5. Index BAM
+    if [[ ! -f "$BAI" ]]; then
+        samtools index -@ "$THREADS" "$BAM"
+    fi
+
+    # 6. Variant calling with lofreq call-parallel
+    TMP_VCF="${OUTDIR}/${SAMPLE}.vcf"
+    if [[ ! -f "$VCF" || "$TMP_VCF" -ot "$BAI" ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" --verbose \
+            --ref "$REF" --out "$TMP_VCF" "$BAM"
+        # Compress and index VCF, then clean up intermediate file
+        bgzip -c "$TMP_VCF" > "$VCF"
+        tabix -p vcf "$VCF"
+        rm -f "$TMP_VCF"
+    fi
+done
+
+# ---- Collapse step ---------------------------------------------------------------
+COLLAPSED="${OUTDIR}/collapsed.tsv"
+if [[ ! -f "$COLLAPSED" ]] || [[ "$COLLAPSED" -ot "$(printf '%s.vcf.gz\n' "${SAMPLES[@]}" | xargs -I{} stat -c %Y {} | paste -sd+ - | bc)" ]]; then
+    {
+        echo -e "sample\tchrom\tpos\tref\talt\taf"
+        for SAMPLE in "${SAMPLES[@]}"; do
+            VCF="${OUTDIR}/${SAMPLE}.vcf.gz"
+            bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$VCF" | while read -r chrom pos ref alt af; do
+                echo -e "${SAMPLE}\t${chrom}\t${pos}\t${ref}\t${alt}\t${af}"
+            done
+        done
+    } > "$COLLAPSED"
+fi
+
+# Script ends successfully
+exit 0

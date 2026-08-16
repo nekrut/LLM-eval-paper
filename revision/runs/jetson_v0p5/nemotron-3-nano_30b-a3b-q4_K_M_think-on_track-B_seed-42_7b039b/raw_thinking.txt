@@ -1,0 +1,780 @@
+We need to output a bash script meeting constraints:
+
+- First line: #!/usr/bin/env bash
+- Second line: set -euo pipefail
+- Must be self-contained, idempotent: if results/ exists and files are present, exit 0 without redoing work or erroring.
+- Use only tools listed. No absolute paths outside cwd.
+- Outputs under results/
+- Must process paired-end fastq.gz files in data/raw/, map to chrM.fa (in data/ref/), produce .bam, .bai, .vcf.gz, .tbi, and collapsed.tsv.
+
+We need to design workflow: For each sample pair, run bwa mem (or bwa aln?) with appropriate parameters for amplicon mapping to mitochondrial reference. Use samtools view -bS -o .bam, then sort? Actually .bam may be unsorted; but we need .bai index which can be created via samtools index.
+
+Then variant calling using lofreq? Or maybe use bcftools mpileup + call? The task says final outputs per sample plus collapsed table. Use lofreq for variant calling? Could also use bcftools mpileup and call. But we have lofreq tool available; likely to use lofreq for variant calling on amplicon data.
+
+But we need to produce .vcf.gz and .tbi index. So after lofreq, we can compress with bgzip and index with tabix.
+
+Then collapsed.tsv: combine all variants across samples? The columns sample chrom pos ref alt af. Probably aggregate all variant calls from each sample's VCF into one table, maybe filter for high quality? Use awk to extract fields.
+
+We need to ensure idempotency: if results/ contains the required files, script should exit 0 without redoing work or erroring. So we can check existence of final outputs (maybe collapsed.tsv) and skip processing if all are present. Or check each sample's .vcf.gz.tbi? Let's design: For each sample, we need .bam, .bai, .vcf.gz, .tbi. If all exist for a sample, skip that sample.
+
+Simplify: At script start, ensure results/ exists (mkdir -p). Then iterate over samples list. For each sample, check if results/${sample}.vcf.gz.tbi exists; if so, continue to next sample (skip). That ensures idempotency.
+
+Processing steps per sample:
+
+1. Determine fastq files: ${sample}_1.fq.gz and ${sample}_2.fq.gz in data/raw/.
+
+2. Run bwa mem with reference data/ref/chrM.fa and the two fastq files, output to results/${sample}.bam (or maybe to stdout pipe). Use samtools view -bS -o results/${sample}.bam.
+
+But need .bai index: after creating .bam, run samtools index results/${sample}.bam -> results/${sample}.bam.bai.
+
+3. Variant calling with lofreq: lofreq requires a reference fasta? Actually lofreq uses bcftools mpileup? Wait lofreq is a tool for variant calling from aligned reads; it can be used as "lofreq call" after generating a pileup? Let's recall: lofreq has subcommands: lofreq index, lofreq call, etc. But maybe we can use bcftools mpileup + call to produce VCF, then compress and index.
+
+But the inventory includes lofreq; perhaps they expect using lofreq for variant calling. However lofreq typically requires a BAM file and reference fasta, and outputs VCF. The command: lofreq call -b ${sample}.bam -f chrM.fa -o ${sample}.vcf.gz? Actually lofreq's output is not compressed by default; we can pipe through bgzip.
+
+But to keep it simple, maybe use bcftools mpileup and call directly. That would be more straightforward: bcftools mpileup -f data/ref/chrM.fa -Ou results/${sample}.bam | bcftools call -c -Oz -o results/${sample}.vcf.gz; then tabix -p vcf results/${sample}.vcf.gz.
+
+But the inventory includes bcftools, so we can use that. However they also listed lofreq; maybe they want to use lofreq for variant calling because it's specialized for amplicon data? But not required; we can use any tool from inventory. The plan says recommended sequence: bwa → samtools → lofreq → bcftools → awk (for final collapse). So they expect using lofreq for variant calling, then bcftools maybe for annotation? Actually they said "bcftools" after lofreq; maybe use bcftools to convert lofreq's output? Or use bcftools to filter? But we can just use lofreq to produce VCF, then index with tabix.
+
+But lofreq may require additional steps: lofreq index to create .bam index? Actually lofreq has "lofreq index" to generate a genome-wide index for the BAM. Then "lofreq call" to produce VCF. Let's recall typical usage:
+
+```
+samtools sort -o sample.sorted.bam sample.bam
+samtools index sample.sorted.bam
+lofreq index -b sample.sorted.bam -f reference.fa -o sample.lofreq.index
+lofreq call -b sample.sorted.bam -f reference.fa -t 4 -p 0.01 -O vcf -o sample.vcf.gz
+```
+
+But I'm not entirely sure of the exact flags. However we can approximate.
+
+Given constraints, we need to produce a script that works; but we may not have precise lofreq command syntax. Could use "lofreq call" with appropriate options: -b input.bam -f reference.fa -o output.vcf.gz? Actually lofreq's "call" subcommand expects "-b<bam>" and "-f<ref.fa>", and outputs VCF (maybe not compressed). It also has "--output" option? Let's quickly recall: In lofreq, the command is:
+
+```
+lofreq call -b sample.bam -f reference.fa -o output.vcf.gz
+```
+
+But I think it writes uncompressed VCF; you can pipe to bgzip.
+
+Given we cannot test, but we need to produce a script that likely works with typical commands. Use lofreq call with -b and -f and -o output.vcf.gz (which will be compressed). Then index with tabix: tabix -p vcf output.vcf.gz.
+
+But the inventory includes both bcftools and lofreq; maybe they want to use lofreq for variant calling, then bcftools for annotation? Actually final collapsed.tsv requires sample, chrom, pos, ref, alt, af. That's typical VCF fields: CHROM, POS, REF, ALT, INFO/AF (allele frequency). So we can extract from each sample's VCF and combine.
+
+Thus steps:
+
+- For each sample:
+  - Run bwa mem with reference and fastq files, output to results/${sample}.bam.
+  - Index with samtools index -> .bai.
+  - Run lofreq call: lofreq call -b results/${sample}.bam -f data/ref/chrM.fa -o results/${sample}.vcf.gz (maybe need additional flags like -t ${THREADS}).
+  - Index VCF: tabix -p vcf results/${sample}.vcf.gz -> .tbi.
+
+- After all samples processed, create collapsed.tsv by merging all VCFs. Use awk to extract fields and produce header.
+
+We can use "zcat" on each vcf.gz to get lines, filter for biallelic variants? Not required. Just extract CHROM POS REF ALT AF from INFO field. Use "cut -f1,2,4,5,8" maybe? Actually VCF format: fields: CHROM, POS, ID, REF, ALT, QUAL, FILTER, INFO, FORMAT, sample data. The allele frequency is in INFO/AF or in FORMAT/AD? Usually AF is in INFO. So we can extract using "awk -F'\t' '{print $1"\t"$2"\t"$4"\t"$5"\t$8}'". But need to parse INFO field for AF= value. Simpler: use "bcftools query -f '%CHROM\t%POS0\t%REF\t%ALT[\t%AF]\n'" maybe? Actually bcftools query can output custom fields. But we only have awk; we can extract using "cut -f1,2,4,5,8" and then parse AF from INFO field (field 8). Could use "awk -F'\t' '{split($8,a,/AF=|;); split(a[2],b,;/); print $1"\t"$2"\t"$4"\t"$5"\t"b[2]}'". That's messy.
+
+Simplify: Use bcftools query to output tab-separated fields with AF. For each VCF file, we can do:
+
+```
+bcftools query -f '%CHROM\t%POS0\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz | awk -v sample=${sample} '{print sample"\t"$1"\t"$2"\t$3"\t$4"\t"$5}' >> results/collapsed_raw.tsv
+```
+
+But we need to produce collapsed.tsv with header and all samples. We can combine using a loop.
+
+But we only have awk, not bcftools query? Actually bcftools is available, so we can use it. Use "bcftools query -f '%CHROM\t%POS0\t%REF\t%ALT[\t%AF]\n'" which outputs fields separated by tabs? The format string uses printf-like syntax; we can embed tabs.
+
+But the final collapsed.tsv must have columns: sample  chrom  pos  ref  alt  af. So we need to output each variant per sample with its allele frequency.
+
+Thus after processing all samples, we can create collapsed.tsv by concatenating per-sample lines and adding header.
+
+Implementation plan:
+
+- At script start:
+  - set -euo pipefail
+  - mkdir -p results
+  - Define list of samples (maybe from data/raw/*_1.fq.gz). Use a loop to discover sample base names: for f in data/raw/*_1.fq.gz; do sample=$(basename "$f" | sed 's/_1.fq.gz//'); done.
+
+- For each sample, check if results/${sample}.vcf.gz.tbi exists; if so, continue.
+
+- Then run steps:
+
+  - bwa mem -t ${THREADS:-4} data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools view -bS -o results/${sample}.bam
+  - samtools index results/${sample}.bam   # creates .bai
+
+  - lofreq call -b results/${sample}.bam -f data/ref/chrM.fa -t ${THREADS:-4} -O vcf.gz -o results/${sample}.vcf.gz? Actually need correct flag. Let's check typical usage: "lofreq call -b sample.bam -f reference.fa -o output.vcf". According to docs, "-O" is for output format? Not sure.
+
+But maybe we can use bcftools mpileup + call instead of lofreq. However the plan says lofreq then bcftools; but maybe they want to use lofreq for variant calling and then bcftools for filtering? Actually they said "bcftools" after lofreq, maybe to convert lofreq's output? Not sure.
+
+Given we have both tools, we could skip lofreq and just use bcftools mpileup+call. But the plan suggests using lofreq; but not mandatory? The instruction: "Design and implement the workflow yourself, using only the tools above." So we can choose any sequence as long as final outputs are produced. Using bcftools directly may be simpler.
+
+But they also listed SnpSift, snpEff, fastqc, seqkit, etc., but not required.
+
+Thus we could do:
+
+- Use bwa mem to produce sorted? Actually we can pipe directly to samtools view -bS -o results/${sample}.bam.
+
+- Then index.
+
+- Then variant calling with bcftools mpileup and call:
+
+```
+bcftools mpileup -f data/ref/chrM.fa -Ou results/${sample}.bam | \
+bcftools call -c -Oz -o results/${sample}.vcf.gz
+tabix -p vcf results/${sample}.vcf.gz
+```
+
+This produces .vcf.gz and .tbi.
+
+But the plan mentions lofreq; maybe they expect using lofreq for variant calling because it's more appropriate for amplicon data. However we can still use bcftools; but to be safe, maybe incorporate lofreq as per plan: after bam, run lofreq call to produce VCF.
+
+Let's search memory: lofreq command usage:
+
+```
+lofreq index -b sample.bam -f reference.fa -o sample.lofreq.index
+lofreq call -b sample.bam -f reference.fa -t 4 -p 0.01 -O vcf.gz -o output.vcf.gz
+```
+
+But I'm not certain about flags. Actually "lofreq call" has options: "-b<bam>", "-f<ref.fa>", "-t<threads>", "-p<p-value>", "-s<sample-name>", "-O<output-format>"? The output can be VCF or GVCF.
+
+Given uncertainty, maybe better to avoid lofreq and use bcftools directly; but the plan says "bwa → samtools → lofreq → bcftools → awk". Could interpret that after lofreq we may need bcftools for filtering? Actually lofreq's output is VCF; maybe they want to use bcftools to compress and index? But we already have tabix.
+
+But the plan might be just a suggestion, not strict requirement. So we can implement using bcftools mpileup+call directly, which uses bcftools (which is in inventory). That would satisfy "using only tools listed". It doesn't require lofreq; but they mentioned lofreq as part of recommended sequence; maybe they expect to use it. However not mandatory.
+
+But the instruction: "Design and implement the workflow yourself, using only the tools above." So we can choose any subset. Using bcftools directly is okay.
+
+Thus final script will:
+
+- For each sample:
+  - If results/${sample}.vcf.gz.tbi exists, skip.
+  - Run bwa mem (with -t ${THREADS:-4}) to produce .bam.
+  - Index with samtools index.
+  - Variant calling: bcftools mpileup -f data/ref/chrM.fa -Ou results/${sample}.bam | bcftools call -c -Oz -o results/${sample}.vcf.gz
+  - Index VCF: tabix -p vcf results/${sample}.vcf.gz
+
+- After all samples processed, create collapsed.tsv:
+
+  - Ensure file exists; if exists, skip? But we need idempotent; if collapsed.tsv already exists, maybe just exit 0? Or regenerate? The requirement: "Be idempotent: rerunning on a populated results/ directory must exit 0 without redoing work or erroring." So if all outputs exist (including collapsed.tsv), script should exit 0. So we can check at start: if results/collapsed.tsv exists, then maybe just exit 0? But need to ensure that all per-sample files also exist; but if collapsed.tsv exists but some sample missing, script would think it's done and exit, leaving incomplete outputs. Better to check for each sample's .vcf.gz.tbi existence; if all present, then proceed to create collapsed.tsv (or if already exists, skip). Simpler: At start, if results/collapsed.tsv exists, then we can just exit 0 (assuming previous run completed). But if script is re-run after partial progress, it may think done incorrectly. Safer: Check for each sample's .vcf.gz.tbi; if all present, then proceed to create collapsed.tsv (or if collapsed.tsv already exists, skip creation). That ensures idempotent.
+
+Implementation details:
+
+- Determine THREADS variable: maybe use environment variable or default 4. Use THREADS=${THREADS:-4}.
+
+- In bwa mem command, use -t $THREADS.
+
+- In lofreq (if used) also need -t.
+
+- For bcftools mpileup, we may want to set --threads? Not needed.
+
+- Ensure that we use proper output naming: results/${sample}.bam, .bai, .vcf.gz, .tbi.
+
+- After processing all samples, create collapsed.tsv:
+
+  - If results/collapsed.tsv exists, skip creation; else generate.
+
+  - Use a temporary file to collect lines.
+
+  - For each sample, use bcftools query to extract fields with AF and format as tab-separated: sample\tchrom\tpos\tref\talt\taf
+
+    Example command:
+
+```
+bcftools query -f '%CHROM\t%POS0\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz | \
+awk -v s=${sample} '{print s"\t"$1"\t"$2"\t"$3"\t"$4"\t"$5}' >> results/collapsed_raw.tsv
+```
+
+But need to ensure that AF field is present; if not, maybe use "INFO/AF". The format string '%CHROM\t%POS0\t%REF\t%ALT[\t%AF]\n' will output fields separated by tabs? Actually %CHROM prints chromosome, %POS0 prints position (0-based?), but we need 1-based pos. Use %POS. But we can just use %CHROM\t%POS\t%REF\t%ALT[\t%AF]\n. However bcftools query format uses printf style; we can embed literal tabs with \t? Actually in format string, you need to escape tabs as \t? I think you can include literal tab characters by writing $'\t' in bash, but within single quotes it's not interpreted. Simpler: use cut and awk to parse.
+
+Alternative: Use "bcftools query -f '%CHROM\t%POS0\t%REF\t%ALT[\t%AF]\n'" maybe works; but we can just use "bcftools query -f '%CHROM\t%POS0\t%REF\t%ALT[\t%AF]\n'". However I'm not fully sure.
+
+Simplify: Use "bcftools query -f '%CHROM\t%POS0\t%REF\t%ALT[\t%AF]\n'" but we can also use "bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n'". The %POS0 is 0-based; we want 1-based. Use %POS.
+
+Thus command:
+
+```
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz | \
+awk -v s=${sample} '{print s"\t"$1"\t"$2"\t"$3"\t"$4"\t"$5}' >> results/collapsed.tsv
+```
+
+But need to ensure that the output includes header. We'll add header after all samples processed.
+
+Implementation steps for collapsed.tsv:
+
+- If results/collapsed.tsv does not exist, create it with header: "sample	chrom	pos	ref	alt	af"
+
+- Then for each sample, append lines as above.
+
+But we need to ensure that we don't duplicate if script rerun; we can check if collapsed.tsv exists and has header; if so, skip appending? But idempotent requirement says re-running on populated results/ must exit 0 without redoing work or erroring. So if collapsed.tsv already exists (with header), we can just exit 0 after checking sample files exist? Actually we need to ensure that if all per-sample outputs are present, script should complete successfully (exit 0). It doesn't necessarily need to skip creation of collapsed.tsv; but it must not error. So we can safely recreate collapsed.tsv each time; but that would redo work if already done, which violates idempotent? The requirement: "Be idempotent: rerunning on a populated results/ directory must exit 0 without redoing work or erroring." That suggests that if all outputs are already present, the script should detect and exit early (i.e., not re-run steps). It can still recreate collapsed.tsv but that would be considered redoing work? Possibly not; but to be safe, we can check if collapsed.tsv exists and is non-empty; if so, skip processing entirely (including variant calling) and just exit 0. But then if some sample missing, script would think done incorrectly. So better to check per-sample .vcf.gz.tbi existence; if all present, then proceed to create collapsed.tsv (or if already exists, skip). That ensures we only process missing samples.
+
+Thus algorithm:
+
+- Ensure results/ exists.
+
+- Get list of samples from fastq files: for each *_1.fq.gz, extract sample base name.
+
+- For each sample:
+  - If results/${sample}.vcf.gz.tbi exists, continue.
+  - Else perform mapping and variant calling steps.
+
+- After loop, if any sample was processed (i.e., we performed any step), then create collapsed.tsv (or update). But we can just always generate collapsed.tsv from scratch each run; but that would redo work if already done. To avoid redoing work, we can check if collapsed.tsv exists and is up-to-date (maybe compare timestamps?). Simpler: Always regenerate collapsed.tsv after processing all samples; but if script is rerun when results/ already has all files, the per-sample steps will be skipped, but we still need to generate collapsed.tsv. If collapsed.tsv already exists, we could skip generating it; but that would be extra check.
+
+Simplify: At start, if results/collapsed.tsv exists and all sample .vcf.gz.tbi exist, then exit 0 (i.e., nothing to do). But we need to verify all sample .vcf.gz.tbi exist. So we can compute list of samples; if for all samples the .vcf.gz.tbi exists, then we can check if collapsed.tsv exists; if yes, exit 0; else create it? But creating it would be considered redoing work? Not necessarily; but it's okay as long as script exits 0. The requirement is that rerunning on a populated results/ directory must exit 0 without redoing work or erroring. If we still generate collapsed.tsv (maybe overwriting), that's redoing work (writing file). That might be considered redoing work. So better to not rewrite if already exists.
+
+Thus we can check: if results/collapsed.tsv exists, then exit 0 (assuming previous run completed). But what if some sample missing? Then script would think done incorrectly and exit early leaving incomplete outputs. So we need to ensure that we only exit early when all required files are present. That includes collapsed.tsv as well. So we can check: if results/collapsed.tsv exists, then we assume everything is done; exit 0. But if some sample missing but collapsed.tsv still exists (maybe from previous incomplete run), that would be false positive. However collapsed.tsv generation requires all samples; if any sample missing, it wouldn't have been generated. So if collapsed.tsv exists, likely all samples were processed. So we can safely exit 0.
+
+Thus idempotent check: At script start:
+
+- If results/collapsed.tsv exists, then exit 0 (since all per-sample outputs must also exist for collapsed.tsv to be created). But we need to ensure that if some sample missing but collapsed.tsv still exists from previous run? That would be inconsistent; but maybe not happen.
+
+Thus we can implement:
+
+```
+if [[ -f results/collapsed.tsv ]]; then
+    exit 0
+fi
+```
+
+But need to ensure that script doesn't error if file is a directory? It's a file. So okay.
+
+However, what if collapsed.tsv exists but some sample outputs missing? That would be a bug; but we assume previous run completed successfully.
+
+Thus idempotent: If results/collapsed.tsv exists, exit 0; else proceed.
+
+Now implement processing:
+
+- Determine samples list: Use globbing to find data/raw/*_1.fq.gz; for each file, sample=$(basename "$f" | sed 's/_1.fq.gz//'); add to array.
+
+- Loop over samples.
+
+- For each sample, if results/${sample}.vcf.gz.tbi exists, continue; else process.
+
+Processing steps:
+
+```
+# Map
+bwa mem -t $THREADS data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+samtools view -bS -o results/${sample}.bam
+
+# Index
+samtools index results/${sample}.bam
+
+# Variant calling with bcftools mpileup + call
+bcftools mpileup -f data/ref/chrM.fa -Ou results/${sample}.bam | \
+bcftools call -c -Oz -o results/${sample}.vcf.gz
+
+# Index VCF
+tabix -p vcf results/${sample}.vcf.gz
+```
+
+But need to ensure that bcftools mpileup uses -Ou for output to stdout? Actually -Ou writes uncompressed VCF to stdout; but we are piping to call which expects input from stdin? The typical command is:
+
+```
+bcftools mpileup -f ref.fa -Ou sample.bam | bcftools call -c -Oz -o out.vcf.gz
+```
+
+Yes, that works.
+
+Now after all samples processed, generate collapsed.tsv:
+
+- Create file with header.
+
+- For each sample, extract fields using bcftools query and format.
+
+But we need to ensure that we only process samples that have been processed (i.e., those for which .vcf.gz.tbi exists). We can collect them into an array.
+
+Simplify: After processing all samples, we can generate collapsed.tsv by iterating over the same sample list but only those with .vcf.gz.tbi existing. Use a loop to append lines.
+
+Implementation:
+
+```
+{
+    echo -e "sample\tchrom\tpos\tref\talt\taf"
+    for sample in "${samples[@]}"; do
+        if [[ -f results/${sample}.vcf.gz.tbi ]]; then
+            bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz |
+            awk -v s="${sample}" '{print s"\t"$1"\t"$2"\t"$3"\t"$4"\t"$5}' 
+        fi
+    done
+} > results/collapsed.tsv
+```
+
+But we need to ensure that the output is tab-separated. The bcftools query format string uses literal tabs? Actually we can embed "\t" in single quotes? In bash, within single quotes, \t is not interpreted; it's just backslash t characters. So we need to use $'\t' or use actual tab character. Simpler: Use printf with literal tab: $'\t'. But inside single quotes, $'' is not expanded. So we can use:
+
+```
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' ...
+```
+
+But that will output literal "\t" characters? Actually the format string is interpreted by bcftools; it treats \t as a tab character. So it's okay.
+
+Thus we can use:
+
+```
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz
+```
+
+This will output fields separated by tabs, ending with AF field also separated by tab? Actually the format includes a literal tab before AF and then the value; but we want to capture AF as separate column. The format string ends with '\n', so after AF there is newline. So the output lines will be like:
+
+```
+chrM    100     A       G    AF=0.12
+```
+
+But we need to extract AF value only, not the whole "AF=0.12". We can use awk to split on "AF=" and ";" etc.
+
+Simplify: Use bcftools query with format string that outputs just the fields we want, without extra text. For example:
+
+```
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz
+```
+
+This will output something like:
+
+```
+chrM    100     A       G    0.12
+```
+
+But I'm not sure if it outputs the AF value directly or "AF=0.12". Actually the placeholder %AF prints the allele frequency; but we used %ALT[\t%AF] which includes a tab and then the AF field? The syntax: %ALT[...]; inside brackets you can specify subfields? I think you can use %INFO/AF? Not sure.
+
+Better to use bcftools query with custom format: -f '%CHROM\t%POS0\t%REF\t%ALT[\t%AF]\n' maybe outputs "CHROM POS REF ALT AF". Actually the placeholder %AF prints the allele frequency value. So we can use:
+
+```
+bcftools query -f '%CHROM\t%POS0\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz
+```
+
+But I'm not fully certain.
+
+Alternative: Use "bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n'" and then use cut to get fields. But we can just parse with awk: after splitting by tab, the last field will be something like "AF=0.12". We can extract numeric part.
+
+Simplify: Use "bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n'" and then use awk to extract AF value:
+
+```
+awk -v s="${sample}" '{split($5,a,/=/); split(a[2],b,/;/); print s"\t"$1"\t"$2"\t"$3"\t"$4"\t"b[1]}
+```
+
+But that's messy.
+
+Maybe easier: Use "bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n'" and then use cut -f5 to get AF value? Actually the fields are separated by tabs; the 5th field will be "AF=0.12". We can extract numeric part using awk.
+
+But we can also use "bcftools query -i '%CHROM==\"chrM\"' -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n'"? Not needed.
+
+Given complexity, maybe simpler: Use "bcftools view -h" to get header and then extract AF? But we can just use "bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n'" and then use awk to split on '=' and ';' to get numeric.
+
+But maybe we can avoid extracting AF; we could just output the raw INFO field? The requirement: column af must be allele frequency. Could be the value from INFO/AF. So we need to extract that numeric value.
+
+Simplify: Use "bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n'" and then use awk:
+
+```
+awk -v s="${sample}" '
+{
+    split($5, a, /=/);
+    split(a[2], b, /;/);
+    af = b[1];
+    print s"\t"$1"\t"$2"\t"$3"\t"$4"\t"af
+}'
+```
+
+But $5 is the field containing "AF=0.12". Actually the format string includes a tab before AF and then the value; but there may be other tabs? Let's assume fields are separated by tabs, so $5 is the AF value with prefix "AF=". So we can extract numeric part.
+
+Thus final per-sample line generation:
+
+```
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz |
+awk -v s="${sample}" '
+{
+    split($5, a, /=/);
+    split(a[2], b, /;/);
+    af = b[1];
+    print s"\t"$1"\t"$2"\t"$3"\t"$4"\t"af
+}'
+```
+
+But we need to ensure that $1..$4 correspond to CHROM, POS, REF, ALT? Actually the format string includes %CHROM\t%POS\t%REF\t%ALT[\t%AF]\n. So after splitting by tab, we have:
+
+- Field1: CHROM
+- Field2: POS
+- Field3: REF
+- Field4: ALT
+- Field5: AF=...
+
+Thus $1..$4 are as needed; $5 is AF field.
+
+Thus we can use $1..$4 directly.
+
+Thus awk line:
+
+```
+print s"\t"$1"\t"$2"\t"$3"\t"$4"\t"af
+```
+
+But we need to output tab-separated columns: sample, chrom, pos, ref, alt, af. So we need to print sample (s), then $1, $2, $3, $4, then af.
+
+Thus final awk command:
+
+```
+awk -v s="${sample}" '
+{
+    split($5, a, /=/);
+    split(a[2], b, /;/);
+    af = b[1];
+    print s"\t"$1"\t"$2"\t"$3"\t"$4"\t"af
+}'
+```
+
+Now we need to append these lines to collapsed.tsv.
+
+Thus final script steps:
+
+- At start: set -euo pipefail; #!/usr/bin/env bash
+
+- Ensure results/ exists: mkdir -p results
+
+- If results/collapsed.tsv exists, exit 0
+
+- Determine samples list: Use a loop to find all *_1.fq.gz files and extract sample base name.
+
+- For each sample, if results/${sample}.vcf.gz.tbi exists, continue; else process.
+
+Processing per sample:
+
+```
+# Map
+bwa mem -t $THREADS data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+samtools view -bS -o results/${sample}.bam
+
+# Index
+samtools index results/${sample}.bam
+
+# Variant calling
+bcftools mpileup -f data/ref/chrM.fa -Ou results/${sample}.bam | \
+bcftools call -c -Oz -o results/${sample}.vcf.gz
+
+# Index VCF
+tabix -p vcf results/${sample}.vcf.gz
+```
+
+- After loop, generate collapsed.tsv:
+
+```
+{
+    echo -e "sample\tchrom\tpos\tref\talt\taf"
+    for sample in "${samples[@]}"; do
+        if [[ -f results/${sample}.vcf.gz.tbi ]]; then
+            bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz |
+            awk -v s="${sample}" '
+            {
+                split($5, a, /=/);
+                split(a[2], b, /;/);
+                af = b[1];
+                print s"\t"$1"\t"$2"\t"$3"\t"$4"\t"af
+            }'
+        fi
+    done
+} > results/collapsed.tsv
+```
+
+But we need to ensure that the awk script is correctly quoted; we can embed within single quotes, but need to escape double quotes? Actually we are using single quotes around the whole awk program; inside we have double quotes for variables? We use single quotes for the whole awk script, but we need to include double quotes around $5 etc. Inside single quotes, double quotes are literal, not variable expansion. However we are using double quotes inside the awk script for string literals; that's fine as long as they are within single quotes. But we also need to embed variables like s="${sample}" which is set in bash before calling awk; we can pass it via -v s="${sample}". That's okay.
+
+But we need to ensure that the awk script uses $1, $2 etc. Those refer to fields from input. That's fine.
+
+Now we need to ensure that the script uses only tools listed: bwa, samtools, bcftools, tabix, awk (which is part of gawk? but awk is likely available). The inventory includes "shellcheck", "java", but not awk; but typical Linux has awk. It's not listed but probably present. However they didn't list awk explicitly; but it's a standard tool, likely allowed. They said only tools listed in TOOL_INVENTORY; but awk is not listed. However they may consider awk part of the system, but not listed. The instruction: "Use only tools listed in TOOL_INVENTORY." So we cannot use awk if not listed. But they didn't list awk; however they listed "shellcheck", "java". They didn't list "awk". So we must avoid using awk? Actually they didn't list awk, but they listed "seqkit", "snakemake", etc. They didn't mention "awk". However many pipelines rely on awk; maybe it's considered part of the environment (likely present). But to be safe, we should avoid invoking awk explicitly if not in inventory. However they didn't forbid using standard Unix utilities like cut, grep, sed, awk? The instruction says "Use only tools listed in TOOL_INVENTORY." That suggests we cannot use any tool not listed. So we must restrict to the given list: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. No awk, cut, grep, sed, etc.
+
+Thus we cannot use awk for parsing; we need to produce collapsed.tsv using only listed tools. That's challenging.
+
+But maybe they consider awk part of the standard environment and not restricted. However the instruction is strict: "Use only tools listed in TOOL_INVENTORY." So we must not invoke any tool not listed. Let's check the inventory again:
+
+TOOL_INVENTORY (linux-aarch64, conda env 'bench')
+=================================================
+  bwa          Version: 0.7.18-  [ok]
+  samtools     samtools 1.21  [ok]
+  bcftools     bcftools 1.21  [ok]
+  tabix        tabix (htslib) 1.21  [ok]
+  lofreq       version: 2.1.5  [ok]
+  SnpSift      SnpSift version 5.2  [ok]
+  snpEff       SnpEff	5.2	2023-09-29  [ok]
+  fastqc       FastQC v0.12.1  [ok]
+  seqkit       seqkit v2.8.2  [ok]
+  snakemake    8.20.7  [ok]
+  shellcheck   version: 0.10.0  [ok]
+  java         openjdk version "21.0.9-internal" 2025-10-21  [ok]
+
+Thus awk is not listed. So we cannot use awk. We must produce collapsed.tsv using only the listed tools. That means we need to extract fields and format using maybe bcftools query with custom format that directly outputs tab-separated fields including AF numeric value, without needing extra processing.
+
+We can use "bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n'" which outputs fields separated by tabs, and the AF field is just the numeric value? Actually %AF prints the allele frequency value (like 0.12). So we can use that directly.
+
+Thus we can produce a line like:
+
+```
+sample	chrom	pos	ref	alt	af
+```
+
+But we need to include sample column as first field. We can prepend sample name manually using echo or paste.
+
+We can generate per-sample lines using "bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n'" and then use "paste" to combine with sample name? But paste is not listed. However we can use "printf" builtin of bash to format lines, which doesn't require external tool. That's allowed (builtin). So we can generate the line using bash variable substitution.
+
+Thus we can avoid awk by using bash to parse the AF value and output tab-separated fields.
+
+But parsing the AF field from the VCF query output may still need some text processing; we can use parameter expansion or sed? Those are builtins, not external tools. Using Bash's built-in string manipulation is okay (no external command). So we can read the line into a variable and parse.
+
+Simplify: Use "bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n'" to output something like:
+
+```
+chrM    100     A       G    0.12
+```
+
+But we need to capture each field separately. We can read into an array using IFS= read -r line; then split by tabs using read -r -d $'\t' fields? Bash's read can split on delimiter using IFS and read -r -d ''? Actually we can use while IFS=$'\t' read -r chrom pos ref alt af; but that uses builtin IFS and read, which is okay.
+
+Thus we can process each line in a while loop without external tools.
+
+But we need to produce collapsed.tsv with header and lines. We can do:
+
+```
+{
+    printf "sample\tchrom\tpos\tref\talt\taf\n"
+    for sample in "${samples[@]}"; do
+        if [[ -f results/${sample}.vcf.gz.tbi ]]; then
+            while IFS=$'\t' read -r chrom pos ref alt af; do
+                printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sample" "$chrom" "$pos" "$ref" "$alt" "$af"
+            done<<(bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz)
+        fi
+    done
+} > results/collapsed.tsv
+```
+
+This uses only bash builtins and bcftools, tabix, etc. No external awk.
+
+But we need to ensure that the while loop reads correctly; the input may have trailing newline; it's fine.
+
+Now we must ensure that we don't use any external command like paste, cut, etc. Using printf is a bash builtin; okay.
+
+Thus final script will rely on bash builtins for parsing and formatting.
+
+Now we need to incorporate lofreq? The plan suggested using lofreq then bcftools; but we are not using lofreq. However the instruction didn't require using all tools, just only those listed. Using only bwa, samtools, bcftools, tabix is okay. But maybe they expect to use lofreq for variant calling; but it's not mandatory. However to be safe, maybe we should incorporate lofreq as per recommended sequence: after mapping, run lofreq call to produce VCF, then index with tabix. That would use lofreq (which is listed). Let's do that.
+
+Thus steps:
+
+- After indexing BAM, run lofreq call:
+
+```
+lofreq call -b results/${sample}.bam -f data/ref/chrM.fa -t $THREADS -O vcf.gz -o results/${sample}.vcf.gz
+```
+
+But need to verify flags. Let's check typical usage: According to lofreq documentation, the command is:
+
+```
+lofreq call -b<bam> -f<ref.fa> -t<threads> -p<p-value> -s<sample-id> -O vcf.gz -o output.vcf.gz
+```
+
+But I'm not sure about -O and -o options. Actually lofreq's "call" subcommand has options: "-b<bam>", "-f<ref.fa>", "-t<threads>", "-p<p-value>", "-s<sample-id>", "-O<output-format>"? The output can be VCF or GVCF; you specify "-o<out.vcf.gz>". I think the flag is "-o". Let's assume:
+
+```
+lofreq call -b results/${sample}.bam -f data/ref/chrM.fa -t $THREADS -o results/${sample}.vcf.gz
+```
+
+But we need to verify that lofreq produces VCF (maybe not compressed). Actually lofreq can output VCF directly; but I think it outputs uncompressed VCF. To compress, we can pipe to bgzip? But maybe -o automatically compresses? Not sure.
+
+Given uncertainty, perhaps better to stick with bcftools mpileup+call which is more reliable.
+
+But the plan says "bwa → samtools → lofreq → bcftools → awk". Maybe they intend to use lofreq for variant calling and then bcftools for annotation (like SnpSift or snpEff). But we don't need annotation; we just need collapsed.tsv. So maybe they want to use bcftools to filter or combine? Actually they might want to use bcftools to merge VCFs? But final collapsed.tsv is a simple table; we can generate directly from VCF using bcftools query.
+
+Thus we could incorporate lofreq for variant calling, then use bcftools view to extract fields? But we still need to parse AF.
+
+But maybe they want to use SnpSift or snpEff for annotation, but not required.
+
+Given the constraints, I think it's acceptable to use bcftools mpileup+call directly; it's simpler and uses only listed tools. The plan is just a suggestion; we can deviate as long as we produce correct outputs.
+
+Thus final script will not use lofreq; but that might be considered not following recommended sequence? The instruction: "Design and implement the workflow yourself, using only the tools above." It doesn't require to follow the suggested sequence. So it's okay.
+
+Now ensure idempotency: At start, check if results/collapsed.tsv exists; if yes, exit 0. That ensures no redoing work.
+
+But we also need to ensure that if results/ already contains some files but not all, script will process missing ones and then generate collapsed.tsv (overwrites existing? It will overwrite collapsed.tsv). Overwriting may be considered redoing work? But it's okay because we are generating final output; but if collapsed.tsv already existed from previous run, overwriting it is redoing work. However the idempotent requirement says "rerunning on a populated results/ directory must exit 0 without redoing work or erroring." If results/ is populated (i.e., all required files are present), script should exit 0 without doing any work. So we need to check if results/collapsed.tsv exists; if yes, exit 0. That ensures we only run when not populated.
+
+Thus final script:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Exit early if all outputs already exist
+if [[ -f results/collapsed.tsv ]]; then
+    exit 0
+fi
+
+mkdir -p results
+
+# Determine sample list from fastq files
+samples=()
+for f in data/raw/*_1.fq.gz; do
+    # Remove path and suffix _1.fq.gz
+    sample=$(basename "$f")
+    sample=${sample%_1.fq.gz}
+    samples+=("$sample")
+done
+
+THREADS=${THREADS:-4}
+
+# Process each sample
+for sample in "${samples[@]}"; do
+    # Check if final VCF index exists; if so, skip
+    if [[ -f results/${sample}.vcf.gz.tbi ]]; then
+        continue
+    fi
+
+    # Mapping
+    bwa mem -t "$THREADS" data/ref/chrM.fa \
+        data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz |
+    samtools view -bS -o results/${sample}.bam
+
+    # Index BAM
+    samtools index results/${sample}.bam
+
+    # Variant calling with bcftools mpileup + call
+    bcftools mpileup -f data/ref/chrM.fa -Ou results/${sample}.bam |
+    bcftools call -c -Oz -o results/${sample}.vcf.gz
+
+    # Index VCF
+    tabix -p vcf results/${sample}.vcf.gz
+done
+
+# Generate collapsed.tsv
+{
+    printf "sample\tchrom\tpos\tref\talt\taf\n"
+    for sample in "${samples[@]}"; do
+        if [[ -f results/${sample}.vcf.gz.tbi ]]; then
+            # Extract CHROM POS REF ALT AF from VCF using bcftools query
+            while IFS=$'\t' read -r chrom pos ref alt af; do
+                printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sample" "$chrom" "$pos" "$ref" "$alt" "$af"
+            done<<(bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz)
+        fi
+    done
+} > results/collapsed.tsv
+```
+
+But we need to ensure that the while loop reads correctly; the input may have trailing newline; it's fine.
+
+Potential issues:
+
+- bcftools query output may include header lines starting with #; those will be read as first line? Actually bcftools query does not output header lines unless you request them. The format string we used does not include meta-information, so it should output only data lines, no headers. So fine.
+
+- The while loop reads fields separated by tabs; but the input may have spaces? No, VCF fields are tab-separated, so reading with IFS=$'\t' will split correctly.
+
+- The af field may contain "AF=0.12" or just numeric? Using %AF placeholder prints the allele frequency value (like 0.12). So it should be numeric without prefix. Good.
+
+- However the format string includes %ALT[\t%AF]; this may output ALT field then a tab then AF value; but we also have separate fields for REF and ALT earlier. Actually the format string we used: '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n'. This will output CHROM, POS, REF, ALT, then a tab, then AF value? Actually the syntax %ALT[...] includes a subfield list; I think it outputs the ALT field, then a literal tab, then the AF field? Not sure. But we are reading five fields: chrom, pos, ref, alt, af. That matches expectation.
+
+But need to ensure that the format string yields exactly 5 tab-separated fields. Let's test mentally: %CHROM prints chromosome name; then \t inserts a tab; %POS prints position; then \t; %REF prints reference allele; then \t; %ALT[...] prints ALT field, then inside brackets we have \t which is a literal tab, then %AF prints allele frequency; then \n newline. So the output line will be:
+
+CHROM<TAB>POS<TAB>REF<TAB>ALT<TAB>AF\n
+
+Thus five fields separated by tabs, as desired.
+
+Thus our while loop reading 5 fields works.
+
+Now ensure that we use only tools listed: bwa, samtools, bcftools, tabix are listed. Yes. We also use printf and bash builtins, which is fine.
+
+We didn't use lofreq; but it's okay.
+
+Now ensure script uses only relative paths: data/ref/chrM.fa, data/raw/... etc. Yes.
+
+Ensure outputs under results/: yes.
+
+Idempotent: If results/collapsed.tsv exists, exit 0. That ensures no redoing work.
+
+Potential edge case: If results/collapsed.tsv exists but some sample missing, script would exit early leaving incomplete outputs; but that scenario shouldn't happen because collapsed.tsv is only created after all samples processed successfully. So it's safe.
+
+Now ensure that the script does not produce any extra output to stdout/stderr beyond natural tool output. We use printf and echo? We used printf which writes to stdout; that's okay as part of script's normal output; but they said "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." Using printf to create a file is writing to stdout, which would go to results/collapsed.tsv via redirection; that's fine. The script itself may emit nothing else.
+
+But we used "printf \"sample\\tchrom...\" > results/collapsed.tsv". That writes to stdout and redirects; that's okay.
+
+We also used "if [[ -f results/collapsed.tsv ]]; then exit 0; fi". That's fine.
+
+Now ensure that the script is self-contained: It includes shebang, set -euo pipefail, uses only relative paths, creates results/, processes samples, writes outputs. Yes.
+
+Now final check: The first line must be "#!/usr/bin/env bash". Second line "set -euo pipefail". So we need to put those exactly as first two lines.
+
+Thus final script:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+# (rest of script)
+```
+
+But the instruction says "Output ONLY the script — no prose, no markdown fences, no commentary before or after." So we must output just the script content, starting with those two lines. No extra comments? They didn't forbid comments, but they said no prose, no markdown fences. Comments are okay as part of script? Probably fine, but they might consider comments as prose? Safer to avoid comments to keep it minimal. But we can include minimal comments? The instruction says "no prose". Comments are not prose? Might be considered commentary; better to omit comments entirely.
+
+Thus output just the script without any extra text. So we need to output exactly the script lines, starting with shebang and set -euo pipefail, then the rest of the script (without comments). Let's produce the script without comments.
+
+But we need to ensure that the script is self-contained; we can include minimal necessary commands.
+
+Thus final script:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p results
+samples=()
+for f in data/raw/*_1.fq.gz; do
+    sample=$(basename "$f")
+    sample=${sample%_1.fq.gz}
+    samples+=("$sample")
+done
+THREADS=${THREADS:-4}
+for sample in "${samples[@]}"; do
+    if [[ -f results/${sample}.vcf.gz.tbi ]]; then continue; fi
+    bwa mem -t "$THREADS" data/ref/chrM.fa \
+        data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz |
+    samtools view -bS -o results/${sample}.bam
+    samtools index results/${sample}.bam
+    bcftools mpileup -f data/ref/chrM.fa -Ou results/${sample}.bam |
+    bcftools call -c -Oz -o results/${sample}.vcf.gz
+    tabix -p vcf results/${sample}.vcf.gz
+done
+{
+    printf "sample\tchrom\tpos\tref\talt\taf\n"
+    for sample in "${samples[@]}"; do
+        if [[ -f results/${sample}.vcf.gz.tbi ]]; then
+            while IFS=$'\t' read -r chrom pos ref alt af; do
+                printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sample" "$chrom" "$pos" "$ref" "$alt" "$af"
+            done<<(bcftools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%AF]\n' results/${sample}.vcf.gz)
+        fi
+    done
+} > results/collapsed.tsv
+```
+
+But we need to ensure that the while loop reads correctly; we used "while IFS=$'\t' read -r chrom pos ref alt af; do ... done<<(bcftools query ...)". That's fine.
+
+Now check that we didn't use any external command not listed: "printf" is builtin, okay. "basename", "sed"? We used parameter expansion to strip suffix: sample=${sample%_1.fq.gz}. That's bash builtin, okay. No external commands.
+
+We used "continue" inside for loop; that's bash builtin.
+
+We used "if [[ -f ... ]]; then continue; fi". That's bash builtin.
+
+Thus all good.
+
+Now ensure that the script exits 0 if results/collapsed.tsv exists at start. We added that check? Actually we removed it earlier but need to include it for idempotency. Let's add at top after mkdir -p results? Actually before processing, we can check if results/collapsed.tsv exists and exit 0. But we need to ensure that we don't create results/ directory prematurely? It's okay.
+
+Add:
+
+```
+if [[ -f results/collapsed.tsv ]]; then
+    exit 0
+fi
+```
+
+But we must place it after set -euo pipefail, before any other commands. Let's insert it.
+
+Thus final script:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -f results/collapsed.tsv ]]; then
+    exit 0
+fi
+
+mkdir -p results
+...
+```
+
+Now ensure that we don't produce any output to stdout besides the redirection at end; but we used printf inside braces to write header and lines to stdout, which is redirected to file. That's fine.
+
+Now final script must be exactly as above, no extra commentary.
+
+Let's produce final answer accordingly.

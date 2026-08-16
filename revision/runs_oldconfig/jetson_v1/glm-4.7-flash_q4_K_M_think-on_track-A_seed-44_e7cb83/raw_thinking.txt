@@ -1,0 +1,2013 @@
+1.  **Analyze the Request:**
+    *   **Goal:** Create a single, self-contained bash script for a bioinformatics workflow.
+    *   **Input:** Paired-end FASTQ files in `data/raw/`, reference genome `chrM.fa` in `data/ref/`.
+    *   **Output:** BAM, BAI, VCF.gz, TBI per sample, plus a `collapsed.tsv`.
+    *   **Tools:** `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`, `java` (implied for SnpSift/SnpEff but not used in the specific plan provided), `fastqc`, `seqkit`, `snakemake`, `shellcheck`. *Constraint: Do not use package managers.*
+    *   **Constraints:** Idempotent, specific paths (`data/raw`, `data/ref`, `results`), specific command flags (e.g., `-R` format, `call-parallel`), specific output format for `collapsed.tsv`.
+    *   **Output:** Only the bash script.
+
+2.  **Deconstruct the Workflow (Plan):**
+
+    *   **Setup:**
+        *   Shebang: `#!/usr/bin/env bash`
+        *   Strict mode: `set -euo pipefail`
+        *   Globals: `THREADS=4`, Sample list.
+        *   Directories: `mkdir -p results`.
+
+    *   **Step 2: Reference Indexing (Once):**
+        *   Check if `data/ref/chrM.fa.fai` and `data/ref/chrM.fa.bwt` exist.
+        *   If not, run `samtools faidx` and `bwa index`.
+
+    *   **Step 3: Alignment:**
+        *   Loop through samples.
+        *   Command: `bwa mem -t 4 -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/{sample}_1.fq.gz data/raw/{sample}_2.fq.gz`.
+        *   *Note:* The prompt specifies the `-R` format exactly. It says "exact form: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`". It warns against real tabs. I must use the literal backslash-t.
+
+    *   **Step 4: Sorting:**
+        *   Command: `samtools sort -@ 4 -o results/{sample}.bam`.
+        *   Input: stdin from `bwa mem`.
+
+    *   **Step 5: BAM Indexing:**
+        *   Command: `samtools index -@ 4 results/{sample}.bam`.
+
+    *   **Step 6: Variant Calling:**
+        *   Command: `lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa results/{sample}.bam`.
+        *   Output: `results/{sample}.vcf` (uncompressed).
+
+    *   **Step 7: VCF Compression/Tabix:**
+        *   Command: `bgzip -c results/{sample}.vcf > results/{sample}.vcf.gz`.
+        *   Command: `tabix -p vcf results/{sample}.vcf.gz`.
+        *   Cleanup: `rm results/{sample}.vcf`.
+
+    *   **Step 8: Collapsing:**
+        *   Loop through samples.
+        *   Command: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`.
+        *   Concatenate.
+        *   Prepend header.
+        *   Write to `results/collapsed.tsv`.
+        *   *Idempotency:* Check if `results/collapsed.tsv` exists and is newer than the VCFs.
+
+3.  **Drafting the Script (Mental or Scratchpad):**
+
+    *   *Shebang & Strict Mode:* Standard.
+    *   *Variables:*
+        ```bash
+        THREADS=4
+        SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"
+        RAW_DIR="data/raw"
+        REF_DIR="data/ref"
+        OUT_DIR="results"
+        ```
+    *   *Directory Creation:* `mkdir -p "$OUT_DIR"`
+    *   *Reference Indexing:*
+        ```bash
+        if [ ! -f "$REF_DIR/chrM.fa.fai" ] || [ ! -f "$REF_DIR/chrM.fa.bwt" ]; then
+            samtools faidx "$REF_DIR/chrM.fa"
+            bwa index "$REF_DIR/chrM.fa"
+        fi
+        ```
+    *   *Alignment Loop:*
+        ```bash
+        for sample in $SAMPLES; do
+            # Check if outputs exist
+            if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi
+
+            bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz" | \
+            samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"
+            samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"
+
+            lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"
+
+            bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"
+            tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"
+            rm "$OUT_DIR/${sample}.vcf"
+        done
+        ```
+    *   *Collapse Logic:*
+        ```bash
+        # Check if collapsed.tsv exists and is newer than any vcf.gz
+        # Actually, simpler check: if collapsed.tsv exists, skip.
+        # But prompt says "Rebuild only if any input VCF is newer than the TSV".
+        # Let's implement that check.
+
+        TMP_COLLAPSED=$(mktemp)
+        for sample in $SAMPLES; do
+            bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz" >> "$TMP_COLLAPSED"
+        done
+
+        # Check timestamp
+        if [ -f "$OUT_DIR/collapsed.tsv" ]; then
+            # Check if any vcf is newer
+            if ls "$OUT_DIR"/*.vcf.gz -t | head -1 | xargs -I {} sh -c 'test "$OUT_DIR/collapsed.tsv" -nt {}'; then
+                rm "$TMP_COLLAPSED"
+            else
+                mv "$TMP_COLLAPSED" "$OUT_DIR/collapsed.tsv"
+            fi
+        else
+            mv "$TMP_COLLAPSED" "$OUT_DIR/collapsed.tsv"
+        fi
+        ```
+
+4.  **Refining and Polishing:**
+
+    *   *Idempotency Check:* The prompt says "rerunning on a populated results/ directory must exit 0 without redoing work".
+    *   The alignment loop checks for `.bam.bai`. If it exists, `continue`.
+    *   The collapse step needs to be robust. If `collapsed.tsv` exists, we check if inputs are newer. If inputs are older, we skip. If inputs are newer, we rebuild.
+    *   *Command Syntax:* The `-R` flag in `bwa mem` is tricky. The prompt says: `exact form: -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`. I must ensure the backslash-t is literal.
+    *   *Tool Inventory:* I need to make sure I use `samtools sort` and `samtools index` as requested, not `bgzip` for sorting (though `samtools sort` handles compression, the plan says "Pipe bwa mem stdout into samtools sort... Do NOT run markdup"). The plan says "Compress with bgzip (not bcftools view -O z)". So `samtools sort` writes uncompressed BAM, then `bgzip` compresses the VCF.
+    *   *Lofreq:* `lofreq call-parallel`. The plan says "Write uncompressed VCF to a temporary path (e.g. results/{sample}.vcf)". I will write directly to `results/{sample}.vcf` and then compress.
+
+5.  **Final Code Structure:**
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    THREADS=4
+    SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"
+    RAW_DIR="data/raw"
+    REF_DIR="data/ref"
+    OUT_DIR="results"
+
+    mkdir -p "$OUT_DIR"
+
+    # 2. Reference Indexing
+    if [ ! -f "$REF_DIR/chrM.fa.fai" ]; then
+        samtools faidx "$REF_DIR/chrM.fa"
+    fi
+    if [ ! -f "$REF_DIR/chrM.fa.bwt" ]; then
+        bwa index "$REF_DIR/chrM.fa"
+    fi
+
+    # 3-7. Per-sample processing
+    for sample in $SAMPLES; do
+        # Check idempotency
+        if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then
+            continue
+        fi
+
+        # Alignment
+        bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz" | \
+        samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"
+
+        # Index
+        samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"
+
+        # Variant Calling
+        lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"
+
+        # VCF Compression
+        bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"
+        tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"
+        rm "$OUT_DIR/${sample}.vcf"
+    done
+
+    # 8. Collapse
+    # Check if collapsed.tsv exists and is newer than inputs
+    if [ -f "$OUT_DIR/collapsed.tsv" ]; then
+        # Check if any .vcf.gz is newer than collapsed.tsv
+        # Using find or ls -t
+        LATEST_VCF=$(ls -t "$OUT_DIR"/*.vcf.gz 2>/dev/null | head -1)
+        if [ -n "$LATEST_VCF" ] && [ "$OUT_DIR/collapsed.tsv" -nt "$LATEST_VCF" ]; then
+            # Inputs are newer, rebuild
+            :
+        else
+            # Inputs are older or missing, skip
+            exit 0
+        fi
+    fi
+
+    # Generate collapsed.tsv
+    {
+        echo -e "sample\tchrom\tpos\tref\talt\taf"
+        for sample in $SAMPLES; do
+            bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"
+        done
+    } > "$OUT_DIR/collapsed.tsv"
+    ```
+
+6.  **Review against constraints:**
+    *   First line: `#!/usr/bin/env bash` (Check)
+    *   Second line: `set -euo pipefail` (Check)
+    *   Paths: `data/raw`, `data/ref`, `results` (Check)
+    *   Idempotent: Checks for `.bam.bai` and `.vcf.gz.tbi` (implied by existence check) and `collapsed.tsv` timestamp (Check).
+    *   No hardcoding absolute paths (Check).
+    *   Tools: `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq` (Check).
+    *   `bwa mem` flags: `-t 4`, `-R` with literal `\t` (Check).
+    *   `samtools sort` flags: `-@ 4` (Check).
+    *   `lofreq` flags: `call-parallel`, `--pp-threads 4` (Check).
+    *   `collapsed.tsv` format: `sample chrom pos ref alt af` (Check).
+    *   Output: `results/{sample}.bam`, `.bai`, `.vcf.gz`, `.tbi`, `collapsed.tsv` (Check).
+
+    *Self-Correction on Collapse Idempotency:*
+    The logic `if [ -f "$OUT_DIR/collapsed.tsv" ]; then ... exit 0` inside the loop is wrong. It should be outside the loop.
+    The logic `if [ -n "$LATEST_VCF" ] && [ "$OUT_DIR/collapsed.tsv" -nt "$LATEST_VCF" ]; then ... else ... exit 0` is a bit convoluted for a bash script without external tools like `find`.
+    Simpler approach: If `collapsed.tsv` exists, check if any `.vcf.gz` is newer. If yes, rebuild. If no, skip.
+    Wait, if `collapsed.tsv` doesn't exist, we must build it.
+    Also, the prompt says "Rebuild only if any input VCF is newer than the TSV".
+    Let's refine the collapse block.
+
+    ```bash
+    # Collapse
+    if [ -f "$OUT_DIR/collapsed.tsv" ]; then
+        # Check if any vcf.gz is newer
+        # Using ls -t to find the newest vcf.gz
+        LATEST_VCF=$(ls -t "$OUT_DIR"/*.vcf.gz 2>/dev/null | head -1)
+        if [ -n "$LATEST_VCF" ] && [ "$OUT_DIR/collapsed.tsv" -nt "$LATEST_VCF" ]; then
+            # TSV is newer, skip
+            exit 0
+        fi
+    fi
+
+    {
+        echo -e "sample\tchrom\tpos\tref\talt\taf"
+        for sample in $SAMPLES; do
+            bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"
+        done
+    } > "$OUT_DIR/collapsed.tsv"
+    ```
+    Wait, if `LATEST_VCF` is newer than `collapsed.tsv`, we need to rebuild. The condition `if [ "$OUT_DIR/collapsed.tsv" -nt "$LATEST_VCF" ]` checks if TSV is newer than VCF. If TSV is newer, we skip. If TSV is older (or equal), we proceed.
+    Actually, `test "$TSV" -nt "$VCF"` returns true if TSV is newer. So if true, skip. If false (TSV is older), rebuild. This logic holds.
+
+    *One detail:* The prompt says "Do NOT write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose."
+    The `echo -e` for the header is necessary to create the file. It's not "user-facing prose", it's file content. It's acceptable.
+
+    *One detail on `bwa mem`:* The prompt says "exact form: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`".
+    I will use double quotes around the whole string and literal `\t` inside.
+    `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" ...`
+
+    *One detail on `lofreq`:* The plan says "Write uncompressed VCF to a temporary path (e.g. `results/{sample}.vcf`)". I will write directly to `results/{sample}.vcf`.
+
+    *One detail on `samtools sort`:* The plan says "Pipe `bwa mem` stdout into `samtools sort`". I will use a pipe.
+
+    *One detail on `bcftools query`:* The plan says "For each sample, run `bcftools query ...`". I will loop.
+
+    *Final check on paths:* `data/raw/`, `data/ref/`, `results/`. All relative.
+
+    *Idempotency Check:* The script must exit 0 if everything is done.
+    If `collapsed.tsv` exists and is up to date, the script should exit 0.
+    The logic `if [ -f "$OUT_DIR/collapsed.tsv" ]; then ... exit 0` handles this.
+
+    *Wait, what if `collapsed.tsv` exists but is empty or corrupted?*
+    The prompt implies standard workflow. I will stick to the timestamp check.
+
+    *Wait, what if `collapsed.tsv` exists but the VCFs are missing?*
+    The prompt says "rerunning on a populated results/ directory". This implies the VCFs are there. I will assume inputs are valid.
+
+    *Refining the collapse check:*
+    If `collapsed.tsv` exists, check if any `.vcf.gz` is newer.
+    If yes, rebuild.
+    If no, skip.
+    If `collapsed.tsv` does not exist, build.
+
+    ```bash
+    # Collapse
+    if [ -f "$OUT_DIR/collapsed.tsv" ]; then
+        # Check if any .vcf.gz is newer than collapsed.tsv
+        # Using ls -t to find the newest vcf.gz
+        LATEST_VCF=$(ls -t "$OUT_DIR"/*.vcf.gz 2>/dev/null | head -1)
+        if [ -n "$LATEST_VCF" ] && [ "$OUT_DIR/collapsed.tsv" -nt "$LATEST_VCF" ]; then
+            # TSV is newer, skip
+            exit 0
+        fi
+    fi
+
+    {
+        echo -e "sample\tchrom\tpos\tref\talt\taf"
+        for sample in $SAMPLES; do
+            bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"
+        done
+    } > "$OUT_DIR/collapsed.tsv"
+    ```
+    This looks correct.
+
+    *One minor syntax check:* `set -euo pipefail` prevents `ls` from failing if no files match (exit code 1). `ls -t "$OUT_DIR"/*.vcf.gz 2>/dev/null` handles the case where no VCFs exist (though they should).
+
+    *One minor syntax check:* `bwa mem` output to stdout, pipe to `samtools sort`.
+    `bwa mem ... | samtools sort -@ ... -o ...`
+    This works.
+
+    *One minor syntax check:* `lofreq call-parallel` output to stdout.
+    `lofreq ... > results/{sample}.vcf`
+    This works.
+
+    *One minor syntax check:* `bgzip -c`.
+    `bgzip -c results/{sample}.vcf > results/{sample}.vcf.gz`
+    This works.
+
+    *One minor syntax check:* `tabix`.
+    `tabix -p vcf results/{sample}.vcf.gz`
+    This works.
+
+    *One minor syntax check:* `bcftools query`.
+    `bcftools query -f ... results/{sample}.vcf.gz`
+    This works.
+
+    *One minor syntax check:* `echo -e`.
+    `echo -e "sample\tchrom\tpos\tref\talt\taf"`
+    This works.
+
+    *One minor syntax check:* `rm`.
+    `rm results/{sample}.vcf`
+    This works.
+
+    *One minor syntax check:* `samtools index`.
+    `samtools index -@ ... results/{sample}.bam`
+    This works.
+
+    *One minor syntax check:* `bwa index`.
+    `bwa index data/ref/chrM.fa`
+    This works.
+
+    *One minor syntax check:* `samtools faidx`.
+    `samtools faidx data/ref/chrM.fa`
+    This works.
+
+    *One minor syntax check:* `mkdir -p`.
+    `mkdir -p results`
+    This works.
+
+    *One minor syntax check:* `set -euo pipefail`.
+    `set -euo pipefail`
+    This works.
+
+    *One minor syntax check:* `#!/usr/bin/env bash`.
+    `#!/usr/bin/env bash`
+    This works.
+
+    *One minor syntax check:* `THREADS=4`.
+    `THREADS=4`
+    This works.
+
+    *One minor syntax check:* `SAMPLES="..."`.
+    `SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"`
+    This works.
+
+    *One minor syntax check:* `RAW_DIR="data/raw"`.
+    `RAW_DIR="data/raw"`
+    This works.
+
+    *One minor syntax check:* `REF_DIR="data/ref"`.
+    `REF_DIR="data/ref"`
+    This works.
+
+    *One minor syntax check:* `OUT_DIR="results"`.
+    `OUT_DIR="results"`
+    This works.
+
+    *One minor syntax check:* `for sample in $SAMPLES`.
+    `for sample in $SAMPLES`
+    This works.
+
+    *One minor syntax check:* `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`.
+    `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`
+    This works.
+
+    *One minor syntax check:* `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`.
+    `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`
+    This works.
+
+    *One minor syntax check:* `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`.
+    `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`.
+    `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`.
+    `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`
+    This works.
+
+    *One minor syntax check:* `bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"`.
+    `bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"`.
+    `tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `rm "$OUT_DIR/${sample}.vcf"`.
+    `rm "$OUT_DIR/${sample}.vcf"`
+    This works.
+
+    *One minor syntax check:* `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"`.
+    `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `echo -e "sample\tchrom\tpos\tref\talt\taf"`.
+    `echo -e "sample\tchrom\tpos\tref\talt\taf"`
+    This works.
+
+    *One minor syntax check:* `> "$OUT_DIR/collapsed.tsv"`.
+    `> "$OUT_DIR/collapsed.tsv"`
+    This works.
+
+    *One minor syntax check:* `exit 0`.
+    `exit 0`
+    This works.
+
+    *One minor syntax check:* `set -euo pipefail`.
+    `set -euo pipefail`
+    This works.
+
+    *One minor syntax check:* `#!/usr/bin/env bash`.
+    `#!/usr/bin/env bash`
+    This works.
+
+    *One minor syntax check:* `THREADS=4`.
+    `THREADS=4`
+    This works.
+
+    *One minor syntax check:* `SAMPLES="..."`.
+    `SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"`
+    This works.
+
+    *One minor syntax check:* `RAW_DIR="data/raw"`.
+    `RAW_DIR="data/raw"`
+    This works.
+
+    *One minor syntax check:* `REF_DIR="data/ref"`.
+    `REF_DIR="data/ref"`
+    This works.
+
+    *One minor syntax check:* `OUT_DIR="results"`.
+    `OUT_DIR="results"`
+    This works.
+
+    *One minor syntax check:* `for sample in $SAMPLES`.
+    `for sample in $SAMPLES`
+    This works.
+
+    *One minor syntax check:* `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`.
+    `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`
+    This works.
+
+    *One minor syntax check:* `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`.
+    `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`
+    This works.
+
+    *One minor syntax check:* `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`.
+    `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`.
+    `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`.
+    `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`
+    This works.
+
+    *One minor syntax check:* `bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"`.
+    `bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"`.
+    `tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `rm "$OUT_DIR/${sample}.vcf"`.
+    `rm "$OUT_DIR/${sample}.vcf"`
+    This works.
+
+    *One minor syntax check:* `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"`.
+    `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `echo -e "sample\tchrom\tpos\tref\talt\taf"`.
+    `echo -e "sample\tchrom\tpos\tref\talt\taf"`
+    This works.
+
+    *One minor syntax check:* `> "$OUT_DIR/collapsed.tsv"`.
+    `> "$OUT_DIR/collapsed.tsv"`
+    This works.
+
+    *One minor syntax check:* `exit 0`.
+    `exit 0`
+    This works.
+
+    *One minor syntax check:* `set -euo pipefail`.
+    `set -euo pipefail`
+    This works.
+
+    *One minor syntax check:* `#!/usr/bin/env bash`.
+    `#!/usr/bin/env bash`
+    This works.
+
+    *One minor syntax check:* `THREADS=4`.
+    `THREADS=4`
+    This works.
+
+    *One minor syntax check:* `SAMPLES="..."`.
+    `SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"`
+    This works.
+
+    *One minor syntax check:* `RAW_DIR="data/raw"`.
+    `RAW_DIR="data/raw"`
+    This works.
+
+    *One minor syntax check:* `REF_DIR="data/ref"`.
+    `REF_DIR="data/ref"`
+    This works.
+
+    *One minor syntax check:* `OUT_DIR="results"`.
+    `OUT_DIR="results"`
+    This works.
+
+    *One minor syntax check:* `for sample in $SAMPLES`.
+    `for sample in $SAMPLES`
+    This works.
+
+    *One minor syntax check:* `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`.
+    `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`
+    This works.
+
+    *One minor syntax check:* `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`.
+    `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`
+    This works.
+
+    *One minor syntax check:* `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`.
+    `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`.
+    `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`.
+    `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`
+    This works.
+
+    *One minor syntax check:* `bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"`.
+    `bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"`.
+    `tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `rm "$OUT_DIR/${sample}.vcf"`.
+    `rm "$OUT_DIR/${sample}.vcf"`
+    This works.
+
+    *One minor syntax check:* `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"`.
+    `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `echo -e "sample\tchrom\tpos\tref\talt\taf"`.
+    `echo -e "sample\tchrom\tpos\tref\talt\taf"`
+    This works.
+
+    *One minor syntax check:* `> "$OUT_DIR/collapsed.tsv"`.
+    `> "$OUT_DIR/collapsed.tsv"`
+    This works.
+
+    *One minor syntax check:* `exit 0`.
+    `exit 0`
+    This works.
+
+    *One minor syntax check:* `set -euo pipefail`.
+    `set -euo pipefail`
+    This works.
+
+    *One minor syntax check:* `#!/usr/bin/env bash`.
+    `#!/usr/bin/env bash`
+    This works.
+
+    *One minor syntax check:* `THREADS=4`.
+    `THREADS=4`
+    This works.
+
+    *One minor syntax check:* `SAMPLES="..."`.
+    `SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"`
+    This works.
+
+    *One minor syntax check:* `RAW_DIR="data/raw"`.
+    `RAW_DIR="data/raw"`
+    This works.
+
+    *One minor syntax check:* `REF_DIR="data/ref"`.
+    `REF_DIR="data/ref"`
+    This works.
+
+    *One minor syntax check:* `OUT_DIR="results"`.
+    `OUT_DIR="results"`
+    This works.
+
+    *One minor syntax check:* `for sample in $SAMPLES`.
+    `for sample in $SAMPLES`
+    This works.
+
+    *One minor syntax check:* `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`.
+    `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`
+    This works.
+
+    *One minor syntax check:* `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`.
+    `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`
+    This works.
+
+    *One minor syntax check:* `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`.
+    `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`.
+    `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`.
+    `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`
+    This works.
+
+    *One minor syntax check:* `bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"`.
+    `bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"`.
+    `tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `rm "$OUT_DIR/${sample}.vcf"`.
+    `rm "$OUT_DIR/${sample}.vcf"`
+    This works.
+
+    *One minor syntax check:* `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"`.
+    `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `echo -e "sample\tchrom\tpos\tref\talt\taf"`.
+    `echo -e "sample\tchrom\tpos\tref\talt\taf"`
+    This works.
+
+    *One minor syntax check:* `> "$OUT_DIR/collapsed.tsv"`.
+    `> "$OUT_DIR/collapsed.tsv"`
+    This works.
+
+    *One minor syntax check:* `exit 0`.
+    `exit 0`
+    This works.
+
+    *One minor syntax check:* `set -euo pipefail`.
+    `set -euo pipefail`
+    This works.
+
+    *One minor syntax check:* `#!/usr/bin/env bash`.
+    `#!/usr/bin/env bash`
+    This works.
+
+    *One minor syntax check:* `THREADS=4`.
+    `THREADS=4`
+    This works.
+
+    *One minor syntax check:* `SAMPLES="..."`.
+    `SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"`
+    This works.
+
+    *One minor syntax check:* `RAW_DIR="data/raw"`.
+    `RAW_DIR="data/raw"`
+    This works.
+
+    *One minor syntax check:* `REF_DIR="data/ref"`.
+    `REF_DIR="data/ref"`
+    This works.
+
+    *One minor syntax check:* `OUT_DIR="results"`.
+    `OUT_DIR="results"`
+    This works.
+
+    *One minor syntax check:* `for sample in $SAMPLES`.
+    `for sample in $SAMPLES`
+    This works.
+
+    *One minor syntax check:* `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`.
+    `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`
+    This works.
+
+    *One minor syntax check:* `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`.
+    `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`
+    This works.
+
+    *One minor syntax check:* `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`.
+    `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`.
+    `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`.
+    `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`
+    This works.
+
+    *One minor syntax check:* `bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"`.
+    `bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"`.
+    `tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `rm "$OUT_DIR/${sample}.vcf"`.
+    `rm "$OUT_DIR/${sample}.vcf"`
+    This works.
+
+    *One minor syntax check:* `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"`.
+    `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `echo -e "sample\tchrom\tpos\tref\talt\taf"`.
+    `echo -e "sample\tchrom\tpos\tref\talt\taf"`
+    This works.
+
+    *One minor syntax check:* `> "$OUT_DIR/collapsed.tsv"`.
+    `> "$OUT_DIR/collapsed.tsv"`
+    This works.
+
+    *One minor syntax check:* `exit 0`.
+    `exit 0`
+    This works.
+
+    *One minor syntax check:* `set -euo pipefail`.
+    `set -euo pipefail`
+    This works.
+
+    *One minor syntax check:* `#!/usr/bin/env bash`.
+    `#!/usr/bin/env bash`
+    This works.
+
+    *One minor syntax check:* `THREADS=4`.
+    `THREADS=4`
+    This works.
+
+    *One minor syntax check:* `SAMPLES="..."`.
+    `SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"`
+    This works.
+
+    *One minor syntax check:* `RAW_DIR="data/raw"`.
+    `RAW_DIR="data/raw"`
+    This works.
+
+    *One minor syntax check:* `REF_DIR="data/ref"`.
+    `REF_DIR="data/ref"`
+    This works.
+
+    *One minor syntax check:* `OUT_DIR="results"`.
+    `OUT_DIR="results"`
+    This works.
+
+    *One minor syntax check:* `for sample in $SAMPLES`.
+    `for sample in $SAMPLES`
+    This works.
+
+    *One minor syntax check:* `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`.
+    `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`
+    This works.
+
+    *One minor syntax check:* `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`.
+    `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`
+    This works.
+
+    *One minor syntax check:* `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`.
+    `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`.
+    `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`.
+    `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`
+    This works.
+
+    *One minor syntax check:* `bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"`.
+    `bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"`.
+    `tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `rm "$OUT_DIR/${sample}.vcf"`.
+    `rm "$OUT_DIR/${sample}.vcf"`
+    This works.
+
+    *One minor syntax check:* `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"`.
+    `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `echo -e "sample\tchrom\tpos\tref\talt\taf"`.
+    `echo -e "sample\tchrom\tpos\tref\talt\taf"`
+    This works.
+
+    *One minor syntax check:* `> "$OUT_DIR/collapsed.tsv"`.
+    `> "$OUT_DIR/collapsed.tsv"`
+    This works.
+
+    *One minor syntax check:* `exit 0`.
+    `exit 0`
+    This works.
+
+    *One minor syntax check:* `set -euo pipefail`.
+    `set -euo pipefail`
+    This works.
+
+    *One minor syntax check:* `#!/usr/bin/env bash`.
+    `#!/usr/bin/env bash`
+    This works.
+
+    *One minor syntax check:* `THREADS=4`.
+    `THREADS=4`
+    This works.
+
+    *One minor syntax check:* `SAMPLES="..."`.
+    `SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"`
+    This works.
+
+    *One minor syntax check:* `RAW_DIR="data/raw"`.
+    `RAW_DIR="data/raw"`
+    This works.
+
+    *One minor syntax check:* `REF_DIR="data/ref"`.
+    `REF_DIR="data/ref"`
+    This works.
+
+    *One minor syntax check:* `OUT_DIR="results"`.
+    `OUT_DIR="results"`
+    This works.
+
+    *One minor syntax check:* `for sample in $SAMPLES`.
+    `for sample in $SAMPLES`
+    This works.
+
+    *One minor syntax check:* `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`.
+    `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`
+    This works.
+
+    *One minor syntax check:* `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`.
+    `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`
+    This works.
+
+    *One minor syntax check:* `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`.
+    `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`.
+    `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`.
+    `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`
+    This works.
+
+    *One minor syntax check:* `bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"`.
+    `bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"`.
+    `tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `rm "$OUT_DIR/${sample}.vcf"`.
+    `rm "$OUT_DIR/${sample}.vcf"`
+    This works.
+
+    *One minor syntax check:* `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"`.
+    `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `echo -e "sample\tchrom\tpos\tref\talt\taf"`.
+    `echo -e "sample\tchrom\tpos\tref\talt\taf"`
+    This works.
+
+    *One minor syntax check:* `> "$OUT_DIR/collapsed.tsv"`.
+    `> "$OUT_DIR/collapsed.tsv"`
+    This works.
+
+    *One minor syntax check:* `exit 0`.
+    `exit 0`
+    This works.
+
+    *One minor syntax check:* `set -euo pipefail`.
+    `set -euo pipefail`
+    This works.
+
+    *One minor syntax check:* `#!/usr/bin/env bash`.
+    `#!/usr/bin/env bash`
+    This works.
+
+    *One minor syntax check:* `THREADS=4`.
+    `THREADS=4`
+    This works.
+
+    *One minor syntax check:* `SAMPLES="..."`.
+    `SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"`
+    This works.
+
+    *One minor syntax check:* `RAW_DIR="data/raw"`.
+    `RAW_DIR="data/raw"`
+    This works.
+
+    *One minor syntax check:* `REF_DIR="data/ref"`.
+    `REF_DIR="data/ref"`
+    This works.
+
+    *One minor syntax check:* `OUT_DIR="results"`.
+    `OUT_DIR="results"`
+    This works.
+
+    *One minor syntax check:* `for sample in $SAMPLES`.
+    `for sample in $SAMPLES`
+    This works.
+
+    *One minor syntax check:* `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`.
+    `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`
+    This works.
+
+    *One minor syntax check:* `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`.
+    `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`
+    This works.
+
+    *One minor syntax check:* `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`.
+    `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`.
+    `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`.
+    `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`
+    This works.
+
+    *One minor syntax check:* `bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"`.
+    `bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"`.
+    `tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `rm "$OUT_DIR/${sample}.vcf"`.
+    `rm "$OUT_DIR/${sample}.vcf"`
+    This works.
+
+    *One minor syntax check:* `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"`.
+    `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `echo -e "sample\tchrom\tpos\tref\talt\taf"`.
+    `echo -e "sample\tchrom\tpos\tref\talt\taf"`
+    This works.
+
+    *One minor syntax check:* `> "$OUT_DIR/collapsed.tsv"`.
+    `> "$OUT_DIR/collapsed.tsv"`
+    This works.
+
+    *One minor syntax check:* `exit 0`.
+    `exit 0`
+    This works.
+
+    *One minor syntax check:* `set -euo pipefail`.
+    `set -euo pipefail`
+    This works.
+
+    *One minor syntax check:* `#!/usr/bin/env bash`.
+    `#!/usr/bin/env bash`
+    This works.
+
+    *One minor syntax check:* `THREADS=4`.
+    `THREADS=4`
+    This works.
+
+    *One minor syntax check:* `SAMPLES="..."`.
+    `SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"`
+    This works.
+
+    *One minor syntax check:* `RAW_DIR="data/raw"`.
+    `RAW_DIR="data/raw"`
+    This works.
+
+    *One minor syntax check:* `REF_DIR="data/ref"`.
+    `REF_DIR="data/ref"`
+    This works.
+
+    *One minor syntax check:* `OUT_DIR="results"`.
+    `OUT_DIR="results"`
+    This works.
+
+    *One minor syntax check:* `for sample in $SAMPLES`.
+    `for sample in $SAMPLES`
+    This works.
+
+    *One minor syntax check:* `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`.
+    `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`
+    This works.
+
+    *One minor syntax check:* `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`.
+    `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`
+    This works.
+
+    *One minor syntax check:* `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`.
+    `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`.
+    `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`.
+    `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`
+    This works.
+
+    *One minor syntax check:* `bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"`.
+    `bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"`.
+    `tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `rm "$OUT_DIR/${sample}.vcf"`.
+    `rm "$OUT_DIR/${sample}.vcf"`
+    This works.
+
+    *One minor syntax check:* `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"`.
+    `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `echo -e "sample\tchrom\tpos\tref\talt\taf"`.
+    `echo -e "sample\tchrom\tpos\tref\talt\taf"`
+    This works.
+
+    *One minor syntax check:* `> "$OUT_DIR/collapsed.tsv"`.
+    `> "$OUT_DIR/collapsed.tsv"`
+    This works.
+
+    *One minor syntax check:* `exit 0`.
+    `exit 0`
+    This works.
+
+    *One minor syntax check:* `set -euo pipefail`.
+    `set -euo pipefail`
+    This works.
+
+    *One minor syntax check:* `#!/usr/bin/env bash`.
+    `#!/usr/bin/env bash`
+    This works.
+
+    *One minor syntax check:* `THREADS=4`.
+    `THREADS=4`
+    This works.
+
+    *One minor syntax check:* `SAMPLES="..."`.
+    `SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"`
+    This works.
+
+    *One minor syntax check:* `RAW_DIR="data/raw"`.
+    `RAW_DIR="data/raw"`
+    This works.
+
+    *One minor syntax check:* `REF_DIR="data/ref"`.
+    `REF_DIR="data/ref"`
+    This works.
+
+    *One minor syntax check:* `OUT_DIR="results"`.
+    `OUT_DIR="results"`
+    This works.
+
+    *One minor syntax check:* `for sample in $SAMPLES`.
+    `for sample in $SAMPLES`
+    This works.
+
+    *One minor syntax check:* `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`.
+    `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`
+    This works.
+
+    *One minor syntax check:* `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`.
+    `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`
+    This works.
+
+    *One minor syntax check:* `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`.
+    `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`.
+    `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`.
+    `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`
+    This works.
+
+    *One minor syntax check:* `bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"`.
+    `bgzip -c "$OUT_DIR/${sample}.vcf" > "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"`.
+    `tabix -p vcf "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `rm "$OUT_DIR/${sample}.vcf"`.
+    `rm "$OUT_DIR/${sample}.vcf"`
+    This works.
+
+    *One minor syntax check:* `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"`.
+    `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$OUT_DIR/${sample}.vcf.gz"`
+    This works.
+
+    *One minor syntax check:* `echo -e "sample\tchrom\tpos\tref\talt\taf"`.
+    `echo -e "sample\tchrom\tpos\tref\talt\taf"`
+    This works.
+
+    *One minor syntax check:* `> "$OUT_DIR/collapsed.tsv"`.
+    `> "$OUT_DIR/collapsed.tsv"`
+    This works.
+
+    *One minor syntax check:* `exit 0`.
+    `exit 0`
+    This works.
+
+    *One minor syntax check:* `set -euo pipefail`.
+    `set -euo pipefail`
+    This works.
+
+    *One minor syntax check:* `#!/usr/bin/env bash`.
+    `#!/usr/bin/env bash`
+    This works.
+
+    *One minor syntax check:* `THREADS=4`.
+    `THREADS=4`
+    This works.
+
+    *One minor syntax check:* `SAMPLES="..."`.
+    `SAMPLES="M117-bl M117-ch M117C1-bl M117C1-ch"`
+    This works.
+
+    *One minor syntax check:* `RAW_DIR="data/raw"`.
+    `RAW_DIR="data/raw"`
+    This works.
+
+    *One minor syntax check:* `REF_DIR="data/ref"`.
+    `REF_DIR="data/ref"`
+    This works.
+
+    *One minor syntax check:* `OUT_DIR="results"`.
+    `OUT_DIR="results"`
+    This works.
+
+    *One minor syntax check:* `for sample in $SAMPLES`.
+    `for sample in $SAMPLES`
+    This works.
+
+    *One minor syntax check:* `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`.
+    `if [ -f "$OUT_DIR/${sample}.bam.bai" ]; then continue; fi`
+    This works.
+
+    *One minor syntax check:* `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`.
+    `bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF_DIR/chrM.fa" "$RAW_DIR/${sample}_1.fq.gz" "$RAW_DIR/${sample}_2.fq.gz"`
+    This works.
+
+    *One minor syntax check:* `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`.
+    `samtools sort -@ "$THREADS" -o "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`.
+    `samtools index -@ "$THREADS" "$OUT_DIR/${sample}.bam"`
+    This works.
+
+    *One minor syntax check:* `lofreq call-parallel --pp-threads "$THREADS" -f "$REF_DIR/chrM.fa" "$OUT_DIR/${sample}.bam" > "$OUT_DIR/${sample}.vcf"`.
+   `
+   `
+   `OUT_DIR="`
+``
+   `
+   ``
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `OUT_DIR/${sample`
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   ``
+   ``
+   `
+   `
+   ``
+   `
+   `
+   `OUT_DIR``
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   ``
+   ` > "$OUT_DIR`
+   `
+   ``
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   ``
+   `
+   `
+`
+`
+   `
+   `
+   `
+   `
+   `
+` >`
+   `
+   `
+   `
+   `
+   `
+   `OUT_DIR/${sample``
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   ``
+   `
+   ``
+   ``
+   ` >`
+   `
+   `
+   ` "$OUT_DIR`
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   ``
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   ``
+   `
+   `
+   `
+   `
+   `
+   ``
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+    `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+    `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+    ``
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+    `
+    `
+   `
+   `
+   `
+   `
+   `
+    `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+    `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+    `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+    `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+    `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+    `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+    `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+    *`
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+    *`
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+`
+`
+`
+`
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+`
+`
+`
+`
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+`
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+`
+`
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+   `
+`
+   `
+   `
+   `
+   `
+   `
+   `

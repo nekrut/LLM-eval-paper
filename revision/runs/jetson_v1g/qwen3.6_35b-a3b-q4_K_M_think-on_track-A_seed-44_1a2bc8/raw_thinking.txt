@@ -1,0 +1,556 @@
+The user wants a single bash script that performs a bioinformatics workflow for variant calling on mitochondrial DNA amplicon data.
+Let's break down the requirements:
+1. Shebang and set options: `#!/usr/bin/env bash` and `set -euo pipefail`
+2. Globals: `THREADS=4`, samples: `M117-bl M117-ch M117C1-bl M117C1-ch`
+3. Create `results/` directory.
+4. Reference indexing: `samtools faidx data/ref/chrM.fa` and `bwa index data/ref/chrM.fa`. Skip if indices exist.
+5. Per-sample alignment: `bwa mem -t 4 -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/{sample}_1.fq.gz data/raw/{sample}_2.fq.gz | samtools sort -@ 4 -o results/{sample}.bam`
+   Note: The `-R` argument must have literal `\t` characters, not actual tabs. I'll use single quotes to preserve them: `'-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"'`
+6. BAM indexing: `samtools index -@ 4 results/{sample}.bam`
+7. Variant calling: `lofreq call-parallel --pp-threads 4 --verbose --ref data/ref/chrM.fa --out results/{sample}.vcf --sig --bonf results/{sample}.bam`
+   Wait, the prompt says: `(The bare --sig and --bonf lines come from Galaxy-runtime-supplied values; you can omit them and use lofreq's defaults. The load-bearing detail is that results/{sample}.bam is a positional argument at the end, not behind -i/-b/-bam.)`
+   So I'll just run: `lofreq call-parallel --pp-threads 4 --ref data/ref/chrM.fa --out results/{sample}.vcf results/{sample}.bam`
+   Actually, lofreq might complain if `--sig` and `--bonf` are not provided? The prompt says I can omit them. I'll stick to the minimal required args or include them as positional flags if needed. I'll just use `lofreq call-parallel --pp-threads 4 --ref data/ref/chrM.fa --out results/{sample}.vcf results/{sample}.bam`.
+   Wait, lofreq's `call-parallel` syntax: `lofreq call-parallel [options] <bam>`. Yes.
+8. VCF compression/indexing: `bgzip results/{sample}.vcf`, `tabix -p vcf results/{sample}.vcf.gz`. Remove `.vcf`.
+9. Collapse step: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz` for each sample, concatenate, prepend header to `results/collapsed.tsv`.
+10. Idempotency: Check if outputs exist before running steps. The prompt says "guard each artifact with an existence check... Re-runs on a fully populated results/ must exit 0 without re-doing work."
+
+Let's carefully construct the script.
+
+Structure:
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p results
+
+# Reference indexing
+if [[ ! -f data/ref/chrM.fa.fai || ! -f data/ref/chrM.fa.bwt ]]; then
+    samtools faidx data/ref/chrM.fa
+    bwa index data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    bam="results/${sample}.bam"
+    bai="${bam}.bai"
+    vcf="results/${sample}.vcf"
+    vcfz="${vcf}.gz"
+    tbix="${vcfz}.tbi"
+
+    # Alignment & sorting
+    if [[ ! -f "$bam" ]]; then
+        bwa mem -t "$THREADS" \
+            "-R @RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            data/ref/chrM.fa \
+            "data/raw/${sample}_1.fq.gz" \
+            "data/raw/${sample}_2.fq.gz" | \
+        samtools sort -@ "$THREADS" -o "$bam"
+    fi
+
+    # BAM indexing
+    if [[ ! -f "$bai" ]]; then
+        samtools index -@ "$THREADS" "$bam"
+    fi
+
+    # Variant calling
+    if [[ ! -f "$vcfz" ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" \
+            --ref data/ref/chrM.fa \
+            --out "$vcf" \
+            "$bam"
+    fi
+
+    # VCF compression & indexing
+    if [[ ! -f "$tbix" ]]; then
+        bgzip "$vcf"
+        tabix -p vcf "$vcfz"
+        rm -f "$vcf"
+    fi
+done
+
+# Collapse step
+collapsed="results/collapsed.tsv"
+if [[ ! -f "$collapsed" ]]; then
+    {
+        printf 'sample\tchrom\tpos\tref\talt\taf\n'
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"
+        done
+    } > "$collapsed"
+fi
+```
+
+Wait, check the `-R` argument requirement carefully:
+"Pass the read group via `-R` as a single double-quoted argument containing literal backslash-t between fields and colons between key and value: exact form: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"` The `\t` must remain the two characters backslash and `t` — bwa parses them itself. Do NOT use `printf`, `echo -e`, `$'\t'`, or any mechanism that turns them into real tabs; bwa rejects real tabs with “the read group line contained literal <tab> characters”."
+
+In bash, if I write:
+`bwa mem -t "$THREADS" "-R @RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" ...`
+The double quotes will preserve the backslashes. So `"-R @RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"` is correct. But wait, `-R` takes one argument. I should pass it as a single argument to bwa. Usually it's `-R "@RG:..."`. The prompt says: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`. So I'll write exactly that.
+
+Let's verify lofreq command:
+`lofreq call-parallel --pp-threads 4 --verbose --ref data/ref/chrM.fa --out results/{sample}.vcf --sig --bonf results/{sample}.bam`
+The prompt says: `(The bare --sig and --bonf lines come from Galaxy-runtime-supplied values; you can omit them and use lofreq's defaults. The load-bearing detail is that results/{sample}.bam is a positional argument at the end, not behind -i/-b/-bam.)`
+So I will just use: `lofreq call-parallel --pp-threads "$THREADS" --ref data/ref/chrM.fa --out "$vcf" "$bam"`
+
+Wait, lofreq might require `--verbose`? Not strictly. I'll omit it to keep it clean, or include it as in the plan. The plan says `--verbose` but then says you can omit `--sig` and `--bonf`. I'll stick to the minimal required. Actually, including `--verbose` is fine. I'll just follow the exact command from step 6 but without `--sig --bonf` as suggested:
+`lofreq call-parallel --pp-threads "$THREADS" --ref data/ref/chrM.fa --out "$vcf" "$bam"`
+
+Check bcftools query format:
+`bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`
+In bash, single quotes prevent variable expansion. So I need to use double quotes or escape the braces for bcftools? bcftools uses `{}` for format strings. If I use double quotes in bash, `${sample}` will expand. That's fine. But `%CHROM` etc. are bcftools variables.
+So: `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"`
+Wait, `\t` and `\n` inside double quotes in bash are literal backslash-t/n unless using `$'...'`. bcftools interprets `\t` and `\n` itself. So double quotes are fine.
+
+Let's test mentally:
+`bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"`
+This works. bcftools will see `${sample}` expanded to e.g., `M117-bl`, then `\t%CHROM...`.
+
+One detail: `bcftools query` format string uses `%CHROM` etc. The prompt says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`. I'll follow that exactly, using double quotes for bash expansion of `{sample}`.
+
+Wait, bcftools format strings use `%` for fields. The prompt says `'{sample}\t...'`. In bcftools, literal text is just written as is. So `${sample}` in bash will become the sample name. That's correct.
+
+Idempotency: The script checks for file existence before each step. This satisfies idempotency.
+But wait, `samtools faidx` and `bwa index` should be run once outside the loop. I put that at the top.
+What about `results/` directory? `mkdir -p results` is fine.
+
+Let's refine the script to ensure it strictly follows constraints.
+- First line: `#!/usr/bin/env bash`
+- Second line: `set -euo pipefail`
+- No absolute paths outside cwd.
+- Idempotent: checks exist before running.
+- Tools: bwa, samtools, bcftools, lofreq, bgzip, tabix. All in inventory.
+- Threads: 4.
+- Output columns: sample chrom pos ref alt af.
+
+One minor point: `lofreq call-parallel` might need `--verbose`? The plan says `--verbose`. I'll include it just in case, or omit it. It doesn't matter much. I'll stick to the plan's command but without `--sig --bonf` as instructed.
+Actually, the plan says:
+```
+lofreq call-parallel --pp-threads 4 --verbose
+--ref data/ref/chrM.fa --out results/{sample}.vcf
+--sig
+--bonf
+results/{sample}.bam
+```
+I'll just write it on one line for clarity, or keep newlines. Bash handles newlines in commands fine.
+
+Wait, `lofreq call-parallel` syntax in v2.1.5:
+`lofreq call-parallel [options] <bam>`
+Options include `--pp-threads`, `--ref`, `--out`.
+I'll write:
+`lofreq call-parallel --pp-threads "$THREADS" --verbose --ref data/ref/chrM.fa --out "$vcf" "$bam"`
+
+Check `bcftools query` format string again. The prompt says:
+`bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`
+In bash, if I use double quotes around the format string, `${sample}` will expand. But `%CHROM` etc. are fine.
+So: `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"`
+
+Wait, bcftools format strings use `%` for fields. The prompt uses `{sample}` as a placeholder for bash expansion. I'll just use double quotes in bash: `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"`
+
+One thing: `bcftools query` might complain if `%INFO/AF` is not present or empty. But for this task, we assume it works. Alternatively, I could use `%INFO/AF` which is standard.
+
+Let's assemble the script carefully.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p results
+
+# Reference indexing (once)
+if [[ ! -f data/ref/chrM.fa.fai || ! -f data/ref/chrM.fa.bwt ]]; then
+    samtools faidx data/ref/chrM.fa
+    bwa index data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    bam="results/${sample}.bam"
+    bai="${bam}.bai"
+    vcf="results/${sample}.vcf"
+    vcfz="${vcf}.gz"
+    tbix="${vcfz}.tbi"
+
+    # Alignment & sorting
+    if [[ ! -f "$bam" ]]; then
+        bwa mem -t "$THREADS" \
+            "-R @RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            data/ref/chrM.fa \
+            "data/raw/${sample}_1.fq.gz" \
+            "data/raw/${sample}_2.fq.gz" | \
+        samtools sort -@ "$THREADS" -o "$bam"
+    fi
+
+    # BAM indexing
+    if [[ ! -f "$bai" ]]; then
+        samtools index -@ "$THREADS" "$bam"
+    fi
+
+    # Variant calling
+    if [[ ! -f "$vcfz" ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" \
+            --verbose \
+            --ref data/ref/chrM.fa \
+            --out "$vcf" \
+            "$bam"
+    fi
+
+    # VCF compression & indexing
+    if [[ ! -f "$tbix" ]]; then
+        bgzip "$vcf"
+        tabix -p vcf "$vcfz"
+        rm -f "$vcf"
+    fi
+done
+
+# Collapse step
+collapsed="results/collapsed.tsv"
+if [[ ! -f "$collapsed" ]]; then
+    {
+        printf 'sample\tchrom\tpos\tref\talt\taf\n'
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"
+        done
+    } > "$collapsed"
+fi
+```
+
+Wait, `bcftools query` format string: `%INFO/AF` might not be the correct tag for lofreq. Lofreq outputs `AF` in the INFO field? Actually, lofreq outputs `AF` in the FORMAT or INFO? In VCF, allele frequency is usually `AF` in INFO or `GQ` etc. But the prompt explicitly says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`. I will follow the prompt exactly.
+
+One detail: `bwa mem` `-R` argument. The prompt says:
+`-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`
+In bash, if I write `"-R @RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`, the `\t` will be passed literally as backslash-t because it's inside double quotes. That matches the requirement.
+
+Wait, `samtools sort` might need `-m` or other options? Default is fine.
+`lofreq call-parallel` might require `--verbose`? I'll keep it.
+`bgzip` and `tabix` are standard.
+
+Check idempotency: The script checks for each output file before running the step that creates it. If all exist, it skips everything and exits 0. This satisfies idempotency.
+
+One minor point: `samtools faidx` produces `.fai`. `bwa index` produces `.amb .ann .bwt .pac .sa`. Checking for `.bwt` is sufficient to know bwa index exists. I'll check for both or just one. The prompt says "Skip both if the index files already exist." I'll check `data/ref/chrM.fa.fai` and `data/ref/chrM.fa.bwt`.
+
+Wait, `bcftools query` format string in the prompt uses `{sample}` as a placeholder for bash variable expansion. In my script, I used `${sample}` inside double quotes. That's correct.
+
+Let's verify the exact command for bcftools from the prompt:
+`bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`
+I will write it as:
+`bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"`
+
+Is there any issue with `%INFO/AF`? Sometimes lofreq uses `AF` in INFO. It's fine.
+
+One thing: `lofreq call-parallel` might complain if `--verbose` is not recognized or if it expects `--sig` and `--bonf`. The prompt says: `(The bare --sig and --bonf lines come from Galaxy-runtime-supplied values; you can omit them and use lofreq's defaults. The load-bearing detail is that results/{sample}.bam is a positional argument at the end, not behind -i/-b/-bam.)`
+So I will omit `--verbose` to be safe, or keep it. It doesn't matter much. I'll keep it as in the plan but note that defaults are fine. Actually, I'll just follow the plan exactly but remove `--sig --bonf` as instructed.
+
+Wait, `lofreq call-parallel` syntax in v2.1.5:
+`lofreq call-parallel [options] <bam>`
+Options: `--pp-threads`, `--ref`, `--out`.
+I'll write it exactly as:
+`lofreq call-parallel --pp-threads "$THREADS" --ref data/ref/chrM.fa --out "$vcf" "$bam"`
+
+Let's double check the `-R` argument requirement.
+"Pass the read group via `-R` as a single double-quoted argument containing literal backslash-t between fields and colons between key and value: exact form: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`"
+In bash: `bwa mem -t "$THREADS" "-R @RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" ...`
+This is correct.
+
+One detail: `samtools sort` might produce a `.bam.bai`? No, `samtools index` produces it.
+The prompt says: `results/{sample}.bam.bai`
+My script creates it via `samtools index`.
+
+Check `collapsed.tsv` header: `sample\tchrom\tpos\tref\talt\taf`
+My script: `printf 'sample\tchrom\tpos\tref\talt\taf\n'`
+Correct.
+
+Check idempotency condition: "Re-runs on a fully populated results/ must exit 0 without re-doing work."
+My checks `if [[ ! -f "$bam" ]]; then ... fi` ensure this.
+
+One potential issue: `bcftools query` might output nothing for some positions if AF is missing, but that's fine. The prompt says to use that exact format string.
+
+Wait, `lofreq call-parallel` might need `--verbose`? I'll include it as in the plan. It doesn't hurt.
+Actually, the plan says:
+```
+lofreq call-parallel --pp-threads 4 --verbose
+--ref data/ref/chrM.fa --out results/{sample}.vcf
+--sig
+--bonf
+results/{sample}.bam
+```
+I'll just write it on one line for cleanliness, but keep `--verbose`.
+
+Let's verify `bwa mem` read group format. bwa expects `-R "@RG:ID:...:SM:...:LB:...:PL:..."` or `-R "@RG\tID:...:SM:...:LB:...:PL:..."`. The prompt says colons between key and value, and literal `\t` between fields. So `@RG\tID:M117-bl:SM:M117-bl:LB:M117-bl:PL:ILLUMINA`. My string matches this.
+
+One minor point: `samtools faidx` and `bwa index` should be guarded properly.
+```bash
+if [[ ! -f data/ref/chrM.fa.fai || ! -f data/ref/chrM.fa.bwt ]]; then
+    samtools faidx data/ref/chrM.fa
+    bwa index data/ref/chrM.fa
+fi
+```
+This is fine.
+
+Wait, `bwa index` might take a while on chrM (16kb), but it's fast.
+The prompt says "Assume the current working directory contains data/raw/ ... and data/ref/".
+All paths are relative.
+
+Check `bcftools query` format string again. The prompt uses `{sample}` as a placeholder. In bash, I'll use `${sample}`.
+`bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"`
+This is correct.
+
+One thing: `lofreq call-parallel` might require `--verbose`? I'll keep it.
+Actually, `lofreq call-parallel` in v2.1.5 might not need `--verbose`. I'll remove it to be safe, or keep it. It doesn't matter. I'll stick to the minimal required args as per standard practice, but the prompt explicitly lists `--verbose` in step 6. I'll include it.
+
+Wait, `lofreq call-parallel` might complain about `--verbose` if not supported? It is supported.
+I'll just write:
+`lofreq call-parallel --pp-threads "$THREADS" --ref data/ref/chrM.fa --out "$vcf" "$bam"`
+It's cleaner.
+
+Let's verify the exact command from step 6 again:
+`lofreq call-parallel --pp-threads 4 --verbose --ref data/ref/chrM.fa --out results/{sample}.vcf --sig --bonf results/{sample}.bam`
+I will follow it closely but omit `--sig --bonf` as instructed.
+`lofreq call-parallel --pp-threads "$THREADS" --verbose --ref data/ref/chrM.fa --out "$vcf" "$bam"`
+
+One detail: `bcftools query` format string in the prompt uses `%INFO/AF`. In some VCFs, AF is in INFO. It's fine.
+
+Check `collapsed.tsv` generation:
+```bash
+if [[ ! -f "$collapsed" ]]; then
+    {
+        printf 'sample\tchrom\tpos\tref\talt\taf\n'
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"
+        done
+    } > "$collapsed"
+fi
+```
+This is correct.
+
+Wait, `bcftools query` might output multiple ALT alleles as comma-separated. That's fine.
+The prompt says: `results/collapsed.tsv` must have columns `sample chrom pos ref alt af`.
+My script produces exactly that.
+
+One thing: `samtools sort` might need `-o` which is supported in samtools 1.21.
+`bwa mem -t 4` is supported.
+`lofreq call-parallel --pp-threads 4` is supported.
+`bgzip` and `tabix` are standard.
+
+All constraints met.
+I will produce the script now.
+Double check the `-R` argument: The prompt says "exact form: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`". In bash, I'll write it as `"-R @RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`. This preserves the backslashes.
+Wait, bwa expects `-R "@RG:..."` or `-R "@RG\t..."`. The prompt says colons between key and value, and `\t` between fields. So `@RG\tID:M117-bl:SM:M117-bl:LB:M117-bl:PL:ILLUMINA`. My string matches.
+
+One minor point: `bcftools query` format string might need `%INFO/AF` to be `%INFO/AF` or just `%AF`? The prompt says `%INFO/AF`. I'll stick to it.
+
+Final check of the script structure:
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p results
+
+# Reference indexing (once)
+if [[ ! -f data/ref/chrM.fa.fai || ! -f data/ref/chrM.fa.bwt ]]; then
+    samtools faidx data/ref/chrM.fa
+    bwa index data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    bam="results/${sample}.bam"
+    bai="${bam}.bai"
+    vcf="results/${sample}.vcf"
+    vcfz="${vcf}.gz"
+    tbix="${vcfz}.tbi"
+
+    # Alignment & sorting
+    if [[ ! -f "$bam" ]]; then
+        bwa mem -t "$THREADS" \
+            "-R @RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            data/ref/chrM.fa \
+            "data/raw/${sample}_1.fq.gz" \
+            "data/raw/${sample}_2.fq.gz" | \
+        samtools sort -@ "$THREADS" -o "$bam"
+    fi
+
+    # BAM indexing
+    if [[ ! -f "$bai" ]]; then
+        samtools index -@ "$THREADS" "$bam"
+    fi
+
+    # Variant calling
+    if [[ ! -f "$vcfz" ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" \
+            --verbose \
+            --ref data/ref/chrM.fa \
+            --out "$vcf" \
+            "$bam"
+    fi
+
+    # VCF compression & indexing
+    if [[ ! -f "$tbix" ]]; then
+        bgzip "$vcf"
+        tabix -p vcf "$vcfz"
+        rm -f "$vcf"
+    fi
+done
+
+# Collapse step
+collapsed="results/collapsed.tsv"
+if [[ ! -f "$collapsed" ]]; then
+    {
+        printf 'sample\tchrom\tpos\tref\talt\taf\n'
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"
+        done
+    } > "$collapsed"
+fi
+```
+
+Wait, `bcftools query` might fail if `%INFO/AF` is not present. But the prompt explicitly gives that format string. I'll follow it.
+Also, `lofreq call-parallel` might need `--verbose`? I'll keep it.
+One thing: `samtools sort` might produce a `.bam.bai`? No, `samtools index` does.
+The script looks solid.
+
+Check idempotency: If `results/` is populated, all `if [[ ! -f ... ]]` conditions are false, so nothing runs, and the script exits 0. Correct.
+Check paths: All relative to cwd. Correct.
+Check tools: Only listed tools used. Correct.
+Check first two lines: Correct.
+Check output files: Matches requirements.
+
+One minor adjustment: `bcftools query` format string in the prompt uses `{sample}` as a placeholder. In bash, I used `${sample}`. That's fine.
+I will ensure no extra whitespace or comments that could be construed as prose. The prompt says "Output ONLY the script — no prose, no markdown fences, no commentary before or after."
+
+I'll produce exactly the script.
+One detail: `lofreq call-parallel` might require `--verbose` to be on a new line or same line? Doesn't matter in bash.
+I'll keep it clean.
+
+Final check of the prompt: "Pass the read group via `-R` as a single double-quoted argument containing literal backslash-t between fields and colons between key and value: exact form: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`"
+My code: `"-R @RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"`
+This matches.
+
+All good.
+Proceeding. 
+Output matches exactly.
+One thing: `bcftools query` might need `%INFO/AF` or `%ALT`? The prompt says `%ALT`. I'll use `%ALT`.
+The prompt says: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz`
+I'll use exactly that.
+
+Ready. 
+Output generation. 
+(Self-Correction/Refinement during thought)
+Wait, `bcftools query` format string uses `%` for fields. The prompt's `{sample}` is a bash placeholder. I will use `${sample}` in double quotes.
+Also, `lofreq call-parallel` might complain if `--verbose` is not recognized? It is standard. I'll keep it.
+The script is robust.
+I will output it now. 
+One minor point: `samtools faidx` and `bwa index` should be guarded by checking both `.fai` and `.bwt`. I did that.
+All constraints met.
+Output matches request.
+Proceeds. 
+[Output Generation] -> *script*
+(Note: I'll make sure there are no markdown fences in the output as requested: "Output ONLY the script — no prose, no markdown fences, no commentary before or after.")
+I will paste raw text.
+Done. 
+Let's generate. 
+`#!/usr/bin/env bash`
+`set -euo pipefail`
+... (rest of script)
+All good. 
+Proceeds. 
+[Output Generation] (matches the refined script)
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p results
+
+# Reference indexing (once)
+if [[ ! -f data/ref/chrM.fa.fai || ! -f data/ref/chrM.fa.bwt ]]; then
+    samtools faidx data/ref/chrM.fa
+    bwa index data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    bam="results/${sample}.bam"
+    bai="${bam}.bai"
+    vcf="results/${sample}.vcf"
+    vcfz="${vcf}.gz"
+    tbix="${vcfz}.tbi"
+
+    # Alignment & sorting
+    if [[ ! -f "$bam" ]]; then
+        bwa mem -t "$THREADS" \
+            "-R @RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            data/ref/chrM.fa \
+            "data/raw/${sample}_1.fq.gz" \
+            "data/raw/${sample}_2.fq.gz" | \
+        samtools sort -@ "$THREADS" -o "$bam"
+    fi
+
+    # BAM indexing
+    if [[ ! -f "$bai" ]]; then
+        samtools index -@ "$THREADS" "$bam"
+    fi
+
+    # Variant calling
+    if [[ ! -f "$vcfz" ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" \
+            --verbose \
+            --ref data/ref/chrM.fa \
+            --out "$vcf" \
+            "$bam"
+    fi
+
+    # VCF compression & indexing
+    if [[ ! -f "$tbix" ]]; then
+        bgzip "$vcf"
+        tabix -p vcf "$vcfz"
+        rm -f "$vcf"
+    fi
+done
+
+# Collapse step
+collapsed="results/collapsed.tsv"
+if [[ ! -f "$collapsed" ]]; then
+    {
+        printf 'sample\tchrom\tpos\tref\talt\taf\n'
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"
+        done
+    } > "$collapsed"
+fi
+```
+Wait, the prompt says "Output ONLY the script — no prose, no markdown fences, no commentary before or after."
+I will output exactly the raw text without any formatting.
+Done. 
+Proceeds. 
+(Self-Correction/Verification during generation prep)
+Check `bcftools query` format string: `%INFO/AF` might be `%AF` in some versions, but I'll stick to prompt.
+Check `lofreq call-parallel` syntax: `--pp-threads` is correct for v2.1.5.
+Check `bwa mem -R`: The prompt says exact form `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"`. My code uses double quotes around the whole argument, which preserves `\t`. This is correct.
+All good.
+Output matches.
+Proceeds. 
+[Final Check of the Prompt]
+"First line must be: #!/usr/bin/env bash"
+"Second line must be: set -euo pipefail"
+"Assume the current working directory contains data/raw/ ... and data/ref/"
+"Write all outputs under results/"
+"Be idempotent"
+"Do not hardcode any path outside the current working directory."
+"Use only tools listed in TOOL_INVENTORY."
+"Total wall-clock must be under 600 seconds at THREADS=4."
+"Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose."
+
+Everything matches. I will generate the raw script now. 
+Note: I'll remove the markdown code block fences as requested. Just raw text.
+Done. 
+[Output Generation] -> *raw script*
+(Proceeds)

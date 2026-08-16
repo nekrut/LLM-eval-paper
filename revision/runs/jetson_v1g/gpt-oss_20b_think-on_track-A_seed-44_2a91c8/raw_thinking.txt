@@ -1,0 +1,228 @@
+We need to produce a bash script that follows plan. Must be idempotent: skip steps if outputs exist and newer than inputs.
+
+We have tools: bwa, samtools, bcftools, tabix, lofreq, etc. We also have bgzip? Not listed but can use bcftools view -O z or bgzip from htslib? Actually bgzip is part of htslib; not in TOOL_INVENTORY list but we can use bcftools +bgzip? Wait plan says compress with bgzip (not bcftools). But bgzip may be available as a separate binary. Not listed, but maybe present. However to be safe, we could use bcftools view -O z which is allowed. But plan explicitly says use bgzip. Let's assume bgzip is available in PATH because htslib provides it; not listed but likely present. We'll use bgzip.
+
+Also need tabix for indexing vcf.gz.
+
+We must avoid echo for user-facing prose, only tool outputs.
+
+Script structure:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+Define THREADS=4 and sample list array.
+
+Create results dir if missing: mkdir -p results
+
+Reference indexing: check existence of chrM.fa.fai or .amb etc. We'll check .amb file maybe; but better to check .amb exists. If not, run samtools faidx and bwa index.
+
+Per-sample loop:
+
+For each sample in list:
+- Define bam=results/${sample}.bam
+- Check if bam.bai exists? Actually we need both bam and bai. But we can skip entire sample if all outputs exist: bam, bai, vcf.gz.tbi. But also need to ensure they are newer than inputs.
+
+Simpler: For each step, check existence of output file; if missing or older than input(s), run command.
+
+Define functions maybe.
+
+We need to handle read group string with literal backslash-t. Use single quotes? Actually we need to pass argument containing \t characters literally. In bash, we can use single quotes around the whole string: -R '@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA'. But inside single quotes, variable expansion doesn't happen. So we need double quotes but escape backslashes? Wait requirement: The \t must remain two characters backslash and t; cannot be real tab. In bash, if we use double quotes with literal backslash-t, the shell will interpret \t as a literal t? Actually in double quotes, backslash escapes only certain characters: $, `, ", \, newline. So \t remains \t. Good. But variable expansion occurs. So we can do:
+
+-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"
+
+This will produce string with literal backslash-t sequences.
+
+Ok.
+
+Now alignment step: bwa mem -t 4 -R ... data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ 4 -o ${bam}
+
+Check if bam exists and newer than raw files? We'll check if bam is missing or older than either fastq. Use test -f.
+
+Similarly for bai: samtools index -@ 4 ${bam} -> results/${sample}.bam.bai
+
+Variant calling: lofreq call-parallel --pp-threads 4 --verbose --ref data/ref/chrM.fa --out results/${sample}.vcf --sig --bonf results/${sample}.bam
+
+But we can omit --sig and --bonf; but keep them as per plan. We'll include.
+
+Check if vcf.gz.tbi exists and newer than bam? Actually need to check if vcf.gz.tbi missing or older than bam. But also need to ensure that intermediate .vcf is not present? We will generate .vcf, then compress to .vcf.gz, index, remove .vcf.
+
+We can skip entire variant calling step if results/${sample}.vcf.gz.tbi exists and newer than bam. But we also need to check maybe the vcf.gz file itself. We'll just check tbi existence.
+
+Implementation:
+
+if [ ! -f "${bam}.bai" ] || [[ $(stat -c %Y "$bam") -gt $(stat -c %Y "${bam}.bai") ]]; then samtools index ... fi
+
+But easier: if output missing, run step; else skip. But we also need to handle case where outputs exist but older than inputs. We'll check timestamps.
+
+We'll use stat -c %Y for modification time.
+
+Define function newer? Actually we can just compare each input file's mtime with output's mtime.
+
+Simplify: For each sample:
+
+# alignment
+if [ ! -f "$bam" ] || [[ $(stat -c %Y data/raw/${sample}_1.fq.gz) -gt $(stat -c %Y "$bam") ]] || [[ $(stat -c %Y data/raw/${sample}_2.fq.gz) -gt $(stat -c %Y "$bam") ]]; then
+   bwa mem ... | samtools sort ...
+fi
+
+# index
+bai=${bam}.bai
+if [ ! -f "$bai" ] || [[ $(stat -c %Y "$bam") -gt $(stat -c %Y "$bai") ]]; then
+   samtools index -@ 4 "$bam"
+fi
+
+# variant calling
+vcf="${sample}.vcf"
+vcf_gz="results/${sample}.vcf.gz"
+tbi="results/${sample}.vcf.gz.tbi"
+
+if [ ! -f "$tbi" ] || [[ $(stat -c %Y "$bam") -gt $(stat -c %Y "$tbi") ]]; then
+   # call
+   lofreq call-parallel --pp-threads 4 --verbose --ref data/ref/chrM.fa --out "$vcf" --sig --bonf "$bam"
+   bgzip -c "$vcf" > "$vcf_gz"
+   tabix -p vcf "$vcf_gz"
+   rm "$vcf"
+fi
+
+But we also need to ensure that if .vcf.gz exists but older than bam, we still recompute. So check tbi existence and its mtime relative to bam.
+
+Now collapsed.tsv: header + concatenated bcftools query outputs.
+
+We need to rebuild only if any input VCF is newer than TSV. We'll compute latest modification time among all results/${sample}.vcf.gz files. If tsv missing or older, regenerate.
+
+Implementation:
+
+tsv="results/collapsed.tsv"
+latest=0
+for sample in ...; do
+  vcf_gz="results/${sample}.vcf.gz"
+  if [ -f "$vcf_gz" ]; then
+    mtime=$(stat -c %Y "$vcf_gz")
+    (( mtime > latest )) && latest=$mtime
+  fi
+done
+
+if [ ! -f "$tsv" ] || [[ $(stat -c %Y "$tsv") -lt $latest ]]; then
+   # generate header and concat
+   printf "sample\tchrom\tpos\tref\talt\taf\n" > "$tsv"
+   for sample in ...; do
+     bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> "$tsv"
+   done
+fi
+
+Need to ensure bcftools query works on compressed vcf.
+
+Also need to create results dir earlier.
+
+Reference indexing: check if data/ref/chrM.fa.fai exists; if not, run samtools faidx. For bwa index, check for .amb file maybe. We'll just check for chrM.fa.bwt or .amb. Use -f data/ref/chrM.fa.amb? Actually bwa index produces .amb .ann .bwt .pac .sa. We can check for .amb.
+
+Implementation:
+
+ref="data/ref/chrM.fa"
+if [ ! -f "${ref}.fai" ]; then
+   samtools faidx "$ref"
+fi
+
+if [ ! -f "${ref}.amb" ]; then
+   bwa index "$ref"
+fi
+
+Now we need to ensure that the script is idempotent: re-running on fully populated results/ should exit 0 without doing work. Our checks will skip steps if outputs exist and newer than inputs.
+
+Edge cases: If any output missing, it will run step.
+
+Also need to avoid writing to stdout/stderr beyond tool natural outputs; we use printf for header but that's allowed? The requirement says "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." Using printf is still writing to stdout. But it's part of script output, not user-prose? It's generating collapsed.tsv file content via redirection > "$tsv". That writes to file, not stdout. The printf command outputs to stdout but redirected to file. So no extraneous output.
+
+But we also use printf for header; that's fine.
+
+We need to ensure that the script uses only tools from inventory: bwa, samtools, bcftools, tabix, lofreq, bgzip (maybe). We used bgzip; not in list but part of htslib. But maybe allowed. If not, we can use bcftools view -O z. Let's use bcftools view -O z to compress.
+
+But plan says use bgzip. We'll assume bgzip available.
+
+Also need to ensure that we don't call any other tools like seqkit etc.
+
+Ok.
+
+Now produce final script.
+
+Check for missing variables: sample names contain hyphen and dot? They are M117-bl, M117-ch, M117C1-bl, M117C1-ch. Hyphens fine. In bash arrays, need to quote properly.
+
+Define samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+Now script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+# Reference indexing
+ref="data/ref/chrM.fa"
+if [ ! -f "${ref}.fai" ]; then
+    samtools faidx "$ref"
+fi
+if [ ! -f "${ref}.amb" ]; then
+    bwa index "$ref"
+fi
+
+for sample in "${samples[@]}"; do
+    bam="results/${sample}.bam"
+    bai="${bam}.bai"
+    vcf="results/${sample}.vcf"
+    vcf_gz="results/${sample}.vcf.gz"
+    tbi="results/${sample}.vcf.gz.tbi"
+
+    # Alignment
+    if [ ! -f "$bam" ] || \
+       [[ $(stat -c %Y data/raw/${sample}_1.fq.gz) -gt $(stat -c %Y "$bam") ]] || \
+       [[ $(stat -c %Y data/raw/${sample}_2.fq.gz) -gt $(stat -c %Y "$bam") ]]; then
+        bwa mem -t "$THREADS" -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+            data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | \
+        samtools sort -@ "$THREADS" -o "$bam"
+    fi
+
+    # BAM index
+    if [ ! -f "$bai" ] || [[ $(stat -c %Y "$bam") -gt $(stat -c %Y "$bai") ]]; then
+        samtools index -@ "$THREADS" "$bam"
+    fi
+
+    # Variant calling
+    if [ ! -f "$tbi" ] || [[ $(stat -c %Y "$bam") -gt $(stat -c %Y "$tbi") ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" --verbose \
+            --ref "$ref" --out "$vcf" --sig --bonf "$bam"
+        bgzip -c "$vcf" > "$vcf_gz"
+        tabix -p vcf "$vcf_gz"
+        rm "$vcf"
+    fi
+done
+
+# Collapse table
+tsv="results/collapsed.tsv"
+latest=0
+for sample in "${samples[@]}"; do
+    vcf_gz="results/${sample}.vcf.gz"
+    if [ -f "$vcf_gz" ]; then
+        mtime=$(stat -c %Y "$vcf_gz")
+        (( mtime > latest )) && latest=$mtime
+    fi
+done
+
+if [ ! -f "$tsv" ] || [[ $(stat -c %Y "$tsv") -lt $latest ]]; then
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > "$tsv"
+    for sample in "${samples[@]}"; do
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> "$tsv"
+    done
+fi
+
+That's it. Ensure no stray echo. Use printf only for header.
+
+Check that we didn't use any disallowed tools: yes.
+
+We used bgzip; not in inventory but likely available. If not, could replace with bcftools view -O z. But plan says bgzip. We'll keep.
+
+Also need to ensure that the read group string uses literal backslash-t. In our script we wrote "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA". The double backslashes produce a single backslash in the argument? Wait inside double quotes, \t is not special; but to get literal backslash and t, we need to escape backslash itself. In double quotes, backslash escapes only certain characters. To produce a literal backslash, we can write '\\'. So "@RG\\tID:${sample}\\tSM..." will result in @RG\tID:... etc. Good.
+
+Thus final script ready.

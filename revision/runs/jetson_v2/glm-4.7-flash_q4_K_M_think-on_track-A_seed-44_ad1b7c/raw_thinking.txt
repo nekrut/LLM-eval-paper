@@ -1,0 +1,146 @@
+1.  **Analyze the Request:**
+    *   **Goal:** Create a single, self-contained bash script for per-sample variant calling on mitochondrial DNA (mtDNA) amplicon data.
+    *   **Input:** `data/raw/` contains paired-end FASTQs. `data/ref/` contains `chrM.fa`.
+    *   **Output:** `results/{sample}.bam`, `results/{sample}.bam.bai`, `results/{sample}.vcf.gz`, `results/{sample}.vcf.gz.tbi`, `results/collapsed.tsv`.
+    *   **Constraints:**
+        *   Shebang: `#!/usr/bin/env bash`
+        *   Set: `set -euo pipefail`
+        *   Paths: Relative only (no absolute paths).
+        *   Idempotent: Must exit 0 on re-run if results exist.
+        *   Tools: `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`, `SnpSift`, `snpEff`, `fastqc`, `seqkit`, `snakemake`, `shellcheck`, `java`. (Note: The plan mentions `bgzip`, which is usually part of `samtools` or `htslib`, but `tabix` is listed. `tabix` usually comes with `bgzip`. I will assume `bgzip` is available via `samtools` or `htslib` path, or I should check if `samtools` has it. The plan explicitly says `bgzip -f results/{sample}.vcf`. I will use `samtools bgzip` to be safe and consistent with the tool inventory, or just `bgzip` if standard. The inventory lists `samtools` and `tabix`. `tabix` is often a symlink to `samtools bgzip` or requires `samtools bgzip`. I will use `samtools bgzip` to ensure it works with the provided inventory, or just `bgzip` if I assume standard linux. The prompt says "Use only tools listed in TOOL_INVENTORY". `bgzip` isn't explicitly listed, but `tabix` is. `tabix` usually depends on `bgzip`. I will use `samtools bgzip` to be strictly compliant with the inventory, or check if `tabix` implies it. Actually, standard practice with `tabix` is `samtools bgzip`. I'll use `samtools bgzip` to be safe, or just `bgzip` if I assume it's part of the environment. Let's look at the plan again. It says `bgzip -f`. I will use `samtools bgzip` to be strictly compliant with the inventory provided, as `bgzip` isn't explicitly in the list, but `samtools` is. Wait, `tabix` is listed. `tabix` is often a standalone binary or part of `htslib`. If `tabix` is available, `bgzip` is usually available. I will use `samtools bgzip` to be safe and consistent with the tool inventory.)
+    *   **Plan:** Follow the provided "Implementation Plan" strictly.
+
+2.  **Step-by-Step Implementation:**
+
+    *   **Header:**
+        ```bash
+        #!/usr/bin/env bash
+        set -euo pipefail
+        ```
+
+    *   **Constants & Setup:**
+        ```bash
+        THREADS=4
+        SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+        mkdir -p results
+        ```
+
+    *   **Step 1: BWA Index:**
+        ```bash
+        [[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+        ```
+
+    *   **Step 2: Samtools Faidx:**
+        ```bash
+        [[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+        ```
+
+    *   **Step 3: Alignment & Sort:**
+        ```bash
+        for sample in "${SAMPLES[@]}"; do
+            [[ -f results/${sample}.bam ]] || {
+                bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ "$THREADS" -o "results/${sample}.bam" -
+            }
+        done
+        ```
+
+    *   **Step 4: BAM Index:**
+        ```bash
+        for sample in "${SAMPLES[@]}"; do
+            [[ -f results/${sample}.bam.bai ]] || samtools index -@ "$THREADS" "results/${sample}.bam"
+        done
+        ```
+
+    *   **Step 5: LoFreq Call:**
+        ```bash
+        for sample in "${SAMPLES[@]}"; do
+            [[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] || lofreq call-parallel --pp-threads "$THREADS" -f data/ref/chrM.fa -o "results/${sample}.vcf" "results/${sample}.bam"
+        done
+        ```
+
+    *   **Step 6: VCF Compression & Tabix:**
+        ```bash
+        for sample in "${SAMPLES[@]}"; do
+            [[ -f results/${sample}.vcf.gz.tbi ]] || {
+                samtools bgzip -f "results/${sample}.vcf" && tabix -p vcf "results/${sample}.vcf.gz"
+            }
+        done
+        ```
+
+    *   **Step 7: Collapsed TSV:**
+        ```bash
+        printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+        for sample in "${SAMPLES[@]}"; do
+            bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" | awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+        done
+        ```
+
+3.  **Refining and Checking Constraints:**
+
+    *   *Constraint Check:* "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." -> The script uses `printf` for the header, which is standard. No extra `echo` statements.
+    *   *Constraint Check:* "Use only tools listed in TOOL_INVENTORY." -> Used `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`. `samtools bgzip` is used instead of `bgzip` to ensure it's available via the inventory.
+    *   *Constraint Check:* "Total wall-clock must be under 600 seconds at THREADS=4." -> LoFreq on a 16kb reference with 4 samples is extremely fast. This is easily met.
+    *   *Constraint Check:* "Idempotent." -> The `[[ -f ... ]] ||` guards ensure no work is redone.
+    *   *Constraint Check:* "No hardcoding paths." -> All paths are relative (`data/`, `results/`).
+    *   *Constraint Check:* "RG string gotchas." -> Used literal `\t` in double quotes.
+    *   *Constraint Check:* "LoFreq gotchas." -> Used `--pp-threads`, not `-t`. Used `-f` for reference.
+    *   *Constraint Check:* "bcftools query gotchas." -> Used `%INFO/AF`.
+
+4.  **Final Code Assembly:**
+
+    Combine the pieces into the final script structure.
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    THREADS=4
+    SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+    mkdir -p results
+
+    # 1. BWA Index
+    [[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+
+    # 2. Samtools Faidx
+    [[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+    # 3. Alignment & Sort
+    for sample in "${SAMPLES[@]}"; do
+        [[ -f results/${sample}.bam ]] || {
+            bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ "$THREADS" -o "results/${sample}.bam" -
+        }
+    done
+
+    # 4. BAM Index
+    for sample in "${SAMPLES[@]}"; do
+        [[ -f results/${sample}.bam.bai ]] || samtools index -@ "$THREADS" "results/${sample}.bam"
+    done
+
+    # 5. Variant Calling (LoFreq)
+    for sample in "${SAMPLES[@]}"; do
+        [[ -f results/${sample}.vcf || -f results/${sample}.vcf.gz ]] || lofreq call-parallel --pp-threads "$THREADS" -f data/ref/chrM.fa -o "results/${sample}.vcf" "results/${sample}.bam"
+    done
+
+    # 6. VCF Compression & Tabix
+    for sample in "${SAMPLES[@]}"; do
+        [[ -f results/${sample}.vcf.gz.tbi ]] || {
+            samtools bgzip -f "results/${sample}.vcf" && tabix -p vcf "results/${sample}.vcf.gz"
+        }
+    done
+
+    # 7. Collapsed TSV
+    printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" | awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+    done
+    ```
+
+5.  **Final Review:**
+    *   Does `samtools bgzip` exist? The inventory lists `samtools`. `samtools` version 1.21 definitely has `bgzip`. This is the safest way to invoke it.
+    *   Does `tabix` exist? Yes.
+    *   Does `lofreq` exist? Yes.
+    *   Are variables quoted? Yes (`"$THREADS"`, `"${sample}"`).
+    *   Is the header correct? Yes.
+    *   Is the output directory correct? Yes.
+
+    The script looks solid. I will output it directly.

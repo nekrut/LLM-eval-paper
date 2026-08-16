@@ -1,0 +1,183 @@
+We need to produce a self-contained bash script with first line "#!/usr/bin/env bash" (note they wrote /usr/ bin? Actually they said 1st line must be: #!/usr/ bin/ env bash . That's weird: maybe typo. Should be "#!/usr/bin/env bash". But they explicitly say first line must be: #!/usr/ bin/ env bash . So we must output exactly that string, not correct path. We'll follow instruction.
+
+Second line set -euo pipefail
+
+Then script body.
+
+We need to use only tools in inventory; no echo for user-facing prose. Use conditional checks etc.
+
+Need idempotency: check if results files exist and are newer than inputs.
+
+We cannot hardcode absolute paths, but relative is fine.
+
+We'll create results/ directory.
+
+Reference indexing: samtools faidx data/ref/chrM.fa -> chrM.fa.fai ; bwa index data/ref/chrM.fa -> .amb .ann .bwt .pac .sa
+
+But we need to check if index exists; skip if exists.
+
+Per-sample alignment: bwa mem -t 4 data/raw/{sample}_1. fq.gz data/raw/{sample}_2.fq.gz -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA" | samtools sort -@ 4 -o results/{sample}.bam
+
+But need to ensure output file exists and is newer than inputs; if not, run.
+
+Similarly index with samtools index -@ 4 results/{sample}.bam -> results/{sample}.bam.bai
+
+lofreq call-parallel: lofreq call-parallel --pp-threads 4 data/ref/chrM.fa results/{sample}.bam > results/{sample}.vcf (uncompressed). Then bgzip -c results/{sample}.vcf -> results/{sample}.vcf.gz ; tabix -p vcf results/{sample}.vcf.gz.tbi
+
+Remove intermediate .vcf.
+
+Collapse: For each sample, bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz -> collect lines; then concatenate and add header.
+
+But need to check if collapsed.tsv exists and is newer than any VCF.gz; if not, rebuild.
+
+We must write all outputs under results/. Use relative paths.
+
+Need to ensure script idempotent: each step checks existence and timestamps.
+
+Simplify: we can just run steps sequentially with checks.
+
+Implementation details:
+
+- Define THREADS=4
+
+- Sample list array
+
+- Create results/ if not exists (mkdir -p)
+
+- Index reference: check if chrM.fa.fai exists; if not, samtools faidx data/ref/chrM.fa ; then bwa index data/ref/chrM.fa ; but need to create .amb etc.
+
+But we can just run both commands unconditionally? Idempotent: samtools faidx will error if file already indexed? It may produce same output; fine.
+
+Similarly bwa index on existing index files is okay.
+
+- For each sample:
+
+  - Build input list: data/raw/{sample}_1. fq.gz etc
+
+  - Check if results/{sample}.bam exists and newer than both FASTQs; else run bwa mem + samtools sort.
+
+  - Index BAM similarly.
+
+  - Call lofreq call-parallel > temp .vcf ; bgzip ; tabix ; rm .vcf
+
+  - Ensure VCF.gz exists and is newer than .bam? Not needed.
+
+- Collapse: For each sample, bcftools query ... -> append to file; after loop add header at top. But need to prepend header only once.
+
+Simplify: Build collapsed.tsv empty then for each sample run bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz >> collapsed.tsv ; after loop, if file not empty, prepend header using sed '1s/.*//; 2i sample\ttest'? But cannot use echo.
+
+We can use printf to write header at beginning: but that would overwrite. Better: create temporary file with header then cat all lines.
+
+Simpler: Use awk to prepend header if not exists.
+
+But we need idempotency: only rebuild if any VCF.gz newer than collapsed.tsv.
+
+Implementation:
+
+- If results/collapsed.tsv does not exist or is older than any VCF.gz, then:
+
+  - Create temp file tmp.tsv
+
+  - Write header using printf 'sample\tchrom\tpos\tref\talt\taf\n' >> tmp.tsv
+
+  - For each sample: bcftools query ... >> tmp.tsv
+
+  - mv tmp.tsv results/collapsed.tsv
+
+- Else exit.
+
+But need to check timestamps: we can use find with -mmin? Simpler: if any VCF.gz newer than collapsed, rebuild.
+
+We'll just do conditional: if [[ ! -f results/collapsed.tsv ]] || (( $(stat -c %Y results/collapsed.tsv)< $(stat -c %Y results/M117-*.vcf.gz) )); then rebuild.
+
+But need to compare with any VCF.gz; we can loop.
+
+Simplify: if [[ ! -f results/collapsed.tsv ]] || (( $(date +%s -r results/collapsed.tsv)< $(date +%s -r results/M117-*.vcf.gz) )); then rebuild.
+
+But date may be okay.
+
+Now script must not output anything beyond tool outputs. So no echo.
+
+We'll write script accordingly.
+
+Potential issues: using 'set -euo pipefail' ensures exit on errors; but we need idempotency checks that don't cause error if file missing? If results/collapsed.tsv missing, we rebuild fine.
+
+Now produce final script.
+
+First line: #!/usr/ bin/env bash (exact). Let's output exactly as given.
+
+Second line: set -euo pipefail
+
+Then body.
+
+Let's craft:
+
+#!/usr/ bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+RESULTS_DIR=results
+
+mkdir -p "$RESULTS_DIR"
+
+# Reference indexing (idempotent)
+samtools faidx data/ref/chrM.fa
+bwa index data/ref/chrM.fa
+
+for S in "${SAMPLES[@]}"; do
+  # Input FASTQs
+  IN1=data/raw/${S}_1.fq.gz
+  IN2=data/raw/${S}_2.fq.gz
+  OUT_BAM=results/${S}.bam
+  OUT_BAI=results/${S}.bam.bai
+
+  # Alignment + sort if BAM not newer than inputs
+  if [[ ! -f "$OUT_BAM" ]] || (( $(stat -c %Y "$OUT_BAM")< $(stat -c %Y "$IN1") )) || (( $(stat -c %Y "$OUT_BAM")< $(stat -c %Y "$IN2") )); then
+    bwa mem -t $THREADS "$IN1" "$IN2" \
+      -R "@RG\tID:${S}\tSM:${S}\tLB:${S}\tPL:ILLUMINA" | \
+    samtools sort -@ $THREADS -o "$OUT_BAM"
+  fi
+
+  # Index BAM
+  if [[ ! -f "$OUT_BAI" ]] || (( $(stat -c %Y "$OUT_BAI")< $(stat -c %Y "$OUT_BAM") )); then
+    samtools index -@ $THREADS "$OUT_BAM"
+  fi
+
+  # Variant calling with lofreq call-parallel
+  VCF_TMP=results/${S}.vcf
+  if [[ ! -f "$VCF_TMP" ]] || (( $(stat -c %Y "$VCF_TMP")< $(stat -c %Y "$OUT_BAM") )); then
+    lofreq call-parallel --pp-threads $THREADS data/ref/chrM.fa "$OUT_BAM" > "$VCF_TMP"
+  fi
+
+  # Compress and index VCF
+  if [[ ! -f results/${S}.vcf.gz ]] || (( $(stat -c %Y results/${S}.vcf.gz)< $(stat -c %Y "$VCF_TMP") )); then
+    bgzip -c "$VCF_TMP" > results/${S}.vcf.gz
+    tabix -p vcf results/${S}.vcf.gz.tbi
+    rm "$VCF_TMP"
+  fi
+
+done
+
+# Collapse VCFs to TSV
+COLLAPSE=results/collapsed.tsv
+if [[ ! -f "$COLLAPSE" ]] || (( $(date +%s -r $COLLAPSE)< $(date +%s -r results/M117-*.vcf.gz) )); then
+  tmp=$RESULTS_DIR/tmp_collapsed.tsv
+  printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$tmp"
+  for S in "${SAMPLES[@]}"; do
+    bcftools query -f '{S}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${S}.vcf.gz >> "$tmp"
+  done
+  mv "$tmp" "$COLLAPSE"
+fi
+
+Now ensure idempotency: all steps check timestamps.
+
+Potential issue: using $(date +%s -r file) may be okay.
+
+But we need to compare with any VCF.gz; we used M117-*.vcf.gz which is fine.
+
+Now script ends. No extra output.
+
+Make sure no echo statements.
+
+Now produce final answer: just the script lines.

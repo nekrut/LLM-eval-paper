@@ -1,0 +1,162 @@
+We need to produce a bash script that does per-sample variant calling on paired-end MiSeq amplicon samples mapped to chrM (16569 bp). Output results/{sample}.bam, .bai, .vcf.gz, .vctbi, and collapsed.tsv with columns sample chrom pos ref alt af.
+
+We must be idempotent: rerunning on populated results/ should exit 0 without redoing work or error. So script should check if outputs exist and skip steps accordingly.
+
+Workflow:
+
+1. FastQC? Not required for variant calling but maybe needed to ensure quality. But we can just call bwa mem, samtools view, samtools sort, samtools index, bcftools view -f, gzip, tabix, then generate collapsed.tsv using bcftools query or seqkit.
+
+But need per-sample: each sample has two paired-end files (sample_1. fq.gz, sample_2.fq.gz). So we will call bwa mem chrM.fa<sample>_1.fq.gz<sample>_2.fq.gz > results/{sample}.bam
+
+Then samtools view -@4? Actually samtools sort and index.
+
+But need to ensure idempotent: if .bam exists, skip sorting/indexing? But variant calling may produce new bam anyway. However we can just run full pipeline each time; but if outputs exist, maybe skip steps that would overwrite? The requirement: rerunning on a populated results/ directory must exit 0 without redoing work or erroring. That suggests script should be idempotent: if any output exists, it should not attempt to recompute and just exit successfully.
+
+Thus we need to check for existence of results/{sample}.bam etc; if all exist, just exit 0.
+
+But also need to generate collapsed.tsv only once? It may need to be regenerated each time? Probably yes: per run produce collapsed table. But idempotent means if it exists already, we shouldn't recompute but still output same? Might be okay to skip generating bam/vcf etc and just exit.
+
+Simplify: script checks if any of the expected outputs exist; if all exist, exit 0. Else perform pipeline for each sample sequentially.
+
+But need to ensure that if some outputs missing (e.g., only .bam exists) we still compute vcf? Probably yes.
+
+Implementation steps:
+
+- For each sample in list: M117-bl, M117-ch, M117C1-bl, M117C1-ch
+
+- Define output dir results/ if not exist (mkdir -p)
+
+- Check if results/{sample}.bam exists; if yes skip to next.
+
+- Run bwa mem chrM.fa ${sample}_1.fq.gz ${sample}_2.fq.gz > results/${sample}.bam
+
+- samtools view -@4? Actually sort: samtools sort -@4 results/${sample}.bam -o results/${sample}.sorted.bam (but we want .bam final). Maybe just use samtools view to produce sorted bam directly.
+
+But variant calling: bcftools view -f 0 results/${sample}.bam > results/${sample}.vcf
+
+Then gzip and index: gzip results/${sample}.vcf && tabix -p vcf results/${sample}.vcf.gz
+
+Now generate collapsed.tsv: Use bcftools query -h? Actually we need per sample aggregated counts. Could use seqkit to aggregate.
+
+seqkit aggregate -i results/${sample}.bam -o results/collapsed.tsv -c sample chrom pos ref alt af
+
+But need header and tab-separated.
+
+seqkit aggregate command: seqkit aggregate -i input.bam -o output.tsv -c column1,column2,...? Let's check typical usage: seqkit aggregate -i bam -o tsv -c 0,1,2,3,4,5 maybe. But we need columns sample chrom pos ref alt af.
+
+Better to use bcftools query -h results/${sample}.vcf.gz | awk ... but that would produce per variant lines.
+
+Simplify: Use seqkit aggregate with appropriate columns.
+
+Assume bam has fields: 0 sample, 1 chr, 2 pos, 3 ref, 4 alt, 5 af. So we can do:
+
+seqkit aggregate -i results/${sample}.bam -o results/collapsed.tsv -c 0,1,2,3,4,5
+
+But need header: seqkit may add header automatically.
+
+Now ensure idempotent: if collapsed.tsv exists and matches? Hard to check. We'll just generate it each time; but requirement says rerunning on populated results/ must exit 0 without redoing work or erroring. That suggests script should not attempt to recompute any outputs if they already exist.
+
+Thus we need to check existence of all output files for each sample: .bam, .vcf.gz, .vctbi? Actually index is .tbi (tabix). So check .bam exists; if yes skip bwa etc. But variant calling may produce new vcf even if bam exists. However we could just exit 0.
+
+Simplify: At start, loop over samples; if results/${sample}.bam exists then continue to next sample else run pipeline and generate all outputs for that sample. After processing all samples, check if collapsed.tsv exists? If not create it using seqkit aggregate across all samples? Actually need per-sample aggregated table.
+
+But we can just generate collapsed.tsv after each sample's bam is processed: use seqkit aggregate on its .bam to produce collapsed.tsv (overwrites). That will be idempotent only if we don't re-run script with same inputs; but if script runs again, it would recompute.
+
+But requirement: rerunning on a populated results/ directory must exit 0 without redoing work or erroring. So script should detect that all outputs exist and just exit 0. That means after processing samples, we check for existence of .bam, .vcf.gz, .tbi, collapsed.tsv; if all exist, exit 0.
+
+Thus final script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# List of samples
+samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+for sample in "${samples[@]}"; do
+  bam="results/${sample}.bam"
+  if [[ -f "$bam" ]]; then
+    continue
+  fi
+
+  # Ensure results dir exists
+  mkdir -p results
+
+  # BWA mem
+  bwa mem data/ref/chrM.fa "${sample}_1.fq.gz" "${sample}_2.fq.gz" > "$bam"
+
+  # Sort and index (maybe not needed if we use view)
+  samtools sort -@4 "$bam" -o "$bam"
+  samtools index "$bam"
+
+  # Bcftools view to vcf
+  bcftools view -f 0 "$bam" > results/${sample}.vcf
+  gzip results/${sample}.vcf && tabix -p vcf results/${sample}.vcf.gz
+
+done
+
+# Generate collapsed.tsv using seqkit aggregate on each sample's bam? Actually need combined table.
+# Use seqkit to aggregate all samples into one tsv
+seqkit aggregate -i results/*.bam -o results/collapsed.tsv -c 0,1,2,3,4,5
+
+exit 0
+
+But this may redo work if .bam exists. Also we need idempotent: script should not attempt to recompute if outputs exist.
+
+Thus modify: before processing each sample, check if all expected outputs for that sample exist (bam, vcf.gz, tbi). If yes skip.
+
+Implementation:
+
+for sample in ...; do
+  bam=results/${sample}.bam
+  vcfg=results/${sample}.vcf.gz
+  tbi=results/${sample}.tbi
+  if [[ -f "$bam" && -f "$vcfg" && -f "$tbi" ]]; then continue; fi
+
+  # run pipeline, creating all three files
+
+After loop, check collapsed.tsv exists? If not create.
+
+But we also need to ensure that seqkit aggregate does not redo if collapsed already exists. Could just exit 0 after checking existence of collapsed.tsv as well.
+
+Thus final script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+for sample in "${samples[@]}"; do
+  bam="results/${sample}.bam"
+  vcfg="results/${sample}.vcf.gz"
+  tbi="results/${sample}.tbi"
+
+  if [[ -f "$bam" && -f "$vcfg" && -f "$tbi" ]]; then
+    continue
+  fi
+
+  mkdir -p results
+
+  bwa mem data/ref/chrM.fa "${sample}_1.fq.gz" "${sample}_2.fq.gz" > "$bam"
+  samtools sort -@4 "$bam" -o "$bam"
+  samtools index "$bam"
+
+  bcftools view -f 0 "$bam" > results/${sample}.vcf
+  gzip results/${sample}.vcf && tabix -p vcf results/${sample}.vcf.gz
+
+done
+
+if [[ ! -f "results/collapsed.tsv" ]]; then
+  seqkit aggregate -i results/*.bam -o results/collapsed.tsv -c 0,1,2,3,4,5
+fi
+
+exit 0
+
+But need to ensure that if any output missing (e.g., bam exists but vcf not), script will recompute. That's okay.
+
+Now check idempotent: If all outputs exist, loop skips processing, then collapsed.tsv may already exist; if not, seqkit aggregate would run again? Actually we only generate collapsed.tsv if missing. So if it exists, no redo.
+
+Thus script meets constraints.
+
+Need to ensure no echo statements beyond natural output. We have mkdir -p results (no echo). Good.
+
+Now produce final answer: just the script lines.

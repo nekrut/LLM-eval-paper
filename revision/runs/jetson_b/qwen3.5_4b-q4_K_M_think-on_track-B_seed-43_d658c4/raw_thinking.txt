@@ -1,0 +1,386 @@
+Thinking Process:
+
+1.  **Analyze the Request:**
+    *   **Goal:** Create a self-contained bash script for per-sample variant calling on mitochondrial DNA (chrM) using provided FASTQ files and reference genome.
+    *   **Inputs:** `data/raw/` contains paired-end FASTQs (`_1.fq.gz`, `_2.fq.gz`) for 4 samples. `data/ref/` contains `chrM.fa`.
+    *   **Outputs:** `results/{sample}.bam`, `.bai`, `{sample}.vcf.gz`, `.tbi`, and a collapsed table `collapsed.tsv`.
+    *   **Constraints:**
+        *   First line: `#!/usr/bin/env bash`
+        *   Second line: `set -euo pipefail`
+        *   Working directory contains data/raw/ and data/ref/. Outputs go to results/.
+        *   Idempotent (exit 0 if outputs exist).
+        *   No hardcoded absolute paths.
+        *   Use only specified tools (`bwa`, `samtools`, `bcftools`, `tabix`, `lofreq` is listed but likely not needed for standard variant calling, `SnpSift`, `snpEff`, etc.). Wait, the prompt says "Use only tools listed in TOOL_INVENTORY".
+        *   Wall-clock < 600 seconds at THREADS=4. (Note: The script itself doesn't need to be threaded unless specified, but I should keep it efficient). Actually, looking at `TOOL_INVENTORY`, there is no explicit threading tool like GNU parallel or xargs mentioned in the list other than standard bash features. However, bcftools can handle multiple files efficiently if merged later.
+        *   No echo for user-facing prose (except maybe minimal logging via tools' output).
+        *   Idempotency check: If `results/` exists and contains expected outputs, skip processing? The prompt says "rerunning on a populated results/ directory must exit 0 without redoing work or erroring". This implies I need to check if the final VCFs exist before running alignment/calling.
+        *   No conda/pip/apt/wget calls inside script (assume tools are already installed).
+
+2.  **Workflow Design:**
+    *   Step 1: Check for idempotency conditions. If all required outputs (`results/{sample}.vcf.gz.tbi`) exist, exit successfully without doing anything else? Or just check if the final collapsed table exists? The prompt says "rerunning on a populated results/ directory must exit 0". Usually, this means checking existence of intermediate files or final output to avoid re-running. Let's assume we need to ensure `results/{sample}.vcf.gz.tbi` exist for all samples before skipping.
+    *   Step 2: Create `results/` if it doesn't exist (mkdir -p).
+    *   Step 3: For each sample, run BWA-MEM alignment (`bwa mem`). Output to BAM in results/. Index with `samtools`. Sort and index? Usually bwa-mem outputs sorted by default. Let's use `samtools sort` just to be safe or rely on `-t` (threading) inside bwa if available, but standard is output unsorted sometimes depending on version/flags. BWA 0.7.18 usually needs sorting for some tools like bcftools mpileup? Actually modern pipelines often use `bwa mem -M ... | samtools sort`.
+    *   Step 4: Variant Calling. The prompt mentions `lofreq` in the inventory but standard practice with BWA+Samtools is `bcftools mpileup + call` or just `bcftools call -m`. Since we have a small reference (chrM), speed isn't huge, but efficiency matters.
+        *   Option A: `bwa mem ... | samtools sort > results/{sample}.bam`, then `samtools index`, then `bcftools mpileup` -> VCF.
+        *   Option B: Use `lofreq`. The prompt lists it. But bcftools is more standard for "collapsed.tsv" generation with SnpSift? Actually, the inventory has `snpsift` and `snpEff`. Usually, simple variant calling + filtering produces a VCF. Then we can use `bcftools query` or `awk` to generate TSV.
+        *   Wait, standard BWA+Samtools+BCFTOOLS pipeline is best for compatibility with the inventory (bwa, samtools, bcftools). LoFreq is often used for low-frequency variants but requires specific settings and might be overkill/complex compared to BCFTOOLS mpileup. Given `bcftools` is in the list, I will use it as it's robust.
+    *   Step 5: Generate collapsed.tsv from all VCFs. Combine them into a multi-sample VCF or process individually? Since bcftools can handle multiple files with `-@`, but we need per-sample output first anyway (bam/vcf). To make `collapsed.tsv` easy, I'll extract variants from each sample's VCF and merge/union them using `bcftools isec` or just concatenate if they are compatible. However, bcftools requires a common reference for merging. Since all use the same ref (`chrM.fa`), concatenation might work but needs to be careful about duplicate positions (different samples).
+    *   Actually, simpler approach: Run `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%DP' ...`. But we need allele frequency (af) per sample. The collapsed table requires columns: `sample`, `chrom`, `pos`, `ref`, `alt`, `af`.
+    *   Wait, the prompt asks for "per-sample variant calling". So I must produce VCFs that contain variants called from each specific BAM file. Then generate a TSV with all samples' data combined? Or just one table summarizing findings across samples? The column header says `sample`, implying we need to know which sample contributed which variant.
+    *   Strategy: Call variants per sample -> Store in VCFs (which have SAMPLE field). Extract info from each VCF into TSV rows, then combine all rows into a single file sorted by chrom/pos/ref/alt? The prompt says "collapsed.tsv". Usually implies union of calls across samples.
+    *   Idempotency: Check if `results/{sample}.vcf.gz.tbi` exists for ALL 4 samples before running the pipeline. If yes, exit 0 immediately (or just check existence).
+
+3.  **Tool Selection & Constraints:**
+    *   BWA-MEM is standard.
+    *   Samtools sort/index.
+    *   BCFTOOLS mpileup/call for VCF generation.
+    *   Tabix index the final VCFs (required by prompt).
+    *   SnpSift? Maybe not needed if we just use `bcftools query` or awk to make TSV. The inventory lists it, but I don't strictly need every tool listed unless necessary for robustness. However, using standard tools is safer than assuming specific flags of SnpSift without testing (though the prompt says "Use only tools listed").
+    *   Wait, `bcftools` 1.21 supports `-Oz -o`.
+    *   LoFreq? It's a variant caller that outputs VCFs too. But BWA+BCFTOOLS is more standard for this context unless specified otherwise. I'll stick to BCFTOOLS as it pairs well with Samtools/BWA in the inventory list and handles multi-sample merging better than LoFreq (which often calls per sample).
+    *   Wait, `bcftools` 1.21 might not be installed if only specific tools are available? The prompt says "Use only tools listed". So I must use BWA/Samtools/BCFTOOLS as they are the core pipeline for this task (alignment -> calling). LoFreq is an alternative caller, but BCFTOOLS mpileup/call is more standard with Samtools.
+    *   Actually, `bcftools` 1.21 has a specific requirement: it needs to be called via `mpileup -f ref.fa`. Or the newer `call` command which uses pileups internally? In version 1.21 (which is quite old), `mpileup` + `call` was common, but `bcftools call` works on VCFs or BAM directly in later versions. Let's use `samtools mpileup -f ref.fa | bcftools view -Oz -o`. Wait, `samtools mpileup` is deprecated/removed in newer samtools/bcftools stacks (replaced by `bcftools mpileup`). In 1.21 era?
+    *   Let's check the inventory: `bwa`, `samtools`, `bcftools`. The version numbers are specific (`0.7.18` for BWA, `1.21` for Samtools/BCFTOOLS). This is a bit old (Samtools 1.21 was released around 2023? No, actually BCFTOOLS 1.21 corresponds to older releases too?).
+    *   Actually, standard modern practice with these versions: `bwa mem` -> `samtools sort` -> `bcftools mpileup -f ref.fa ... | bcftools call -m -o`. Or just `bcftools view -Oz -o vcf.gz < (mpileup) > vcf.gz`.
+    *   Wait, the prompt says "Use only tools listed". I should avoid deprecated commands if possible. In BCFTOOLS 1.x era: `samtools mpileup` is often used with older versions of bcftools? No, usually `bcftools mpileup -f ref.fa`.
+    *   Let's assume standard modern usage compatible with these tools (which are actually quite recent for the list provided). Wait, BWA 0.7.18 is old-ish but common in bioconda envs. Samtools/Bcftools 1.21 is relatively new. The command `bcftools mpileup` exists there? Yes.
+    *   Actually, to be safe and robust: Use `bwa mem -t 4 ... | samtools sort > results/{sample}.bam`. Then index with `samtools idx`. Then call variants using `bcftools mpileup -f data/ref/chrM.fa <results/{sample}.bam> | bcftools view -Oz -o results/{sample}.vcf.gz`? No, need to filter.
+    *   Wait, the prompt asks for "per-sample variant calling". Usually means generating a VCF per sample containing variants found in that BAM relative to ref. Then merge them into `collapsed.tsv`.
+    *   To ensure idempotency: Check if all 4 `.vcf.gz.tbi` files exist before running anything else.
+
+4.  **Script Structure:**
+    *   Shebang + set options.
+    *   Define variables (samples, paths).
+    *   Create `results/`.
+    *   Loop over samples:
+        *   Check if output VCF exists (`{sample}.vcf.gz.tbi`). If yes, continue to next sample (idempotency).
+        *   Align with BWA. Output BAM to results/. Sort? BWA-MEM outputs sorted by default in newer versions but 0.7.18 might need explicit sort or just rely on `samtools sort`. Let's use `bwa mem -t 4 ... | samtools sort` for safety and speed (threads).
+        *   Index BAM (`samtools index`).
+        *   Call variants: `bcftools mpileup -f data/ref/chrM.fa <bam> | bcftools call -m -Oz > results/{sample}.vcf.gz`. Wait, need to ensure TBI is created. Tabix needs VCF first? No, tabix creates index from file.
+        *   Actually `bcftools` 1.21 might not support `-m` (min depth) easily without flags. Let's use standard: `bcftools mpileup -f ref.fa <bam> | bcftools call -Oz > vcf`. Then tabix it?
+        *   Wait, the prompt says "Use only tools listed". I should not assume external dependencies like Python or specific plugins unless they are in the list.
+    *   Generate `collapsed.tsv`: Read all 4 VCFs (using bcftools query) and combine into TSV with header + sample column. Sort by chrom/pos/ref/alt? The prompt doesn't specify sort order for collapsed, but standard is sorted genomic coordinates. I'll use `bcftools query` to extract fields per file, then merge/sort using shell tools (awk/sort).
+    *   Wait, merging VCFs from different samples into one TSV where each row has the sample name:
+        1. Extract data from `{sample}.vcf.gz`: `chrom`, `pos`, `ref`, `alt`. Also need allele frequency (`af`). BCFTOOLS VCF usually contains AF in INFO field (e.g., AC/AN or AD). Or I can use bcftools query to get it?
+        2. Actually, standard simple variant calling often outputs a basic format where we might not have per-sample AF unless specified by the caller settings (`bcftools call -m` uses mpileup depth info which is sample-specific in multi-BAM mode). Since I'm doing single BAM -> VCF (per sample), `AF` isn't standardly present as "sample allele freq" because there's only one sample per file.
+        3. Wait, the prompt asks for column `af`. In a mono-sample context, AF is usually calculated based on depth/total alleles or just set to 1 if homozygous? Or maybe it refers to the variant frequency in that specific BAM (which would be ~0-1 depending on heterozygosity).
+        4. Actually, `bcftools mpileup` can output AF directly with `-Oz -o`. But standard VCF INFO field is often missing if not requested. I will use `bcftools query ... %AF or similar? No, bcftools query doesn't support `%AF` unless it's in the file.
+        5. Better approach: Use `lofreq`? It outputs AF directly? Or just calculate depth/total from BAM using `samtools mpileup`. But I need to stick to tools listed (`bcftools`, `bwa`).
+        6. Let's use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT'` and then for AF, since it's per-sample VCF (single sample), the "AF" is effectively derived from depth or just assumed based on genotype? Wait, if I call variants with bcftools using a single BAM file, the `GT` field will be 0/1. The allele frequency in that specific sample would be roughly GT count / total alleles * coverage?
+        7. Actually, simpler: Use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT'`. Then for AF, I can use the INFO field if available (e.g., AD/DP). Or just output a placeholder or calculate it from BAM stats using `samtools depth`? No, that's too slow.
+        8. Let's assume standard VCF generation includes some quality metrics but not necessarily per-sample allele frequency for single sample unless we use specific flags like `-m`. In BCFTOOLS mpileup + call (1.x), the AF is often in INFO:AF or similar if requested? Actually, `bcftools view` doesn't add it.
+        9. Wait, I can calculate AF from BAM depth using a simple script logic within bcftools query output? No, that requires external tools not listed for calculation (awk). But awk is standard shell tool.
+        10. Actually, the prompt asks to use "only tools listed". `bcftools` and `samtools`. I can pipe data through them.
+        11. Okay, let's look at BCFTOOLS mpileup output format: It outputs VCF lines with INFO fields like DP (depth). AF is not standardly included in single-sample calling unless we use specific flags or post-process. Since the prompt asks for `af` column specifically, I should try to get it from the BAM data using a tool that can read depth?
+        12. Wait, maybe I should just output `AF=0.5` (heterozygous) if GT is hetero? Or calculate based on DP/TotalAlleles? Since we don't have total alleles easily without counting bases...
+        13. Okay, let's use a simpler heuristic: If the variant has genotype info in VCF, I can extract it with `bcftools query`. But AF isn't standardly there for single sample unless specified (e.g., using `-m` flag which might not exist or behave differently).
+        14. Wait, maybe I should use `lofreq`? It's listed! LoFreq is specifically designed to output allele frequencies accurately from BAMs. The prompt lists it in the inventory. Using BWA+LoFreq makes sense for "variant calling" where AF matters (e.g., low frequency variants).
+        15. Plan: Use `bwa mem` -> align, then use `lofreq call`. LoFreq outputs VCF with proper allele frequencies per sample. This fits the requirement better than BCFTOOLS mpileup which might not output AF easily for single-sample mode without extra flags (and even then it's complex).
+        16. Wait, does LoFreq require a specific reference format? It takes BAM and ref.
+        17. Okay, I will use `bwa mem` to align -> sort/index -> `lofreq call`. Then index VCF with tabix.
+    *   Step: Generate collapsed.tsv by extracting data from all `{sample}.vcf.gz`, adding sample name column, sorting genomic coordinates.
+
+5.  **Refining the Plan:**
+    *   Idempotency check at start of script (check if `results/{sample}.vcf.gz.tbi` exists for ALL samples). If yes -> exit 0.
+    *   Create `results/`.
+    *   Loop over samples:
+        *   Align: `bwa mem -t 4 data/ref/chrM.fa <raw_1.fq.gz> ... | samtools sort > results/{sample}.bam` (BWA-MEM outputs sorted by default in newer versions, but explicit is safer). Wait, BWA 0.7.18 output might be unsorted? Yes, usually needs `samtools sort`.
+        *   Index BAM: `samtools index -b <results/{sample}.bam> > results/{sample}.bai` (Wait, `-i` creates .bai file in place or separate?). Standard is `samtools idx` -> `.bai`. Or just `samtools view -h ... | samtools sort`.
+        *   Call: `lofreq call --ref data/ref/chrM.fa <results/{sample}.bam> > results/{sample}.vcf.gz`. (LoFreq needs to be invoked correctly). Wait, LoFreq usually takes BAM and ref. Does it output gzipped VCF? Usually yes with `-Oz` or similar flag if available in 2.1.5 version.
+        *   Actually, `lofreq call` command syntax: `lofreq call --bam <file> ...`. It outputs to stdout by default (VCF). I need to compress it (`gzip -c`). But wait, the inventory lists tools but not necessarily their flags are guaranteed? Yes, standard usage.
+        *   Wait, LoFreq 2.x might require specific options for mitochondrial DNA or small genomes? No, general use is fine.
+    *   Tabix: `tabix results/{sample}.vcf.gz`. (Creates .tbi).
+    *   Collapse: Use a loop to extract data from each VCF into TSV rows with sample name column. Sort by chrom/pos/ref/alt.
+
+6.  **Addressing Constraints:**
+    *   "Do not write to stderr/stdout beyond what tools naturally emit". This means I should avoid `echo` statements like "Running alignment...". Just let the script run silently or use minimal logging if absolutely necessary (but prompt says no echo for user-facing prose). So keep it clean.
+    *   Idempotency: Check existence of final VCF index files before running pipeline steps? Or just check intermediate BAMs/VCFs? The safest is to check `results/{sample}.vcf.gz.tbi` exists for all samples at the start. If yes, exit 0 immediately (no work done).
+    *   "Do not hardcode any path outside current working directory". So use relative paths like `data/raw/...`.
+    *   Wall-clock < 600s: With THREADS=4? The script doesn't need to explicitly set threads for all tools, but BWA and LoFreq support threading. I'll add `-t 4` where applicable (BWA).
+
+7.  **Tool Specifics:**
+    *   `bwa mem`: Needs reference FASTA index first! Wait, the prompt says "chrM.fa ... not yet indexed". So I MUST index it before running BWA-MEM? Or does BWA handle unindexed ref gracefully? Usually yes (it builds its own index), but indexing with samtools is good practice. However, `bwa mem` requires `.fai` or similar for some features? No, standard bwa-mem works on FASTA without pre-indexing the reference file itself (it creates a BWT index internally). But wait, if I use `samtools faidx`, it needs an index too (`chrM.fa.fai`). The prompt says "not yet indexed". So I should create `.fai` for chrM? Or just let bwa handle it.
+    *   Wait, the inventory has no tool to build FASTA indices (like samtools faidx). But `samtools idx -b <bam>` creates BAM index (.bai), not ref index. BWA-MEM builds its own reference index internally if needed for alignment? Yes, usually fine without pre-indexing `.fai`.
+    *   However, to be safe and fast: I will let bwa handle it (it's standard).
+    *   `lofreq call`: Does it need ref indexing? LoFreq reads BAM. It uses the reference internally or from file? Usually takes a VCF/Ref pair for annotation but here just calling variants on BAM. The command is typically `lofreq call --bam <file>`. I'll assume standard usage works with unindexed FASTA (LoFreq handles it).
+    *   Wait, LoFreq 2.x might be tricky to get AF right without specific flags? Actually, the prompt asks for "af". If I use BCFTOOLS mpileup + call, can I calculate AF from DP/TotalAlleles in VCF INFO field? Or just output a placeholder if not available.
+    *   Let's reconsider `bcftools`. It is more standard and robust than LoFreq which might be overkill or have version-specific quirks (2.1.5). BCFTOOLS 1.21 mpileup + call can generate VCF with INFO fields like DP, AD, etc. AF isn't default in single-sample mode unless we use `-m` flag?
+    *   Actually, `bcftools view -f ...` filters variants based on quality. To get AF for a specific sample (which is the only one), I can calculate it from depth if needed. But simpler: Use BCFTOOLS to call and assume standard VCF output includes some frequency info or just use 1/2? No, that's inaccurate.
+    *   Wait, `bcftools mpileup` with `-f ref.fa <bam>` outputs pileups. The INFO field is often empty for single sample unless we specify otherwise. However, the prompt asks for AF column in collapsed.tsv. If I can't get it from VCF easily without extra processing (like counting bases), maybe `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT'` and then use a tool to calculate depth?
+    *   Wait, there is no "calculate AF" tool in the inventory. I have to derive it from VCF or BAM using available tools (`samtools`, `bcftools`).
+    *   Actually, if I call variants with BCFTOOLS on single sample, usually we don't get per-sample allele frequency (AF) unless there are multiple samples merged into one VCF file. But the prompt asks for "per-sample variant calling" then a collapsed table WITH AF column. This implies each row in `collapsed.tsv` represents a call from *a* sample at that position/variant, and we need to know its AF *in that specific BAM*.
+    *   If I use BCFTOOLS mpileup on single BAM: The VCF will have DP (depth). Total alleles = 2 * depth. Heterozygous count? `bcftools call` infers GT from pileup. It doesn't output AF in INFO by default for mono-sample mode easily without specific flags like `-m`.
+    *   Wait, maybe I should merge all BAMs into one VCF first (using bcftools mpileup with multiple files)? Then `bcftools call` will produce a multi-allelic site or haplotype? No.
+    *   Okay, let's look at the inventory again: `lofreq`. LoFreq is specifically good for AF estimation from BAMs because it uses base quality scores to estimate allele frequencies (not just depth). It outputs VCF with proper INFO fields including AF. This fits "per-sample variant calling" + "AF column" requirement much better than BCFTOOLS mpileup which relies on simple pileups without the statistical model for low-frequency variants often used in amplicons?
+    *   Wait, LoFreq 2.x command line: `lofreq call --bam <file>`. It outputs VCF. Does it support `-t` (threads)? Yes. I will use this to ensure AF is accurate and present in the output file. Then extract from that VCF for collapsed.tsv.
+    *   Wait, does LoFreq require a reference index? Usually yes (`--ref`). But `bwa mem` creates BAM which has alignment info against ref. LoFreq reads BAM directly (mostly). It might need `.fai`. I'll try to create it with `samtools faidx` if possible... wait, no tool listed for FASTA indexing!
+    *   Okay, BWA-MEM handles unindexed reference fine internally? Yes. So I will align first (`bwa mem`). Then LoFreq reads BAM and ref (it might re-index or handle on the fly). If it fails due to missing `.fai`, that's a risk. But standard usage often skips pre-indexing FASTA for BWA/LoFreq if not strictly required by tool version. I'll assume `bwa mem` handles unindexed ref, and LoFreq reads BAM (which contains alignment info) so maybe less dependent on ref index?
+    *   Actually, to be safe with idempotency: Check existence of final VCFs first.
+
+8.  **Script Logic:**
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+    
+    mkdir -p results/
+    
+    samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+    
+    for sample in "${samples[@]}"; do
+        # Check idempotency: if VCF index exists, skip processing this sample? 
+        # Wait, prompt says "rerunning on a populated results/ directory must exit 0 without redoing work".
+        # This implies checking ALL samples. If ANY is missing, we might need to run it? Or just check all exist before exiting?
+        # Usually idempotency means: if final output exists for THIS sample, skip this sample's processing step. 
+        # But the script should exit 0 overall without redoing work (i.e., not re-running alignment/calling).
+        
+        vcf_file="results/${sample}.vcf.gz"
+        tbi_file="${vcf_file}.tbi"
+        
+        if [[ -e "${tbi_file}" ]]; then
+            continue # Already done, skip to next sample or finish? 
+                   # If I check all samples at start and only one exists, do I run the rest? Yes.
+        fi
+        
+        raw_1="data/raw/${sample}_1.fq.gz"
+        raw_2="data/raw/${sample}_2.fq.gz"
+        
+        if [[ ! -f "${raw_1}" ]] || [[ ! -f "${raw_2}" ]]; then
+            echo "Missing input files for ${sample}" >&2 # Wait, no echo allowed? 
+            # Prompt: "Do not write to stderr/stdout beyond what tools naturally emit". So I cannot use 'echo' even for errors.
+            # But if inputs are missing, script will fail anyway due to set -e or logic error.
+        fi
+        
+        bwa_mem="bwa mem data/ref/chrM.fa ${raw_1} ${raw_2}"
+        
+        # Run alignment and sort (BWA 0.7.18 output might be unsorted, so use samtools sort)
+        # Use -t for threads? BWA supports -t. LoFreq also has threading options but let's stick to bwa -t 4 as per THREADS=4 constraint context.
+        
+        # Wait, I need to check if files exist before running commands (set -e handles missing file errors).
+        
+        # Align and sort BAM
+        samtools view -b <(echo "dummy") ... No pipe is fine.
+        bwa mem data/ref/chrM.fa ${raw_1} ${raw_2} | samtools sort > results/${sample}.bam
+        
+        if [[ ! -f "${results}/${sample}.bai" ]]; then # Check BAM index exists? 
+            # Actually, prompt says "Do not write to stderr/stdout beyond what tools naturally emit".
+            # I should avoid 'if' checks that might print or fail unexpectedly. But set -e handles missing files if they are required for next steps (like tabix).
+        fi
+        
+        samtools index results/${sample}.bam > results/${sample}.bai 2>/dev/null || true 
+        
+        # Call variants with LoFreq to get AF properly? 
+        # Or BCFTOOLS mpileup + call. Let's use bcftools as it is more standard for VCF generation in this inventory context (LoFreq might be less common).
+        # Wait, I decided on LoFreq earlier because of AF requirement. But let's check if BWA+BCFTOOLS can do it better? 
+        # BCFTOOLS mpileup -f ref <bam> | bcftools call ... outputs VCF with INFO fields like DP/AD but not necessarily AF (allele freq).
+        # LoFreq is specifically for allele frequency estimation. I will use LoFreq to ensure the 'af' column requirement is met accurately. 
+        # Command: lofreq call --ref data/ref/chrM.fa results/${sample}.bam > results/${sample}.vcf.gz
+        
+        # Wait, does LoFreq output .gz? No, usually stdout text VCF. I need gzip it manually or use bcftools -Oz if available in pipeline.
+        # But inventory has 'gzip'? Not listed! Only bwa, samtools, bcftools... 
+        # So I cannot use `gzip` command directly unless it's considered a standard tool (it usually is). The prompt says "Use only tools listed". This implies NO gzip? That would be problematic for VCF storage.
+        # Wait, 'bcftools' can output compressed files (-Oz) but that doesn't compress the stream itself without external compression or bcftools internal handling? 
+        # Actually `bcftools view -Oz` outputs a gzipped file to stdout which is then redirected by shell redirection (`> results/...`). This works.
+        
+        # So: bcftools mpileup ... | bcftools call -m -Oz > results/${sample}.vcf.gz
+        
+        # Let's switch back to BCFTOOLS for VCF generation as it handles compression natively via flags (-Oz). LoFreq 2.x might not have this flag.
+        
+        # To get AF in single sample mode with BCFTOOLS: 
+        # I can use `bcftools query` on the output? No, need to generate TSV from VCF later anyway.
+        # If I don't get AF in INFO field, how do I fill it for collapsed.tsv?
+        # Maybe calculate depth/total alleles using samtools mpileup stats per variant? Too slow.
+        # Wait, `bcftools` 1.21 supports `-m` flag to output allele frequency? 
+        # Actually, standard practice: AF is often derived from DP and genotype (GT) if available. If GT=0/1, AF ~ 0.5 * depth / total_depth?
+        # I will assume `bcftools mpileup -f ref <bam> | bcftools call` produces a VCF where INFO fields might include AD or similar which can be used to infer AF if needed. 
+        # But for simplicity and robustness with the inventory, let's use BCFTOOLS as it is more standard than LoFreq in this specific "bioinformatician" context (often implies GATK/BCFTOOL stack).
+        
+        bcftools mpileup -f data/ref/chrM.fa results/${sample}.bam | bcftools call -m -Oz > results/${sample}.vcf.gz
+        
+        # Tabix index the VCF
+        tabix results/${sample}.vcf.gz
+        
+    done
+    
+    # Generate collapsed.tsv
+    echo "sample	chrom	pos	ref	alt	af" > results/collapsed.tsv
+    
+    for sample in "${samples[@]}"; do
+        vcf="results/${sample}.vcf.gz"
+        if [[ -e "$vcf.tbi" ]]; then 
+            bcftools query -f '%CHROM\t%POS\t%REF\t%ALT' "$vcf" | while read line; do ... done # Wait, need AF.
+            
+            # How to get AF from BCFTOOLS VCF (single sample)?
+            # Usually INFO field is empty or has DP/AD. 
+            # If I use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT'`, it doesn't give me AF directly unless in file.
+            # Let's assume we can calculate a placeholder or extract from AD? No, too complex without extra tools.
+            # Wait! The prompt asks for "af". If I use `bcftools mpileup` with `-m 0.1 -Oz`, it might output AF in INFO field if configured correctly (e.g., using --stats)? 
+            # Actually, standard BCFTOOLS VCF does not include per-sample allele frequency unless merged or specific flags used.
+            # Given the constraints and tools: I will use `bcftools query` to extract fields including AD/DP? No, need AF column specifically.
+            
+            # Alternative: Use LoFreq 2.x which is listed! It outputs VCF with proper INFO.AF field for single sample mode (it calculates it). 
+            # So let's switch back to LoFreq call command if possible.
+            # `lofreq call --bam <file> ...` -> Output has AF in INFO? Yes, that's its main feature.
+            
+        fi
+        
+    done
+    
+    ```
+
+9.  **Refining the "AF" Issue:**
+    *   If I use LoFreq (`lofreq call`), it outputs VCF with `INFO.AF`. This is perfect for the requirement. 
+    *   Does LoFreq require a pre-indexed reference? It reads BAM, so maybe not strictly necessary if BWA aligned correctly (BWA creates its own index).
+    *   So: Align -> Index BAM -> Call with LoFreq -> Tabix VCF.
+    *   Wait, does `lofreq call` output compressed files by default or do I need to gzip? It outputs text stream usually. But redirection handles it as plain file unless specified otherwise (e.g., `-Oz`). 
+    *   Actually, standard `bcftools view -Oz` compresses on the fly. LoFreq might not support that flag directly in 2.x version easily without piping to gzip?
+    *   Wait, I can use `gzip > results/...`. But is `gzip` allowed? "Use only tools listed". If `gzip` isn't listed, I should avoid it or rely on bcftools/samtools compression. 
+    *   BCFTOOLS 1.x supports `-Oz` which compresses output stream to stdout (which shell redirects). LoFreq might not support this flag directly?
+    *   Let's check the inventory again: `bcftools`, `lofreq`. Both are listed. I should use tools that work together well. BCFTOOLS is safer for VCF standard compliance and compression (`-Oz`). 
+    *   For AF in single-sample mode with BCFTOOLS? It doesn't output it by default unless we merge samples or use specific flags (like `-m` which might be deprecated).
+    *   Wait, I can calculate AF from the BAM using `samtools depth` per variant position and compare to total alleles. But that's slow for many variants. 
+    *   Actually, let's look at the "collapsed.tsv" requirement again: `sample`, `chrom`, `pos`, `ref`, `alt`, `af`.
+    *   If I use BCFTOOLS mpileup + call on single BAM, the VCF will have GT (e.g., 0/1). The AF is effectively DP / TotalAlleles. But without merging samples into one file to get a global view of "AF" per site? No, it's sample-specific AF.
+    *   Okay, I'll use `bcftools mpileup -f ref <bam> | bcftools call` and assume the INFO field might contain something usable or just output 0/1 based on GT if possible (e.g., count alleles). 
+    *   Wait! There is a trick: Use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT'`. Then for AF, I can use the INFO field value from VCF. But BCFTOOLS single-sample call often doesn't populate AF in INFO unless specific flags are used (like `-m` which might not exist).
+    *   Okay, let's assume `bcftools mpileup -f ref <bam> | bcftools view -Oz > vcf`. Then use `bcftools query` to extract fields. If AF is missing in INFO, I can't get it easily without extra calculation tools (awk). But awk IS a shell tool? The prompt says "Use only tools listed". It doesn't explicitly ban standard Unix utilities like `sort`, `grep`, `cut`, `awk`. Usually scripts use these unless specified otherwise.
+    *   However, to be safe and compliant with "only tools listed", I should try to get AF from the VCF itself if possible (e.g., using LoFreq which is designed for this). 
+    *   Let's prioritize **LoFreq** because it outputs proper allele frequencies in INFO fields by design. It handles single-sample mode well enough? Yes, `lofreq call` works on BAMs and calculates AF based on base qualities.
+    *   So: Align -> LoFreq Call (outputs VCF with AF) -> Tabix. 
+    *   Wait, does LoFreq output compressed files? Usually no. I need to compress it using a tool listed or standard shell redirection + gzip if allowed. Since `gzip` is not in the list, but `bcftools view -Oz` IS (it uses libgzip internally). So BCFTOOLS handles compression better for this constraint set than LoFreq might allow directly?
+    *   Actually, I can use `bwa mem ... | samtools sort > results/bam`. Then `lofreq call --bam <results/bam> ...` -> stdout VCF. Pipe to `bcftools view -Oz` (if compatible) or just redirect and gzip if allowed?
+    *   Wait, the prompt says "Use only tools listed". If I use `gzip`, it's not in the list. So I must rely on BCFTOOLS compression (`-Oz`) for VCFs to ensure they are `.vcf.gz`. LoFreq might output plain text which needs gzip (not allowed).
+    *   Okay, Plan: Use **BCFTOOLS** mpileup + call with `-m` flag? Or just standard. BCFTOOLS 1.x `mpileup -f ref <bam> | bcftools view -Oz`. This ensures `.vcf.gz`. 
+    *   For AF column in collapsed.tsv: I will use the INFO field if available (e.g., AD/DP). If not, maybe calculate from GT? Or just output a placeholder `0.5` for heterozygous calls to satisfy format requirement without extra tools? No, that's bad practice.
+    *   Wait! There is no tool listed specifically for "calculate AF". But I can use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT'`. Then how do I get AF? 
+    *   Maybe the prompt implies using LoFreq because it's in the inventory and designed to output AF. Let's assume LoFreq is available for this specific task (AF requirement).
+    *   But `lofreq call` doesn't support `-Oz` directly usually. So I'd have to pipe through gzip? Not allowed. 
+    *   Okay, compromise: Use BCFTOOLS mpileup + view -Oz for VCF generation (ensures .gz and tabix). For AF column in collapsed.tsv, since it's hard without extra tools or merging samples into one file first...
+    *   Wait! I can merge all BAMs into ONE multi-sample call? `bcftools mpileup` supports multiple files. If I run `mpileup -f ref <bam1> ... | bcftools call`, it will output a VCF with sample columns (SAMPLE, GT). The AF field might be available in INFO if we use specific flags or just calculate from DP/TotalAlleles per sample?
+    *   Actually, standard BCFTOOLS mpileup on multiple BAMs outputs `GT` as multi-allelic genotypes. It doesn't output a single "AF" column unless specified (e.g., using `-m`). 
+    *   Okay, I will stick to **per-sample** processing for the VCF files (`results/{sample}.vcf.gz`) but use LoFreq if possible? No, let's assume BCFTOOLS is sufficient and AF can be derived from `bcftools query` output or INFO fields.
+    *   Wait! There is a tool in inventory: **SnpSift**. It processes VCFs. Maybe I should generate the collapsed.tsv using SnpSift? No, it's for filtering/transforming. 
+    *   Okay, final decision on AF: Since `bcftools mpileup` outputs pileups and `call` infers genotypes, but doesn't output per-sample allele frequency in INFO by default (unless merged). I will use a workaround: For the collapsed.tsv, since each row corresponds to one sample's call at that position, if GT is 0/1, AF ~ 0.5 * DP / TotalDepth? No, simpler: If I can't get it easily from VCF INFO without extra tools (awk), maybe I should use `bcftools query` and then process with awk to calculate depth-based frequency?
+    *   Wait! The prompt says "Use only tools listed". It does NOT ban standard Unix utilities like `sort`, `cut`, `head`, `tail`. These are usually assumed available in PATH. So using `awk` is likely acceptable for data processing (it's a shell tool, not an external package).
+    *   Okay: I will use BCFTOOLS mpileup + view -Oz to generate VCFs with DP/AD fields if possible? Or just assume AF can be calculated from GT and Depth. 
+    *   Actually, let's look at `bcftools query` output format for single sample call. It often includes INFO:DP (depth). Total alleles = 2*Depth. If I have AD (Allele depth), then AF = AD/TotalAlleles?
+    *   Okay, to be safe and compliant with "Use only tools listed", I will use `bcftools` commands which are robust. For the collapsed.tsv generation: Extract data from all VCFs using `bcftools query`, merge them into TSV (using shell sort/awk), add sample column.
+    *   Wait, how to get AF? If BCFTOOLS doesn't output it in INFO for single-sample mode... I might have to assume a default or calculate it from BAM depth per variant using `samtools mpileup` stats again? No, that's redundant. 
+    *   Okay, I will use the **LoFreq** tool because its primary purpose is allele frequency estimation and it outputs VCF with AF in INFO field (e.g., `AF=0.5`). This satisfies "Use only tools listed" better than BCFTOOLS which might not output AF for single sample without merging.
+    *   Wait, does LoFreq 2.x support `-t` threads? Yes (`--threads`). Does it require `.fai` index on ref? It reads BAM (which has alignment info). I'll assume BWA handles unindexed ref fine and LoFreq can read the BAM directly to get base qualities.
+    *   Wait, does `lofreq call` output compressed VCFs by default? No. So I need to compress it. Since `gzip` is not in list... but maybe `bcftools view -Oz` works on stdout of LoFreq if piped? Yes! 
+    *   Plan:
+        1. Align with BWA (output BAM). Sort/Idx BAM.
+        2. Call variants using **LoFreq** (`lofreq call --bam ...`). Pipe output to `bcftools view -Oz` -> results/vcf.gz. This ensures compression and tabix compatibility. LoFreq outputs VCF text, BCFTOOLS compresses it (if supported) or I can use standard shell redirection + gzip? No, no gzip tool listed!
+        3. Wait, `bcftools view -Oz` uses libgzip internally to write compressed stream to stdout. So if I do: `lofreq call ... | bcftools view -Oz > results/vcf.gz`, it works and doesn't require external `gzip`. 
+    *   Step 3: Index VCF with Tabix (`tabix`).
+    *   Step 4: Generate collapsed.tsv using `bcftools query` (extracts fields including AF if present in INFO). Since LoFreq puts AF in INFO, this works.
+
+10. **Final Script Logic:**
+    *   Check idempotency at start (check all `.vcf.gz.tbi`). If yes -> exit 0.
+    *   Loop samples:
+        *   Align (`bwa mem -t 4 ... | samtools sort > results/bam`)
+        *   Index BAM (`samtools index` or `idx`). Note: BWA-MEM output is sorted by default in newer versions but explicit sort ensures compatibility. I'll use `-@ 4`.
+        *   Call LoFreq -> Pipe to BCFTOOLS view -Oz (to compress) -> results/vcf.gz.
+            *   Wait, `bcftools` might not accept stdin from LoFreq directly if it expects specific format? No, VCF is standard. 
+            *   Actually, I'll use `lofreq call --bam ... | bcftools view -Oz > vcf`. This ensures .gz output without external gzip tool (using BCFTOOLS internal compression).
+        *   Tabix index (`tabix`).
+    *   Generate collapsed.tsv: Loop samples -> extract data with `bcftools query` -> merge/sort.
+
+11. **Constraints Check:**
+    *   No absolute paths? OK (relative to cwd).
+    *   Idempotent? Yes, check existence of final VCF index files first. If all exist, exit 0 immediately without running anything else. Wait, prompt says "rerunning on a populated results/ directory must exit 0". This implies if ANY output exists, we might skip work for that sample but need to ensure the script doesn't error out? Or does it mean *if* I run again and everything is done, do nothing? Usually idempotent means: `[[ -f ... ]] && continue`. If all are missing, run.
+    *   Wait, "rerunning on a populated results/ directory must exit 0 without redoing work". This implies if the final state (collapsed.tsv + VCFs) is present, do nothing? Or just skip processing steps for existing samples and regenerate collapsed.tsv from them? 
+    *   Safest interpretation: If all `results/{sample}.vcf.gz.tbi` exist, exit 0 immediately. Otherwise run pipeline to generate missing ones. Then always update `collapsed.tsv`.
+    *   Wait, if I check existence of VCFs at start and they are present, but collapsed.tsv is not? That's fine (pipeline ran before). If all VCFs exist, do nothing -> exit 0. 
+    *   Actually, the prompt says "rerunning on a populated results/ directory must exit 0". This implies if I run it again after completion, it should just say success without re-running alignment/calling. So checking existence of final outputs (VCF index files) is key.
+    *   Wait, `collapsed.tsv` might not exist initially? Yes. But the prompt says "outputs under results/ ... collapsed.tsv". If I check for VCFs and they are missing, run pipeline. Then generate TSV at end regardless. 
+    *   Okay: Check if all 4 `.vcf.gz.tbi` files exist in `results/`. If yes -> exit 0 (no work done). Else -> Run pipeline to create them.
+    *   Wait, what if only one is missing? I should run the rest of samples and regenerate TSV from existing ones + new ones. 
+    *   Okay: Check existence at start. If all exist -> Exit 0. Otherwise proceed (run alignment/calling for missing). Then generate collapsed.tsv always (from whatever VCFs are available or newly created).
+    *   Wait, "rerunning on a populated results/ directory must exit 0 without redoing work". This implies if I run it again after completion, the script should detect that everything is done and just return success. So checking for ALL final outputs at start is correct.
+
+12. **Tool Constraints:**
+    *   No `echo`? "Do not write to stderr/stdout beyond what tools naturally emit". This means no logging messages like "Starting...". Just let the script run silently (except tool output). 
+    *   Wait, I need to check existence of files without printing anything. Use `[[ -f ... ]]`.
+    *   No absolute paths? OK.
+
+13. **Final Check:**
+    *   Shebang + set options.
+    *   Idempotency logic (check all 4 VCF indices). If yes -> exit 0 immediately. 
+    *   Wait, if I check existence at start and they are missing, I run pipeline. Then generate TSV. This is fine. But the constraint says "rerunning on a populated results/ directory must exit 0". So checking all outputs exists before running anything else ensures this behavior (if everything done -> do nothing).
+    *   Wait, if only some VCFs exist? I should run for missing ones and update TSV. The script shouldn't error out just because one is missing. `set -e` might cause exit on command failure. So handle errors gracefully or ensure commands succeed (they will since inputs are assumed present).
+    *   Wait, "Do not write to stderr/stdout beyond what tools naturally emit". I cannot use `echo`. But if a file check fails? No error message needed for script logic unless tool emits it. 
+    *   Okay, let's draft the code.
+
+14. **One detail:**
+    *   The prompt says "Do not write to stderr/stdout beyond what tools naturally emit". This means I should NOT use `echo` even if I want to print progress or errors (unless tool does it). But for file existence checks, no output is needed. 
+    *   Wait, the script MUST exit 0 at end? Yes ("must be idempotent... must exit 0").
+    *   Also "Do not write to stderr/stdout beyond what tools naturally emit". This means I cannot use `echo` for anything (even errors). If a tool fails and prints error to stderr, that's fine. But if my script logic causes an issue? 
+    *   Okay, just keep it clean.
+
+15. **Refining LoFreq vs BCFTOOLS:**
+    *   I'll use `bcftools mpileup` + `call` because `lofreq call` might not be as standard for this specific "variant calling" task in a generic bioinformatics context (often implies GATK/BCF stack). But the inventory lists LoFreq. 
+    *   Wait, if I use BCFTOOLS 1.x mpileup + view -Oz, it outputs VCF with INFO fields like DP but not necessarily AF for single sample mode unless merged?
+    *   Actually, `bcftools call` on a multi-sample BAM (merged) produces better stats. But the prompt asks for "per-sample variant calling". 
+    *   Okay, I will use **BCFTOOLS** mpileup + view -Oz because it's more standard and handles compression (`-Oz`) natively without needing external tools or piping to gzip. LoFreq might not support `-Oz` directly (it outputs text).
+    *   For AF column in collapsed.tsv: I will assume `bcftools mpileup` output includes INFO fields like AD/DP which can be used? Or just use a placeholder if missing? No, that's bad. 
+    *   Wait! There is no tool listed to calculate allele frequency from BAM depth per variant easily without merging samples into one VCF first (which loses sample identity unless handled carefully).
+    *   Okay, I will assume `bcftools mpileup` with `-f ref <bam>` outputs a VCF where INFO field might contain AF if we use specific flags? Or maybe just output 0.5 for heterozygous calls to satisfy format requirement (since it's per-sample and single sample mode)?
+    *   Actually, I'll try to extract `AF` from the VCF using `bcftools query`. If not present in INFO field, I might have to calculate it? No tools listed. 
+    *   Wait! The prompt says "Use only tools listed". It does NOT ban standard Unix utilities (`awk`, `sort`). So I can use them for data processing (like calculating AF from AD/DP or just formatting).
+    *   Okay, Plan: Use BCFTOOLS mpileup + view -Oz. Extract fields with bcftools query. If INFO.AF is missing in single-sample mode VCFs generated by standard call... I'll use `bcftools query` to get `%CHROM\t%POS\t%REF\t%ALT`. For AF, since it's per sample and likely heterozygous (0/1), I can infer from GT? Or just output 0.5 if available in INFO field? 
+    *   Wait! `bcftools mpileup` with `-m` flag might output allele frequency info? No, that's for merging samples.
+    *   Okay, to ensure the script works and meets requirements: I will use **LoFreq** because it is specifically designed to calculate AF from BAMs (base quality scores) which BCFTOOLS mpileup doesn't do as accurately without multi-sample mode or specific flags. 
+    *   So: `lofreq call --bam <results/bam> ...` -> stdout VCF with INFO.AF field. Pipe to `bcftools view -Oz > results/vcf.gz`. This ensures compression and AF availability in VCF (which is needed for collapsed.tsv).
+    *   Wait, does LoFreq 2.x support `-t` threads? Yes (`--threads`). I'll use it with BWA's output. 
+    *   Does `lofreq call` require ref index? It reads BAM which has alignment info against reference. So unindexed FASTA is fine (BWA handles that).
+    *   Okay, final plan: LoFreq for calling + AF accuracy. BCFTOOLS view -Oz for compression. Tabix for indexing.
+
+16. **Wait, one more constraint:** "Do not write to stderr/stdout beyond what tools naturally emit". This means I cannot use `echo` even if it's just a comment? No, comments are fine in script. But no output text (except tool stdout).
+    *   Wait, the prompt says: "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." This means I can't print messages like "Processing sample X". Just let it run silently or via tool logs.
+
+17. **Final Logic:**
+    *   Check if all `results/{sample}.vcf.gz.tbi` exist. If yes -> exit 0 immediately (no work done). 
+    *   Create results/ directory.
+    *   Loop samples: Align, Sort BAM, Index BAM, Call LoFreq + BCFTOOLS view -Oz, Tabix VCF.
+    *   Generate collapsed.tsv from all available VCFs using `bcftools query` and shell tools (sort).
+
+18. **Wait, Idempotency Check:** "rerunning on a populated results/ directory must exit 0 without redoing work or erroring". This means if I run it again after completion, the script should detect that all outputs exist and just return success immediately. So checking existence of ALL final VCF indices at start is correct.
+
+19. **Wait, "Do not write to stderr/stdout beyond what tools naturally emit"**: If I use `[[ -f ... ]]` it doesn't output anything (unless true/false). That's fine.
+    *   Wait, if the check fails? No error message needed from script logic itself unless tool emits one.
+
+20. **Wait, "Do not write to stderr/stdout beyond what tools naturally emit"**: This is a strict constraint. I should avoid `echo` even for debugging or progress (which would be user-facing prose).
+    *   So the script must run silently except for tool output. 
+    *   Wait, if I check file existence and it's missing? No error message needed from my logic. Just proceed to create files.
+
+21. **Wait, "Do not write to stderr/stdout beyond what tools naturally emit"**: This implies I should NOT print anything myself (no `echo`). But the script must exit 0 at end.
+    *   Okay, just implement it cleanly without any extra output statements.
+
+22. **One more thing:** The prompt says "Use only tools listed". Does this include standard Unix utilities like `sort`, `awk`? Usually yes (they are part of shell environment). But I should avoid external commands not in the list if possible to be safe. However, data processing requires them (`bcftools query` outputs text which needs sorting/merging). 
+    *   Wait! The prompt says "Use only tools listed". This might mean NO `sort`, NO `awk`. If so, how do I generate collapsed.tsv?
+    *   Maybe use `cat` and shell redirection to combine files. But merging TSVs requires alignment of columns which is hard without sort/merge logic. 
+    *   Wait! The prompt says "Use only tools listed". It lists specific bioinformatics tools (bwa, samtools...). Standard Unix utilities are usually assumed available in PATH for a bash script unless specified otherwise ("only these are on PATH").
+    *   However, to be safe: I will use `bcftools query` which outputs TSV. Then pipe through standard shell redirections and commands that might not need external tools? 
+    *   Actually, merging multiple VCF files into one sorted list is hard without a merge tool or sort command (which isn't listed).
+    *   Wait! The prompt says "Use only tools listed". This likely means I should NOT use `conda`, `pip`, etc. But standard shell utilities (`sort`, `awk`) are usually considered part of the environment, not external packages to install via pip/apt. 
+    *   However, if strict: I can't merge TSVs without a tool that does it? Or maybe just concatenate and sort by column 1-4 using `bcftools` commands themselves (e.g., bcftools isec)? No, `isec` requires VCF input.
+    *   Okay, I will assume standard Unix tools (`sort`, `awk`) are allowed as they are not "package managers" or specific bio-tools in the list but part of OS shell environment. The constraint likely targets avoiding installing dependencies (conda/pip/apt). 
+    *   Wait! If I can't use sort/awk... How to merge? Maybe just concatenate VCFs and let `bcftools` handle it later? No, need sample column.
+    *   Okay, I'll assume standard shell utilities are allowed for data manipulation (common in such tasks).
+
+23. **Wait! One more constraint:** "Do not write to stderr/stdout beyond what tools naturally emit". This means no `echo`. But if a command fails? It will output error from tool or script logic might fail silently with set -e.
+    *   Okay, I'll proceed.
+
+24. **Final check on LoFreq vs BCFTOOLS:** 
+    *   Inventory has both. Using LoFreq ensures AF is in VCF INFO field (which `bcftools query` can extract). This satisfies the requirement better than standard BWA+BCFTOOL mpileup which might not output AF for single sample mode easily without merging samples into one file first (and then losing per-sample identity unless handled carefully with GT fields).
+    *   So I will use LoFreq.
+
+25. **Wait, `lofreq call` command syntax:** 
+    *   Usually: `lofreq call --bam <file>`. It outputs VCF to stdout by default? Yes (unless `-Oz`). But since I need `.vcf.gz`, and no gzip tool listed...
+    *   Wait! BCFTOOLS 1.21 supports `-Oz` which compresses output stream using libgzip internally without needing external `gzip`. So: `lofreq call ... | bcftools view -Oz > results/vcf.gz`. This works and uses only tools listed (LoFreq + BCFTOOLS).
+    *   Wait, does LoFreq 2.1.5 support `-t` threads? Yes (`--threads`). I'll use it with BWA's output to speed up alignment/calling if possible. But `lofreq call --bam <file>` reads BAM directly (which is sorted by samtools sort).
+    *   Okay, ready to write script.
+
+26. **Wait! One last thing:** "Do not hardcode any path outside the current working directory". So use relative paths like `data/raw/...`. 
+    *   Also: "First line must be #!/usr/bin/env bash", Second line `set -euo pipefail`.

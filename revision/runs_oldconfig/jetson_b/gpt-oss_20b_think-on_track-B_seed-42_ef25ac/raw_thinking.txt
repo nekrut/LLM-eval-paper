@@ -1,0 +1,215 @@
+We need to produce a bash script that does per-sample variant calling on 4 paired-end MiSeq amplicon samples mapped to chrM reference. Output BAMs and BAI, VCF.gz and tbi, collapsed.tsv.
+
+Requirements: idempotent; if results/ already contains outputs, exit 0 without redoing work or erroring. Use only tools listed. No echo for user prose. Only natural tool output.
+
+We need to map reads with bwa mem, sort with samtools sort, index with samtools index. Then variant calling with lofreq? Or bcftools mpileup + call? For mitochondrial amplicon small genome; we can use lofreq vcf. But requirement: final outputs .vcf.gz and tbi. We can produce VCF via lofreq or bcftools. Let's choose lofreq because it's in inventory.
+
+lofreq call -f reference.fa -o sample.vcf input.bam
+
+But need to compress with bgzip? lofreq output is plain text; we can pipe through bgzip (but not listed). Wait tabix requires bgzip. But we don't have bgzip tool? It's part of samtools, but command 'bgzip' may be available. In inventory only tools: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. 'samtools' includes bgzip? Usually yes; but not listed explicitly. But we can use 'bgzip' command from samtools package. It's likely available on PATH as 'bgzip'. We should assume it's there.
+
+Alternatively we could use bcftools view -O z to compress VCF. But lofreq outputs plain VCF; we can pipe through bgzip or use bcftools view -O z < sample.vcf > sample.vcf.gz. Then index with tabix.
+
+But we also need collapsed.tsv: columns sample chrom pos ref alt af. We need allele frequency (af). For mitochondrial amplicon, we can compute AF from lofreq's VCF INFO field? Lofreq includes AF in INFO as 'AF' maybe. Let's check typical lofreq output: It has fields like QUAL, FILTER, INFO: AC=1; AN=2; AF=0.5; etc. So we can parse that.
+
+We need to produce collapsed.tsv with header and one row per variant across all samples? Or per sample? The requirement says "collapsed table" but columns include sample so each line is a variant in a sample. So just combine all VCFs into one file, selecting fields: sample, chrom, pos, ref, alt, af.
+
+We can use bcftools query to extract these fields from each VCF and add sample name column. For example:
+
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[%AF]\n' file.vcf.gz
+
+But we need sample column; we can prepend sample name using awk.
+
+Simpler: use bcftools query with format string including sample name placeholder? Not directly. We'll just use a loop to process each VCF, produce lines and append to collapsed.tsv.
+
+Also need to ensure idempotent: if results/ contains all expected files, exit 0. We can check for existence of all outputs; but also need to skip steps that are already done. For simplicity, we can check at start: if [ -f results/collapsed.tsv ] && all per-sample .bam and .vcf.gz exist, then exit 0.
+
+But we must ensure that if some files missing, script will produce them. We should also create directories as needed.
+
+We need to use only tools; but we can use bash builtins for loops etc.
+
+Also need to run fastqc? Not required by output but maybe part of workflow. But not necessary.
+
+Let's design:
+
+- Set variables: RAW=data/raw; REF=data/ref/chrM.fa; OUT=results
+
+- Ensure OUT exists.
+
+- For each sample in list, check if BAM and VCF exist; if missing, perform mapping etc.
+
+Mapping steps:
+
+1. bwa index $REF (if not indexed). Check for .bwt file? BWA index creates several files: chrM.fa.bwt, .pac, .ann, .amb, .sa. We can test existence of .bwt. If missing, run bwa index.
+
+2. For each sample:
+
+- Input fastq1 and fastq2 from RAW: ${sample}_1.fq.gz etc.
+
+- Output SAM? We'll pipe to samtools view -Sb to produce BAM directly.
+
+Command: bwa mem -t $THREADS $REF $RAW/${sample}_1.fq.gz $RAW/${sample}_2.fq.gz | samtools sort -@ $THREADS -o $OUT/${sample}.bam
+
+Then index: samtools index $OUT/${sample}.bam
+
+But we need to ensure idempotent: if BAM already exists and BAI exists, skip mapping.
+
+Also need to check that reference is indexed before mapping. So at start, if not indexed, run bwa index.
+
+Variant calling:
+
+- If VCF.gz missing, run lofreq call -f $REF -o $OUT/${sample}.vcf $OUT/${sample}.bam
+
+Then compress: bgzip -c $OUT/${sample}.vcf > $OUT/${sample}.vcf.gz && rm $OUT/${sample}.vcf
+
+Index with tabix.
+
+But we can also use bcftools view -O z to compress. But using bgzip is fine.
+
+We need to ensure that if VCF.gz exists, skip calling.
+
+Collapsed.tsv:
+
+- If collapsed.tsv missing, produce by iterating over samples and extracting fields.
+
+Implementation details:
+
+- Use THREADS=4 variable.
+
+- For idempotent: at start, check if all outputs exist; if yes exit 0. But we also need to handle partial outputs? The requirement says "rerunning on a populated results/ directory must exit 0 without redoing work or erroring." So if all expected files present, exit 0. If some missing, proceed.
+
+- We should check for each sample: bam and bai; vcf.gz and tbi; collapsed.tsv.
+
+Simpler: at start, test:
+
+if [ -f results/collapsed.tsv ] && \
+   [ -f results/M117-bl.bam ] && [ -f results/M117-bl.bam.bai ] && ... ; then exit 0
+
+But we can programmatically check all expected files. Use array of samples.
+
+Let's create arrays: SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+Then loop to test existence of each file.
+
+If any missing, proceed with workflow.
+
+Also need to ensure that if reference not indexed, index it.
+
+Now produce collapsed.tsv:
+
+- Use a temporary file; for each sample: bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[%AF]\n' $OUT/${sample}.vcf.gz | awk -v s=$sample 'BEGIN{OFS="\t"} {print s, $0}' >> collapsed.tsv
+
+But we need header line. So before loop, echo "sample\tchrom\tpos\tref\talt\taf" > collapsed.tsv.
+
+Edge: bcftools query may output multiple alt alleles; but fine.
+
+Also need to ensure that AF field exists in INFO; if not, maybe empty. But for mitochondrial amplicon, lofreq includes AF.
+
+Now we must use only tools listed; bcftools is available.
+
+We also need to compress VCF with bgzip; but we can use 'bgzip' from samtools. We'll check existence: command -v bgzip. If not found, we could use 'samtools view -O z', but that's for BAM. For VCF, we can use bcftools view -O z.
+
+Better to use bcftools view -O z $OUT/${sample}.vcf > $OUT/${sample}.vcf.gz
+
+Then index with tabix.
+
+Thus no need for bgzip.
+
+Implementation:
+
+if [ ! -f $OUT/${sample}.vcf.gz ]; then
+  lofreq call -f $REF -o $OUT/${sample}.vcf $OUT/${sample}.bam
+  bcftools view -O z -o $OUT/${sample}.vcf.gz $OUT/${sample}.vcf
+  rm $OUT/${sample}.vcf
+  tabix -p vcf $OUT/${sample}.vcf.gz
+fi
+
+But we need to ensure that lofreq call may produce VCF with header lines; bcftools view will compress.
+
+Now mapping step: if BAM missing, run mapping. But also need to check BAI exists; but samtools index will create .bai file. So we can just test for bam existence.
+
+Implementation:
+
+if [ ! -f $OUT/${sample}.bam ]; then
+  bwa mem -t $THREADS $REF $RAW/${sample}_1.fq.gz $RAW/${sample}_2.fq.gz | \
+    samtools sort -@ $THREADS -o $OUT/${sample}.bam
+  samtools index $OUT/${sample}.bam
+fi
+
+Now reference indexing: if [ ! -f ${REF}.bwt ]; then bwa index $REF; fi
+
+Also need to create results directory.
+
+Edge: We must not write to stdout except tool outputs. Our script may produce echo for header of collapsed.tsv? That would be user-facing prose, which is disallowed. But we can use 'printf' or 'echo -e', but that's still output. The requirement says "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." So printing header might be considered user-facing? It's part of file content, not console. We can redirect to file.
+
+But using echo to create file is fine as long as it's writing to a file, not stdout. But we need to avoid printing to console. We'll use 'printf' > collapsed.tsv; that writes to file but may still produce output to stdout? No, redirection ensures no console output. So okay.
+
+Now ensure script uses only tools from inventory and builtins.
+
+Also need to set -euo pipefail at second line.
+
+Let's craft final script.
+
+Potential pitfalls: bcftools view -O z requires bcftools installed; yes.
+
+We also need to check that tabix is available; yes.
+
+Now produce collapsed.tsv:
+
+printf "sample\tchrom\tpos\tref\talt\taf\n" > $OUT/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+  if [ -f "$OUT/${sample}.vcf.gz" ]; then
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t[%AF]\n' "$OUT/${sample}.vcf.gz" | \
+      awk -v s="$sample" 'BEGIN{OFS="\t"} {print s, $0}' >> "$OUT/collapsed.tsv"
+  fi
+done
+
+But we need to ensure that bcftools query outputs alt allele; if multiple alt alleles separated by comma, bcftools query will output each alt separately? Actually %ALT prints all alt alleles separated by commas. That's fine.
+
+Now idempotent: At start, check if all expected files exist; if yes exit 0.
+
+Implementation:
+
+EXPECTED=(
+  "$OUT/M117-bl.bam" "$OUT/M117-bl.bam.bai"
+  "$OUT/M117-ch.bam" "$OUT/M117-ch.bam.bai"
+  "$OUT/M117C1-bl.bam" "$OUT/M117C1-bl.bam.bai"
+  "$OUT/M117C1-ch.bam" "$OUT/M117C1-ch.bam.bai"
+  "$OUT/M117-bl.vcf.gz" "$OUT/M117-bl.vcf.gz.tbi"
+  "$OUT/M117-ch.vcf.gz" "$OUT/M117-ch.vcf.gz.tbi"
+  "$OUT/M117C1-bl.vcf.gz" "$OUT/M117C1-bl.vcf.gz.tbi"
+  "$OUT/M117C1-ch.vcf.gz" "$OUT/M117C1-ch.vcf.gz.tbi"
+  "$OUT/collapsed.tsv"
+)
+
+for f in "${EXPECTED[@]}"; do
+  if [ ! -f "$f" ]; then
+    break
+  fi
+done
+
+If all exist, exit 0. But we need to detect missing file; we can set a flag.
+
+Simpler: use a function check_all() that returns 0 if any missing.
+
+Implementation:
+
+all_present=true
+for f in "${EXPECTED[@]}"; do
+  if [ ! -f "$f" ]; then
+    all_present=false
+    break
+  fi
+done
+
+if $all_present; then exit 0; fi
+
+Now proceed with workflow.
+
+Also need to ensure that reference is indexed before mapping. We'll check for .bwt file.
+
+Edge: The script may run in environment where bcftools view -O z fails if VCF not gzipped? But we compress after generating plain VCF.
+
+Now final script.
+
+Let's produce final answer.

@@ -1,0 +1,254 @@
+We need to produce a bash script meeting constraints.
+
+First line: #!/usr/bin/env bash
+Second line: set -euo pipefail
+
+Script must be self-contained, no extra prose before or after. Must not use markdown fences etc.
+
+We need to implement steps:
+
+- Define THREADS=4 and sample list.
+- Create results directory if missing.
+- Index reference (chrM.fa) with samtools faidx and bwa index if not exist.
+- For each sample, align with bwa mem using read group string exactly as required: -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA". Must use literal backslash t characters; cannot use echo -e or $'\t'. So we need to embed \t as two characters. In bash, we can just write the string with \t inside double quotes? Actually in a double-quoted string, \t is interpreted as a tab character by Bash unless escaped? Wait: In Bash, within double quotes, backslash is treated as escape for certain characters like \", \\, \$, etc. \t is not recognized as special; it's just literal backslash t? Actually Bash does process backslash escapes inside double quotes: \n, \t, \r, \a are recognized as newline, tab, carriage return, bell. Yes, within double quotes, \t expands to a tab character. But the requirement says bwa rejects real tabs; they want literal characters backslash and t. So we must not let Bash interpret it. To avoid that, we can use single quotes? In single quotes, backslashes are preserved literally. However we need to embed double quotes inside? The read group string includes double quotes around the whole argument: -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA". We can construct it using printf with literal \t? But they said do NOT use printf, echo -e, $'\t', or any mechanism that turns them into real tabs; bwa rejects real tabs. So we need to pass the string exactly as characters backslash t. In Bash, if we write "\t" inside double quotes, it becomes a tab character, which is not allowed. If we use single quotes, \t is taken literally (i.e., backslash followed by t). But we also need double quotes around @RG etc. So we can embed the whole string in single quotes and include \t as literal characters: -R '@RG\tID:'"$sample"'\tSM:'"$sample"'\tLB:'"$sample"'\tPL:ILLUMINA' . However we need to escape single quotes inside? Actually we can use double quotes around the whole -R argument, but then \t would be interpreted. So better to use single quotes for the entire -R argument and embed variable expansions using single quotes? In Bash, you cannot expand variables inside single quotes. So we need to build the string with concatenation of single-quoted parts and variables using double quotes but avoid \t expansion. We can escape backslash before t: "\\t". In double quotes, \\ becomes a literal backslash, then t remains literal t, so resulting characters are backslash t. That yields a literal "\t" (two characters). So we can write -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA". Inside double quotes, \\ becomes a single backslash, then t is literal. So the resulting string passed to bwa will have actual backslash and t characters, not a tab. That's correct.
+
+Thus we can construct read group argument as: -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"
+
+We need to ensure that the whole argument is passed as a single string; bwa expects it as a quoted string? Actually -R takes a string; we can pass it directly.
+
+So command: bwa mem -t 4 -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz
+
+But we need to pipe to samtools sort. Actually we can run bwa mem directly outputting SAM to stdout, then pipe to samtools sort -@ 4 -o results/${sample}.bam -. However we need to specify input? Actually samtools sort reads from stdin if output file is '-'? Let's recall: samtools sort [options]<in.bam> [<out.prefix>]. If you give - as input, it reads from stdin. So we can do: bwa mem ... | samtools sort -@ 4 -o results/${sample}.bam -
+
+Thus pipeline.
+
+- Then index with samtools index -@ 4 results/${sample}.bam
+
+- Variant calling with lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+
+Note: lofreq expects a BAM file; we have sorted BAM.
+
+- Then compress with bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz ; then tabix -p vcf results/${sample}.vcf.gz
+
+- Remove intermediate .vcf.
+
+- Collapse step: For each sample, run bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz . Actually they want to prepend sample name per row. The format string includes {sample} literal? They said "the `{sample}` literal is prepended via the format string so the sample name is attached per row". In bcftools query, you can use %ID? But they want to output sample column as first field. Using -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' will replace {sample} with literal string "sample"? Actually they said the `{sample}` literal is prepended via the format string so the sample name is attached per row. I think they want to use the placeholder {sample} which gets replaced by the actual sample name? Not sure. But we can just use bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' and then prepend sample name manually? They said "the `{sample}` literal is prepended via the format string so the sample name is attached per row". So maybe they want to use something like: bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz . But {sample} is not a special token; it's just literal text. Actually bcftools query format strings support %ID, %CHROM etc. They also allow custom fields? I think you can use the field name 'GT' etc. But you cannot embed arbitrary placeholder that gets replaced by sample name. However they might be referencing that you can use the format string with a literal placeholder like {sample} which will be replaced by the sample name automatically when using bcftools query -f '{sample}\t%CHROM...'? I'm not sure. But we can just use: bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | sed "s/^/\t${sample}/"? That would add sample column but need header.
+
+Simplify: We'll generate per-sample output with bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz . Actually we can use the format string: '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' . This will output sample name then tab then chromosome etc. But does bcftools replace {sample} with the sample name? I think not; it's just literal text. However maybe they intend to use the placeholder %ID? Hmm.
+
+Given constraints, we can produce collapsed.tsv by concatenating per-sample outputs and adding header. We'll do:
+
+{
+  echo -e "sample\tchrom\tpos\tref\talt\taf"
+  for s in $samples; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${s}.vcf.gz | sed "s/^/\t${s}/"? Actually we need to prepend sample column before each line. Could use awk: awk -v s=${s} '{print s"\t"$0}' . But simpler: bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${s}.vcf.gz | paste<(echo -n "${s}") -? Not straightforward.
+
+Better: Use bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${s}.vcf.gz . If that works, then each line will start with sample name. But we need to ensure {sample} is replaced by the actual sample name? I think bcftools query supports using the field name 'ID' etc. It does not support arbitrary placeholder. However there is a special field %SAMPLE? Not sure.
+
+Given the instruction, they likely expect using the format string with literal {sample} which will be substituted by the sample name automatically when using bcftools query -f '{sample}\t%CHROM...'. Actually I recall that bcftools query supports using the placeholder '%' for fields and also you can use the '^' to escape? Not sure.
+
+But we can cheat: Use bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${s}.vcf.gz | paste<(printf "%s\n" "${s}") -? Actually we need to prepend sample name to each line. Could use awk: awk -v s=${s} '{print s"\t"$0}' . But that would add sample column before each line, but also adds extra tab at start of header? We'll handle header separately.
+
+Simplify: For each sample, we can produce a file with header and data using:
+
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${s}.vcf.gz | awk -v s=${s} 'BEGIN{print s"\tchrom\tpos\tref\talt\taf"} {print s"\t"$0}' > tmp_${s}.tsv
+
+But we need to concatenate all and produce collapsed.tsv.
+
+Better: We'll generate collapsed.tsv by:
+
+{
+  echo -e "sample\tchrom\tpos\tref\talt\taf"
+  for s in $samples; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${s}.vcf.gz |
+      awk -v sample=$s '{print sample"\t"$0}'
+  done
+} > results/collapsed.tsv
+
+But we need to ensure that the header line is only printed once. The above will print header from echo, then for each sample we output lines with sample column prefixed. That's fine.
+
+We must rebuild collapsed.tsv only if any input VCF is newer than the TSV. We can implement a simple check: if results/collapsed.tsv exists and all per-sample vcf.gz are older (i.e., their modification time <= collapsed.tsv), then skip? Actually we need to rebuild if any input VCF is newer than the TSV. So we can test: if [ results/collapsed.tsv -nt $(ls -1 results/*.vcf.gz | xargs -I{} stat -c '%Y' {}) ]; then maybe not. Simpler: If any of the per-sample .vcf.gz files is newer than collapsed.tsv, then we need to rebuild. We can check using find: if [ "$(find results -maxdepth 1 -name '*.vcf.gz' -newer results/collapsed.tsv)" ]; then need to rebuild. So we can conditionally run the collapse step only when needed.
+
+Implement idempotency: At each step, before running a command, check if output exists and is newer than its inputs; if so skip.
+
+Simplify: We'll implement per-sample steps with checks:
+
+- If results/${sample}.bam.bai exists and is newer than results/${sample}.bam (or maybe just existence), then skip alignment? But we need to ensure that if BAM exists but maybe outdated, we still redo. Simpler: Check if final output .vcf.gz.tbi exists; if it does, skip all steps for that sample? That may be okay because if .vcf.gz.tbi exists, all previous artifacts should exist and be up-to-date? Not necessarily; but we can treat the presence of .vcf.gz.tbi as indicator that processing is done. However if intermediate files are missing but final index exists (maybe from previous run), it's okay to skip. We'll check for each final artifact: results/${sample}.bam, .bai, .vcf.gz, .tbi. If all exist, we can skip.
+
+But they want idempotent: re-running on a populated results/ must exit 0 without redoing work or erroring. So we can just check if each final output exists; if yes, skip that sample's processing. That ensures no re-run.
+
+Thus for each sample:
+
+if [ -f results/${sample}.bam.bai ]; then continue; fi
+
+But need to ensure all required files exist before moving to next step. So we can check sequentially: If results/${sample}.bam exists and is newer than inputs? But simpler: if results/${sample}.vcf.gz.tbi exists, skip entire sample.
+
+Thus for each sample:
+
+if [ -f results/${sample}.vcf.gz.tbi ]; then continue; fi
+
+Then run steps until produce that file.
+
+Implementation details:
+
+- Create results dir: mkdir -p results
+
+- Index reference: if [ ! -f data/ref/chrM.fa.fai ] || [ ! -f data/ref/chrM.fa.bwt ]; then do indexing. Actually we need to check for index files: .amb .ann .bwt .pac .sa .fai. We'll check if any of them missing; if missing, run samtools faidx and bwa index.
+
+- For each sample:
+
+  - If results/${sample}.vcf.gz.tbi exists; then continue
+
+  - Align: bwa mem ... | samtools sort -@ 4 -o results/${sample}.bam -
+
+    But we need to ensure that if results/${sample}.bam already exists, skip. So check before.
+
+  - Index: samtools index -@ 4 results/${sample}.bam
+
+  - lofreq call-parallel ... -o results/${sample}.vcf results/${sample}.bam
+
+    But we need to ensure output .vcf not existing? Actually we can check if .vcf.gz.tbi exists; but we need to produce .vcf first. So we can just run lofreq regardless; it will overwrite? But they want idempotent, so we should avoid re-running if final outputs exist. So we can check if results/${sample}.vcf.gz.tbi exists; if yes skip.
+
+  - Then compress: bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz
+
+    Then tabix -p vcf results/${sample}.vcf.gz
+
+    Then rm results/${sample}.vcf
+
+- Collapse step: We'll run collapse only if results/collapsed.tsv does not exist or is older than any of the .vcf.gz files. So we can check: if [ -f results/collapsed.tsv ] && [ newer than all inputs?]; then skip. Simpler: If any of the .vcf.gz files is newer than collapsed.tsv, then need to rebuild. We'll implement:
+
+  if [ -f results/collapsed.tsv ]; then
+    # check if any vcf.gz newer
+    if find results -maxdepth 1 -name '*.vcf.gz' -newer results/collapsed.tsv | grep -q .; then
+      need_rebuild=1
+    else
+      need_rebuild=0
+    fi
+  else
+    need_rebuild=1
+  fi
+
+  If need_rebuild, then run collapse.
+
+Implementation of collapse:
+
+{
+  echo -e "sample\tchrom\tpos\tref\talt\taf"
+  for s in $samples; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${s}.vcf.gz |
+      awk -v sample=$s '{print sample"\t"$0}'
+  done
+} > results/collapsed.tsv.tmp && mv results/collapsed.tsv.tmp results/collapsed.tsv
+
+But we need to ensure that the header line is exactly "sample\tchrom\tpos\tref\talt\taf". Use echo -e with tabs? In bash, echo -e will interpret \t as tab if -e and if locale? Actually echo -e interprets backslash escapes. So we can use $'sample\tchrom...' but that expands to real tabs, which is not allowed because they want literal \t characters? The collapsed.tsv must be tab-separated; using actual tab characters is fine; they are not literal backslashes. The requirement only said columns tab-separated with header; they didn't forbid using real tabs. So we can use $'sample\tchrom...' which expands to actual tab characters. That's okay.
+
+Thus:
+
+{
+  printf 'sample\tchrom\tpos\tref\talt\taf\n'
+  for s in $samples; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${s}.vcf.gz |
+      awk -v sample=$s '{print sample"\t"$0}'
+  done
+} > results/collapsed.tsv
+
+But we need to ensure that the header line uses actual tabs, not literal \t. Using $'sample\tchrom...' will produce tabs.
+
+Now overall script structure:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+# Or we can define a space-separated string: samples="M117-bl M117-ch M117C1-bl M117C1-ch"
+
+Create results dir.
+
+Index reference:
+
+if [ ! -f data/ref/chrM.fa.fai ] || [ ! -f data/ref/chrM.fa.amb ]; then
+  samtools faidx data/ref/chrM.fa
+  bwa index data/ref/chrM.fa
+fi
+
+For each sample in $samples; do
+
+  if [ -f results/${sample}.vcf.gz.tbi ]; then continue; fi
+
+  # alignment
+  bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz |
+    samtools sort -@ $THREADS -o results/${sample}.bam -
+
+  # index
+  samtools index -@ $THREADS results/${sample}.bam
+
+  # lofreq call-parallel
+  lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+
+  # compress and index
+  bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz
+  tabix -p vcf results/${sample}.vcf.gz
+  rm results/${sample}.vcf
+
+done
+
+# collapse step
+if [ -f results/collapsed.tsv ]; then
+  # check if any vcf.gz newer
+  if find results -maxdepth 1 -name '*.vcf.gz' -newer results/collapsed.tsv | grep -q .; then
+    need_rebuild=1
+  else
+    need_rebuild=0
+  fi
+else
+  need_rebuild=1
+fi
+
+if [ $need_rebuild -eq 1 ]; then
+  {
+    printf 'sample\tchrom\tpos\tref\talt\taf\n'
+    for s in $samples; do
+      bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${s}.vcf.gz |
+        awk -v sample=$s '{print sample"\t"$0}'
+    done
+  } > results/collapsed.tsv.tmp && mv results/collapsed.tsv.tmp results/collapsed.tsv
+fi
+
+Make sure script exits 0.
+
+We must not use any echo for user-facing prose; only natural tool output. We are using printf and echo -e? We used printf which is fine (builtin). Not prohibited.
+
+We must not write to stderr beyond what tools emit. Using echo for header may write to stdout, which is okay as it's part of script output? The requirement: "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." Using echo to produce header for collapsed.tsv is part of script's normal operation; but they said no user-facing prose. However generating a header line for a file is not user-facing prose; it's part of output generation. It writes to stdout (the script's stdout) which would be captured? Actually the script's stdout will contain the content of collapsed.tsv? No, we are redirecting to a file, so echo writes to stdout but gets redirected? In our collapse block, we used printf '...' > results/collapsed.tsv.tmp. That writes to a file, not to stdout. So no output to console. Good.
+
+Thus we should avoid any echo that prints to terminal. Use printf for header string into file.
+
+Now ensure we don't use any absolute paths; all relative to cwd.
+
+We must not hardcode any path outside cwd. Using data/ref/chrM.fa is okay (relative). Using results/ is relative.
+
+We must not use any tool not in inventory. We are using bwa, samtools, lofreq, bgzip, tabix, bcftools, awk, printf, find, grep. All are allowed.
+
+We must not exceed 600 seconds at THREADS=4; our script uses parallelism within each step but overall should be fine.
+
+Now produce final script as a single bash script with no extra commentary.
+
+Let's craft the script.
+
+Potential issues:
+
+- In bwa mem command, we need to pass -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA". The double quotes around @RG? Actually the read group string must be quoted? In bwa mem, -R takes a string; you can include spaces; quoting is not required but recommended. We'll just pass it as is without extra quotes; but we need to ensure that the whole argument is passed correctly. Using single quotes may cause issues with backslashes. Simpler: Use double quotes around the whole -R argument, but then \t would be interpreted? If we use double quotes, \t expands to tab. So we must avoid double quotes expansion. We can pass without quotes; just -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA". The @ sign is not special in unquoted context? It may be interpreted by shell as array start? Actually @ is allowed in unquoted strings; it's fine. So we can just write -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA". That should work.
+
+But need to ensure that the whole argument is not split by spaces; there are no spaces inside except after @RG? Actually the string contains spaces? No, it's "@RG\tID:...", no spaces. So unquoted is fine.
+
+Thus command:
+
+bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz
+
+Now pipeline to samtools sort.
+
+Now ensure that we use $THREADS variable in -@ options for samtools sort and index.
+
+Now final script.
+
+Let's write it.

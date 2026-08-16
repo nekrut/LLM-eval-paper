@@ -1,0 +1,475 @@
+We need answer user's request: produce ONE self-contained bash script only, no prose/fences. Need satisfy constraints. Need think through idempotency, paths, tools, wall clock, stderr/stdout minimal? They say do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose. We can use printf? Probably okay but avoid extra output. Need script first line #!/usr/bin/env bash second set -euo pipefail.
+
+Need implement workflow with idempotency: rerunning on populated results/ must exit 0 without redoing work or erroring. Need not hardcode outside cwd. Use only listed tools. Tools include bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. No bgzip? Wait TOOL_INVENTORY doesn't list bgzip explicitly! It lists tabix (htslib) 1.21 but not bgzip. Plan says bgzip -f results/{sample}.vcf. But tool inventory only these are on PATH; pinned versions in conda env 'bench'. Does htslib include bgzip? Usually yes, but not listed. Constraint: Use only tools listed in TOOL_INVENTORY. Do not invoke package manager. If bgzip not listed, cannot use it? Need compress VCF to vcf.gz and tbi. Could use samtools? No. bcftools can compress? bcftools +view -Oz outputs compressed VCF directly. We can avoid intermediate .vcf by calling lofreq output .vcf.gz? LoFreq call-parallel -o results/{sample}.vcf.gz maybe writes bgzipped if extension .gz? Need know lofreq 2.1.5: It uses pysam/vcfpy? Output VCF; if filename ends with .vcf.gz, it may write compressed? I think lofreq call-parallel has --output and can output vcf or vcf.gz? In LoFreq docs: -o/--output [OUTPUT] Output file (VCF). If ending in .gz maybe bgzip? Need be safe. Could use bcftools to convert uncompressed VCF to compressed: bcftools view -Oz -o results/{sample}.vcf.gz results/{sample}.vcf, then tabix. But if no bgzip, bcftools can write .vcf.gz (htslib). That uses listed tool. Need idempotency and avoid redoing work.
+
+Need reference indexing: bwa index creates .amb .ann .bwt .pac .sa? For mtDNA maybe also .fa.fai from samtools faidx. Idempotent: if outputs exist, skip. But bwa index may error if existing? It might overwrite or say exists? Need avoid redoing work. We can check for required index files and only run if missing. For chrM.fa, BWA 0.7.18 index creates data/ref/chrM.fa.amb, .ann, .bwt, .pac, .sa (maybe also .fa.fai? bwa index may create .fa.fai? Actually bwa index for fasta creates .amb .ann .bwt .pac .sa and maybe .fa.fai if not present? It uses samtools faidx? In 0.7.18, bwa index -a bwtsw2? For mem, index files: .amb .ann .bwt .pac .sa. It may also create .fa.fai? I think bwa index calls samtools_faidx if not present? Not sure. We can check for data/ref/chrM.fa.bwt and data/ref/chrM.fa.pac etc. But writing to data/ref maybe allowed? Task says assume data/ref contains chrM.fa; outputs under results/. It doesn't forbid indexing reference in place. Plan indexes in data/ref. Need idempotent: if index files exist skip.
+
+But hard constraint: Write all outputs under results/ (relative to cwd). Does that mean no writes outside results/? "Write all outputs under results/" likely final outputs, but reference indices are intermediate? It says assume current working directory contains data/raw and data/ref. Do not hardcode path outside cwd. Could be okay to write index files in data/ref as plan does. But if strict "all outputs" maybe only final outputs; indexing creates auxiliary files. To be safe, can we avoid writing reference indices outside results? BWA requires index near reference or use -p prefix? bwa index has -p prefix option: bwa index -p results/chrM data/ref/chrM.fa? Then alignment with bwa mem using reference and index prefix? Does bwa mem accept -p? In bwa 0.7.18, bwa mem [options] <db> <in1> ...; db can be fasta or index prefix? It expects .fa and finds index files based on input name. There is no option to specify alternate index prefix for mem? Actually bwa index -p prefix creates prefix.*; then bwa mem prefix? If you pass prefix (without .fa) maybe it uses that as database? For BWA 0.7.18, `bwa mem` can take a reference fasta or an index name? Documentation: bwa mem [options] <db> <in1> ... where db is either a fasta file or the prefix of a bwa index (without .fa). If you pass results/chrM, it will look for results/chrM.fa? Hmm maybe if no .fa extension, uses as index prefix. Need test mentally: BWA 0.7.18 `bwa mem` expects db; if ends with .fa or .fasta, loads fasta and indexes on fly? Actually bwa mem can take a reference sequence file (FASTA) or an index name. If given index name, it appends .amb etc. It may not require .fa present. So we could do `bwa index -p results/chrM data/ref/chrM.fa` and then `bwa mem ... results/chrM ...`. But LoFreq needs reference fasta; can use data/ref/chrM.fa. Need samtools faidx for lofreq? LoFreq uses pysam, requires .fa.fai. Could create index under results? `samtools faidx -o results/chrM.fa.fai data/ref/chrM.fa`? Does samtools faidx support -o to write index elsewhere? In samtools 1.21: `samtools faidx [-c] <in.fasta> [region1 ...]`; no -o? It writes .fai next to input. There is `samtools faidx data/ref/chrM.fa` creates data/ref/chrM.fa.fai. Could we avoid writing outside results by copying reference into results and indexing there? But "Write all outputs under results/" maybe okay to copy ref to results/chrM.fa, index there, use that for alignment and lofreq. But then final outputs include extra files in results (reference copy/index) not listed; is that allowed? It says Final outputs per sample plus collapsed table. Maybe extra auxiliary files undesirable but likely acceptable? Better keep data/ref indexing as plan. The constraint "Write all outputs under results/" probably means workflow outputs, not reference index. But to be safe with no writes outside cwd? data/ref is inside cwd. I think okay.
+
+Need idempotency for per-sample BAM/VCF/TBI/collapsed. Rerunning on populated results must exit 0 without redoing work or erroring. Need check if final outputs exist and are valid, skip all steps for sample if bam/bai/vcf.gz/tbi exist? But collapsed.tsv needs include samples; if exists maybe skip entire script? Idempotent: rerun should not redo work. Could simply at top check if all required outputs exist (for each sample) and collapsed.tsv nonempty with header? Then exit 0. That avoids redoing. But if partial results, need complete missing without overwriting existing valid files. Need robust idempotency.
+
+Potential issue: If we skip per-sample steps when bam exists but vcf missing, okay. For reference index, check existence. For collapsed.tsv, if all sample VCFs exist and collapsed.tsv exists maybe exit early? But if collapsed.tsv missing while VCFs present, need generate it without redoing calling. Could do final step only if collapsed.tsv missing or incomplete. Need ensure no duplicate rows on rerun: If collapsed.tsv exists but we append again, bad. So either skip if complete, or regenerate from scratch (not redo work? It would read existing VCFs and rewrite collapsed; that's not heavy but "without redoing work" maybe okay? Better skip if already correct). Need define correctness: header plus at least one line per sample? But some samples may have zero variants. Then cannot require lines per sample. Could check file exists and first line header, and for each sample either has rows or VCF has no records? Hard to know without querying. Simpler: If collapsed.tsv exists and all final outputs exist, exit 0. That satisfies rerun on populated results. If partial, generate missing. But if collapsed.tsv exists but some sample output missing, we may need add that sample's rows; appending could duplicate existing samples. Could regenerate collapsed from scratch after ensuring all VCFs present, using printf > and append for each sample. This rewrites collapsed (not heavy) and avoids duplicates. It doesn't redo variant calling if VCFs exist. That seems okay. But "without redoing work" maybe rewriting collapsed is minor; but to be strict, only rewrite if missing or incomplete? Could check all final outputs and collapsed exists then exit 0 before per-sample. If partial with collapsed exists but some sample missing, we can't just append because duplicates for existing samples. We could regenerate collapsed after completing missing samples. That's acceptable.
+
+Need avoid using echo. Use printf maybe okay? They specifically say do not use `echo` for user-facing prose. We can use printf for header (not user-facing). Or use bcftools query to output header? Need TSV header exactly sample chrom pos ref alt af. Could create with printf. That's fine.
+
+Need consider LoFreq call-parallel: It may require reference index .fa.fai and maybe .gzi? For VCF compression, if we output uncompressed then convert with bcftools. But lofreq might be slow? 4 samples mtDNA small; under 600s likely. Need use THREADS=4. Could call `lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf "${bam}"`. Then convert to gz with bcftools view -Oz -o ... But if we skip lofreq when vcf.gz exists, no need intermediate. If vcf missing but vcf.gz exists? Need handle. We can check final .vcf.gz and .tbi; if both exist skip calling and tabix. If only .vcf.gz missing tbi, run tabix. If .vcf.gz exists but uncompressed .vcf also exists maybe ignore.
+
+But idempotency: If results/{sample}.bam exists but not sorted? We assume valid. Could check `samtools quickcheck`? That emits output? It may write to stdout if fail; okay natural. But extra checks might produce stderr? Not needed. Use file existence only.
+
+Need ensure BWA index idempotent. Check files: data/ref/chrM.fa.bwt, .pac, .amb, .ann, .sa maybe. For bwa mem with -t 4, if reference is small, okay. But `bwa index` may create `.fa.fai` too? We also run samtools faidx. Need check for data/ref/chrM.fa.fai. If missing, run. If present skip.
+
+Potential issue: BWA index on a single chromosome with no gaps? It may require .amb etc. For `bwa mem`, if reference has no Ns, it still creates .amb? Yes. Could use `bwa index -a bwtsw2`? Default for 0.7.18 is bwtsw2 for long reads? Actually default algorithm depends on read length? In BWA 0.7.18, `bwa index` default is bwtsw2 (for long reads) unless `-a bwtsw`. For MiSeq amplicon short reads, bwtsw may be better/faster. Plan just says `bwa index data/ref/chrM.fa`; but BWA 0.7.18 default maybe bwtsw2? Let's recall: In 0.7.18, default algorithm is bwtsw2 (for long reads) if not specified? The manual: `-a {bwtsw|bwtsw2}` Specify the index type. Default: bwtsw2 for `bwa mem`? Actually BWA-MEM can use both; bwtsw2 is faster and more memory efficient but less accurate for short reads? For 150bp, bwtsw may be recommended. But plan authoritative says just bwa index. We should follow plan. If default creates bwtsw2, `bwa mem` works. Wall clock fine.
+
+Need maybe use `bwa index -a bwtsw data/ref/chrM.fa`? Plan doesn't include; don't deviate? It says PLAN authoritative — follow ordering and tool choices. So use exactly `bwa index data/ref/chrM.fa`. But for idempotency, if existing index of different algorithm? Not concern.
+
+Need LoFreq call-parallel: Does it accept BAM without .bai? We create bai. Good. Need maybe set `--min-cov 1`? Plan no. Use exact.
+
+Need VCF compression + tabix: Plan says bgzip -f then tabix. But tool inventory lacks bgzip. Could use `bcftools view -Oz -o results/{sample}.vcf.gz results/{sample}.vcf`. Is that allowed? It deviates from plan's tool choice (bgzip). But constraint only tools listed; bgzip not listed. However htslib tabix is listed, but bgzip often part of htslib but not in inventory. To be safe use bcftools. Does `bcftools view -Oz` require uncompressed VCF? Yes. It will write compressed and maybe remove input? No. Need then tabix. Could also directly output from lofreq to .vcf.gz if supported, avoiding intermediate. But plan says output results/{sample}.vcf then bgzip. We can adapt due tool constraint. Need ensure no leftover uncompressed VCF? Final outputs don't include .vcf; leaving it in results maybe extra. Could remove after compression? Using `rm` is not listed? Tool inventory only these are on PATH; does that forbid shell builtins like rm, mkdir? It says use only tools listed in TOOL_INVENTORY. But boilerplate uses mkdir -p. Hard constraints assume current directory contains data/raw and data/ref; write outputs under results. They likely allow basic coreutils (mkdir, printf) as shell utilities? The tool inventory lists bioinformatics tools on PATH; but `set`, `for`, `printf` are builtins. `rm` is external not listed. Should avoid rm if strict. But leaving intermediate .vcf may be okay? Final outputs list doesn't forbid extra files. Idempotency: If uncompressed .vcf exists, and vcf.gz missing, convert. If both exist, skip. Extra file remains. Could use `mv` to rename? mv external not listed. Avoid.
+
+Could avoid intermediate by having lofreq output directly to results/{sample}.vcf.gz if it supports. Then no extra .vcf. Need know LoFreq 2.1.5 behavior. Let's investigate from memory: LoFreq call-parallel uses `lofreq.call` and writes VCF via `VCFWriter`. It may check if output file ends with `.gz` and use `gzip.open`? In lofreq, `call.py` has function `write_vcf` maybe uses `pysam.VariantFile(filename, mode='w')` which can handle .vcf.gz automatically. If filename is .vcf.gz, pysam writes bgzipped VCF. I think yes: pysam.VariantFile supports compressed output if filename ends with .gz or .bgz. LoFreq docs examples often use `-o out.vcf`, but maybe `.vcf.gz` works. If so we can directly produce final vcf.gz and tabix, no bgzip/bcftools conversion. But plan says step 5 output results/{sample}.vcf then step6 bgzip. However tool constraint may force direct .gz. Is that acceptable? It still uses lofreq and tabix; outputs correct. Need ensure idempotency: if vcf.gz exists skip call. If not, run lofreq -o results/${sample}.vcf.gz. Then tabix if missing. This avoids bgzip. But will LoFreq create .tbi? No.
+
+Potential issue: `lofreq call-parallel` with output `.vcf.gz` might still write uncompressed then compress? It may use pysam, okay. If not, it could write plain text to file named .gz (bad). Need confidence. Let's recall lofreq 2.1.5 code: In `lofreq/call.py`, function `call_parallel` maybe writes using `VCFWriter` from `lofreq.vcf`. It might open with `open(output, "w")`? Hmm. LoFreq uses `pysam.VariantFile` for reading reference and writing VCF? I remember examples: `lofreq call -r ref.fa -o out.vcf in.bam`; for compressed maybe `lofreq call ... | bgzip > out.vcf.gz`. Not sure if direct .gz supported. In lofreq 2.1, there is option `--output` and it says "Output file (VCF)". It may not auto-compress. If we pass .vcf.gz, it might write uncompressed bytes to that filename, then tabix fails because not bgzipped. Need avoid risk.
+
+Could use bcftools to compress from lofreq output. That is safe if lofreq writes plain VCF. But leaves intermediate. Could maybe pipe lofreq stdout to bcftools view -Oz? `lofreq call-parallel ... | bcftools view -Oz -o results/{sample}.vcf.gz` but lofreq may not support stdout? It has `-o` required? Maybe can output to stdout if `-o -`? Not sure. Better use intermediate file and convert.
+
+But tool inventory doesn't list `bgzip`, but lists `bcftools`. Use bcftools view -Oz. Need ensure it doesn't require bgzip binary; htslib internal. Good.
+
+Could we use `samtools` to compress? No.
+
+Need consider `tabix -p vcf results/{sample}.vcf.gz`: If VCF has no variants, tabix still creates .tbi? Yes, empty index maybe. It may warn? Natural. Need idempotency: if tbi exists skip. But if vcf.gz updated and tbi missing, run.
+
+Need collapsed TSV generation with bcftools query. For each sample, `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk ...`. If no variants, outputs nothing. Need ensure AF present in INFO. LoFreq VCF includes AF? Yes, INFO/AF allele frequency. Could be missing for some? It should have. If multiple ALTs, query %ALT prints comma-separated; okay.
+
+Need maybe filter to only PASS? Plan doesn't. Use all records.
+
+Potential issue: `bcftools query` on empty VCF with no records returns 0 and no output. Good.
+
+Idempotency design in detail:
+
+Script:
+#!/usr/bin/env bash
+set -euo pipefail
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+REF=data/ref/chrM.fa
+# maybe define index files
+if [[ ! -s ${REF}.bwt || ! -s ${REF}.pac || ... ]]; then bwa index "$REF"; fi
+if [[ ! -s ${REF}.fai ]]; then samtools faidx "$REF"; fi
+
+for sample in "${SAMPLES[@]}"; do
+  bam=results/${sample}.bam
+  bai=results/${sample}.bam.bai
+  vcf_gz=results/${sample}.vcf.gz
+  tbi=results/${sample}.vcf.gz.tbi
+  # If all final outputs for sample exist, skip? But collapsed may need. We can still not redo per-sample if bam/bai/vcf/tbi exist.
+  if [[ ! -s "$bam" || ! -s "$bai" ]]; then
+     bwa mem ... | samtools sort ... -o "$bam" -
+     samtools index -@ "$THREADS" "$bam"
+  fi
+  # If vcf_gz and tbi exist skip calling/tabix. But if vcf_gz exists but no tbi, tabix. If vcf_gz missing, need call from bam.
+  if [[ ! -s "$vcf_gz" ]]; then
+     lofreq call-parallel --pp-threads "$THREADS" -f "$REF" -o "results/${sample}.vcf" "$bam"
+     bcftools view -Oz -o "$vcf_gz" "results/${sample}.vcf"
+  fi
+  if [[ ! -s "$tbi" ]]; then
+     tabix -p vcf "$vcf_gz"
+  fi
+done
+
+# collapsed: If all final outputs exist and results/collapsed.tsv exists, exit 0? We can do before loop to avoid per-sample checks? But need reference index maybe not needed if all outputs exist. For idempotent rerun on populated results, we can early exit after checking all required files exist. That avoids any tool output. Do:
+if [[ -s results/collapsed.tsv ]]; then
+  ok=1
+  for sample in ...; do
+    for f in results/${sample}.bam results/${sample}.bam.bai results/${sample}.vcf.gz results/${sample}.vcf.gz.tbi; do
+      if [[ ! -s $f ]]; then ok=0; fi
+    done
+  done
+  if (( ok )); then exit 0; fi
+fi
+
+But if collapsed.tsv exists but some sample missing, we proceed. At end regenerate collapsed from scratch (printf >). That will overwrite existing collapsed, no duplicates. Good.
+
+Need ensure early exit doesn't skip if collapsed.tsv exists but is empty? -s false. If header only and all outputs exist, ok=1 exit 0. Good.
+
+But what if results/collapsed.tsv missing but all sample outputs exist: proceed loop (skips per-sample due files), then regenerate collapsed. Good.
+
+What if some sample bam exists but vcf missing; loop calls lofreq. Need reference index present. If early not exit, we ensure ref indexes before loop. Good.
+
+Potential issue with `bwa mem ... | samtools sort -@ 4 -o results/{sample}.bam -`: Under pipefail, if bwa fails, pipeline fails. Good. But if output bam exists partially from previous failed run and we skip due existence? We check -s; a partial nonempty file could cause skip incorrectly. Could use more robust: only skip if all final sample outputs exist? For per-sample, if bam exists but vcf missing, maybe bam is complete? Hard to know. Idempotency on populated results assumes valid. For partial failed run, not required? It says rerunning on a populated results/ directory must exit 0 without redoing work or erroring. Populated likely means final outputs present. We can assume existing files are valid if nonempty. But to be safer, we could check `samtools quickcheck -q "$bam"` and `bcftools index --stats`? That may emit output. Not necessary.
+
+Need avoid writing to stderr/stdout beyond tools naturally emit. Our script uses no echo. Conditionals silent. printf writes to file. Good.
+
+Potential issue: `set -euo pipefail` with arithmetic `(( ok ))` when ok=0 returns nonzero and exits due set -e? Need be careful. Use if [[ $ok -eq 1 ]]; then exit 0; fi. Or avoid arithmetic. In bash, `(( ok ))` with ok=0 has exit status 1, under set -e would terminate unless in conditional. We can do:
+all_present=1
+...
+if [[ ! -s ... ]]; then all_present=0; fi
+if [[ "$all_present" == "1" && -s results/collapsed.tsv ]]; then exit 0; fi
+No arithmetic.
+
+Need check file existence with `-f` or `-s`. Use -s to ensure nonempty. For .bai/.tbi maybe can be empty? Index files should not be empty. Good.
+
+Reference index idempotency: Need list of BWA index files. If using `bwa index data/ref/chrM.fa`, it creates `.amb`, `.ann`, `.bwt`, `.pac`, `.sa`. For bwtsw2 maybe also `.fa.fai`? We can check all five. But if one missing due partial, run again. `bwa index` may fail if some exist? It might overwrite or error "file exists"? Let's recall: BWA index checks if .amb etc exist and says "index already exists" maybe exits 0? In bwa 0.7.18, `bwa_index_main`: if (samtools_faidx) ...; for each file, if (fopen(...,"r") != NULL) { fprintf(stderr, "%s: index already exists\n", prefix); return 0; } maybe? It may not error. But to avoid redoing work, check and skip. If partial missing, running bwa index might see existing .amb and exit without creating missing files? Could be issue. But unlikely. We can if any missing run `bwa index`. If it exits due already exists but some missing, then later alignment fails. Not concern for idempotent populated.
+
+Could use `bwa index -p` to write indices under results to satisfy outputs under results. Let's revisit. The hard constraint: "Write all outputs under results/ (relative to cwd)." It might be interpreted strictly: any file the script writes should be under results/. But reference indexing writes to data/ref, violating? They also say assume current working directory contains data/raw and data/ref; final outputs listed. Usually in such tasks, you can index reference in place. But "Write all outputs" could include intermediate outputs? To be safe, maybe write all generated files (including reference indices) under results/. Can we do that with BWA and samtools faidx? Let's explore.
+
+Option: Copy chrM.fa to results/chrM.fa? `cp` not listed. Could use `seqkit`? seqkit can copy? Not needed. We could create a symlink? ln not listed. Use bwa index -p results/chrM data/ref/chrM.fa to write BWA indices under results. For samtools faidx, no -o in 1.21? Let's verify: `samtools faidx` usage: `samtools faidx [-c] <in.fasta> [region1 ...]`. It writes `<in.fasta>.fai` and `.gzi` if compressed. No output option. But maybe `samtools index -M`? For FASTA, no. Could use `seqkit` to create .fai? seqkit has `seqkit faidx`? In v2.8.2, `seqkit faidx` creates .fai and .gzi for fasta; it may support `-o` output prefix? Let's recall: `seqkit faidx [options] <input>` options include `-o/--output-prefix` maybe? Seqkit often has -o output file or prefix. If we can use seqkit to create index under results, then all writes under results. But LoFreq needs reference fasta and .fai adjacent? pysam requires .fa.fai next to reference. If we only have results/chrM.fa.fai but reference data/ref/chrM.fa, not found. Could pass a reference path that has adjacent fai: need copy or symlink. Not allowed tools? Could use `seqkit` to write a fasta copy under results and index it. For example `seqkit seq -o results/chrM.fa data/ref/chrM.fa`? Seqkit can read and output; but does it preserve header? Yes. Then `seqkit faidx results/chrM.fa` creates results/chrM.fa.fai. BWA index -p results/chrM results/chrM.fa or bwa index results/chrM.fa (writes in results). Then use results/chrM.fa for alignment and lofreq. This writes all outputs under results, but adds reference copy/index extra files. Is that acceptable? It may be more compliant with "write all outputs under results". But it uses seqkit (listed) to copy; is that overkill? Need ensure wall clock: copying 16kb trivial. Idempotency: if results/chrM.fa exists skip copy; index if missing.
+
+But plan says reference file in data/ref and indexing commands on data/ref. It says PLAN authoritative — follow ordering and tool choices. If we change to seqkit copy, deviates. But hard constraints may override? The user likely expects script following plan but with idempotency. They explicitly say assume data/ref/chrM.fa present; final outputs under results. I think indexing in data/ref is acceptable. Many benchmark tasks allow reference index creation outside results as intermediate. The phrase "Write all outputs under results/" probably means requested outputs, not auxiliary indices. Also they list plan with bwa index data/ref and samtools faidx data/ref. So follow that.
+
+Need consider tool inventory: `mkdir` not listed but required by boilerplate; likely allowed as shell/coreutils. They say only these are on PATH; pinned versions in conda env 'bench'. But `mkdir`, `printf`, `awk`? Wait awk is external, not listed! Plan uses awk to prepend sample. Tool inventory does NOT list awk. Constraint: Use only tools listed in TOOL_INVENTORY. Does that forbid awk? It says only these are on PATH; but awk likely on system but not in inventory. We must avoid invoking awk if strict. Need generate collapsed TSV without awk. Can use bcftools query with sample included? `bcftools query -f` can include literal text? It supports format specifiers and maybe escape tabs/newlines, but cannot easily inject shell variable per line except using `-h`? We can use `printf` to output header, then for each record need prepend sample. Without awk/sed/cut (not listed), how? Could use bash while read loop reading bcftools query output and printf. That uses only builtins and bcftools. Example:
+while IFS=$'\t' read -r chrom pos ref alt af; do
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sample" "$chrom" "$pos" "$ref" "$alt" "$af"
+done < <(bcftools query ...) >> results/collapsed.tsv
+But process substitution uses bash builtin, okay. However if no variants, loop none. Need handle lines with missing AF? If AF empty, read may set af empty; printf prints trailing tab? It will print sample chrom pos ref alt \n? Actually printf with six args and format six %s: if af empty, outputs trailing tab before newline? Format has tabs between fields: '%s\t%s\t%s\t%s\t%s\t%s\n' => if af empty, last field empty after tab. Good. But if ALT multiple comma-separated no spaces. IFS tab read splits correctly. If line has fewer fields (e.g., AF missing) then af empty; okay. Need ensure not using external awk. This is better for tool constraint.
+
+But process substitution `< <(...)` requires bash, okay. Under set -euo pipefail, if bcftools query fails inside process substitution? The exit status of process substitution may not be caught by set -e? In bash, failure in process substitution doesn't affect main shell unless wait $! maybe. But bcftools should succeed. Could instead use a temporary file? Not allowed? We can pipe to while: `bcftools query ... | while IFS=$'\t' read ...; do printf ... >> results/collapsed.tsv; done`. Under pipefail, if bcftools fails pipeline fails. The while loop in subshell writes to file via redirection inside each iteration or redirect whole loop. Use:
+{
+  printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+  for sample ...; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" | while IFS=$'\t' read -r chrom pos ref alt af; do
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sample" "$chrom" "$pos" "$ref" "$alt" "$af"
+    done >> results/collapsed.tsv
+  done
+}
+But if we redirect whole block > collapsed, then inside while stdout goes to file. Need be careful with appending per sample vs single redirection. Simpler:
+printf header > results/collapsed.tsv
+for sample in ...; do
+  bcftools query ... | while IFS=$'\t' read -r chrom pos ref alt af; do
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sample" "$chrom" "$pos" "$ref" "$alt" "$af"
+  done >> results/collapsed.tsv
+done
+This uses no awk. It writes header once, appends rows. If rerun after partial and we regenerate collapsed from scratch, okay. But if early exit when complete, skip.
+
+Need consider `bcftools query` output for multiple ALT: %ALT prints comma-separated; read splits on tabs only, so alt field contains commas. Good. AF may be comma-separated? LoFreq INFO/AF maybe one value per ALT? If multiple, bcftools query %INFO/AF prints comma-separated? It might print as list with commas. Read keeps in af field. Good.
+
+Need ensure `while` loop doesn't lose variables due subshell; we only printf inside, no need after. Good.
+
+Could use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' ... | while ...`. If VCF has no records, bcftools outputs nothing, pipeline status 0. Good.
+
+Need avoid using external `awk`, `sed`, `cut`, etc. Use bash builtins and listed tools. What about `printf`? It's a shell builtin in bash (also /usr/bin/printf but builtin used). Allowed? They only forbid echo for user-facing prose; printf to file is okay. `mkdir` external not listed but boilerplate requires. Could use `install -d`? Not listed. We'll use mkdir as plan.
+
+Need maybe use `samtools sort -@ 4` with THREADS variable: `-@ "$THREADS"`. Good.
+
+Potential issue: LoFreq call-parallel may require `--min-cov` and `--min-bp`? No.
+
+Potential issue: LoFreq output VCF may not have AF in INFO for all variants? It does. If missing, bcftools query prints empty. Fine.
+
+Need idempotency with intermediate uncompressed VCF. Suppose results/{sample}.vcf.gz exists but .tbi missing; we skip lofreq and convert? Our condition if [[ ! -s vcf_gz ]]; then call+convert; fi. If vcf_gz exists, no convert. Good. If vcf_gz missing but intermediate .vcf exists from previous partial run, our code will rerun lofreq overwriting .vcf (redo work) and convert. Could instead if intermediate .vcf exists and vcf_gz missing, just convert without calling. That improves idempotency/partial. But if .vcf is stale? It corresponds to bam; okay. We can do:
+if [[ ! -s "$vcf_gz" ]]; then
+  if [[ ! -s "results/${sample}.vcf" ]]; then
+    lofreq ... -o results/${sample}.vcf "$bam"
+  fi
+  bcftools view -Oz -o "$vcf_gz" "results/${sample}.vcf"
+fi
+This avoids redoing calling if intermediate exists. But if vcf.gz missing and .vcf empty? It will try convert empty; maybe fail? Could check -s. If not, call. Good.
+
+But final outputs don't include .vcf; leaving it okay. However early exit checks only final outputs and collapsed; if all final exist but intermediate .vcf exists, exit 0. Good.
+
+Need consider `bcftools view -Oz` on an empty VCF (header only) works? It should output compressed header. If lofreq no variants, VCF has header. Good.
+
+Potential issue: LoFreq call-parallel may produce VCF with no AF for some records if using `--no-update`? No.
+
+Need maybe use `lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf "${bam}"`. It may require reference index .fa.fai; we create. Good.
+
+Potential issue: BWA alignment of paired-end amplicon to chrM: Some reads may map multiple times? bwa mem default multi-map. LoFreq can handle. No need sort -m? no.
+
+Wall clock under 600 at THREADS=4: 4 samples small; okay. But if we use `lofreq call-parallel` per sample sequential, maybe each few seconds. BWA index once. Good.
+
+Need ensure script doesn't emit user-facing prose. It will emit tool logs to stderr naturally (bwa/samtools/lofreq/bcftools). That's allowed. Our conditionals no output. `printf` writes to file, not stdout. The while loop printf inside pipeline: if we redirect per sample >> collapsed, it doesn't go stdout. Good.
+
+Need maybe suppress tool logs? They say do not write beyond what tools naturally emit; don't use echo. We shouldn't add 2>/dev/null because that alters natural output? Probably okay but avoid. Let tools emit.
+
+Potential issue: `set -euo pipefail` and early exit check with for loops: If file missing, all_present=0; no error. Good.
+
+Let's draft script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+REF="data/ref/chrM.fa"
+OUTDIR="results"
+mkdir -p "$OUTDIR"
+
+# Early exit if all final outputs and collapsed exist
+all_present=1
+if [[ ! -s "${OUTDIR}/collapsed.tsv" ]]; then
+  all_present=0
+fi
+for sample in "${SAMPLES[@]}"; do
+  for f in \
+    "${OUTDIR}/${sample}.bam" \
+    "${OUTDIR}/${sample}.bam.bai" \
+    "${OUTDIR}/${sample}.vcf.gz" \
+    "${OUTDIR}/${sample}.vcf.gz.tbi"
+  do
+    if [[ ! -s "$f" ]]; then
+      all_present=0
+    fi
+  done
+done
+if [[ "$all_present" == "1" ]]; then
+  exit 0
+fi
+
+# Reference index idempotent
+bwa_index_ok=1
+for f in "${REF}.amb" "${REF}.ann" "${REF}.bwt" "${REF}.pac" "${REF}.sa"; do
+  if [[ ! -s "$f" ]]; then bwa_index_ok=0; fi
+done
+if [[ "$bwa_index_ok" != "1" ]]; then
+  bwa index "$REF"
+fi
+
+if [[ ! -s "${REF}.fai" ]]; then
+  samtools faidx "$REF"
+fi
+
+for sample in "${SAMPLES[@]}"; do
+  bam="${OUTDIR}/${sample}.bam"
+  bai="${OUTDIR}/${sample}.bam.bai"
+  vcf="${OUTDIR}/${sample}.vcf"
+  vcf_gz="${OUTDIR}/${sample}.vcf.gz"
+  tbi="${OUTDIR}/${sample}.vcf.gz.tbi"
+
+  if [[ ! -s "$bam" || ! -s "$bai" ]]; then
+    bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" "$REF" "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" | samtools sort -@ "$THREADS" -o "$bam" -
+    samtools index -@ "$THREADS" "$bam"
+  fi
+
+  if [[ ! -s "$vcf_gz" ]]; then
+    if [[ ! -s "$vcf" ]]; then
+      lofreq call-parallel --pp-threads "$THREADS" -f "$REF" -o "$vcf" "$bam"
+    fi
+    bcftools view -Oz -o "$vcf_gz" "$vcf"
+  fi
+
+  if [[ ! -s "$tbi" ]]; then
+    tabix -p vcf "$vcf_gz"
+  fi
+done
+
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > "${OUTDIR}/collapsed.tsv"
+for sample in "${SAMPLES[@]}"; do
+  bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "${OUTDIR}/${sample}.vcf.gz" | while IFS=$'\t' read -r chrom pos ref alt af; do
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sample" "$chrom" "$pos" "$ref" "$alt" "$af"
+  done >> "${OUTDIR}/collapsed.tsv"
+done
+
+Need check `IFS=$'\t'` in while: In bash, okay. But if line has trailing empty AF, read with -r and five variables: If there are more fields than variables, last variable gets remainder (including tabs?) Actually with IFS=tab, if line has 5 fields and af is empty? Format outputs chrom\tpos\tref\talt\t\n (if AF missing). That's four tabs? Let's count: %CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n. If INFO/AF empty, output ends with tab before newline. read -r chrom pos ref alt af: fields: chrom, pos, ref, alt, af (empty). Good. If AF has multiple values separated by commas no tabs. Good.
+
+But if ALT is missing? VCF records have ALT. Fine.
+
+Potential issue: `bcftools query` may output lines with spaces in INFO/AF? No.
+
+Need ensure collapsed.tsv regenerated only when not early exit. If all final outputs exist but collapsed missing, we regenerate. If some sample missing, after loop all vcf_gz should exist; then regenerate. Good.
+
+But what if a sample has no variants and its .vcf.gz is header-only; tabix creates .tbi maybe nonempty? Yes. Early exit requires -s tbi. If tabix on empty VCF creates zero-byte .tbi? Need check: tabix index for empty file may create 0 bytes? Possibly. If so early exit would think missing and rerun tabix, but tabix might error if exists? It overwrites? Could be issue. Let's investigate: tabix -p vcf on a bgzipped VCF with no records creates .tbi maybe 12 bytes header? I think it writes index file with header even empty, nonempty. But not 100%. If zero-byte, our -s check fails and we run tabix again; if tabix refuses overwrite? It likely overwrites or says exists? Could error. To be safe, use `-e` existence rather than -s for indices? For final outputs, .bam should nonempty; .bai maybe could be empty? BAM index for empty BAM? Our BAMs have reads, nonempty. VCF.gz header-only nonempty. TBI likely nonempty. But to avoid zero-byte issue, use `[[ ! -e "$tbi" ]]` for tbi/bai? Idempotency: if file exists but zero due failed run, we might skip incorrectly. But populated valid results okay. For robust partial, maybe check size for data files and existence for index files. However if a zero-byte .tbi from previous failure exists, skipping would leave invalid; not required. Use -e to avoid rerunning tabix on empty valid? Hmm.
+
+The requirement: rerunning on a populated results/ directory must exit 0 without redoing work or erroring. If tbi is zero but considered populated? Probably not. But if tabix creates zero-byte for no variants, then our early exit would not exit and per-sample loop would see ! -s tbi true and run tabix again. Would that error? `tabix` may say "file exists" or overwrite? Let's check: htslib tabix by default overwrites index? It might print "index already exists" and exit 0? Not sure. To be safe, we can remove existing tbi before creating? rm not allowed. Could use `tabix -f` to force overwrite? Does tabix have `-f` option: Force overwriting of the index file. Yes, tabix has `-f` (force). We can use `tabix -p vcf -f "$vcf_gz"`. That will overwrite if exists. But idempotency says without redoing work; we only run if missing by our check. If zero-byte and we think missing, running with -f okay. For early exit, if tbi zero but all other files nonempty and collapsed exists, all_present=0 due ! -s, so no early exit; then loop runs tabix -f again (redo minor). Could instead use `-e` for tbi in checks to consider existing zero as present. But if zero invalid, not concern. Use existence for index files maybe better: `[[ ! -e "$bai" || ! -e "$tbi" ]]`. For BAM and VCF.gz use -s. Early exit check can use -e for bai/tbi? If a zero-byte tbi exists from valid empty VCF, early exit should pass. Use `-e` for index files. But if a stale zero-byte index exists while vcf updated, not required. Let's adjust:
+- For BAM: -s (must nonempty)
+- BAI: -e maybe; but if missing run sort/index? We only create bai with samtools index after bam. If bam exists but bai missing/zero, we might need index. Use `if [[ ! -s "$bam" || ! -e "$bai" ]]; then` But if bam nonempty and bai zero, it will realign (redo) because condition true due ! -e? Actually zero file exists so -e true; if use -e, skip indexing even if zero. Not good for partial. Use `! -s "$bam" || ! -s "$bai"` maybe. For valid empty BAM index? Not possible with reads. So -s okay.
+- TBI: Could be zero for no variants? Need know. Let's check htslib tabix index file format: It writes header (magic, n_ref, etc) even if no intervals? Likely at least 12 bytes. So -s okay.
+
+Need maybe use `samtools index` with `-f` to force overwrite? If bai exists but we think missing due zero, samtools index may error "file exists"? It has `-f` option: Force overwriting of the index file. Use `samtools index -@ "$THREADS" -f "$bam"`? In samtools 1.21, `samtools index [-c] [-m nrefs] [-b|-t] <in.bam>`. Does it have -f? I think yes: `-f` Force overwriting of the index file. Use to be safe. But if we only run when missing, not needed. Could include -f.
+
+For tabix, use `tabix -p vcf -f "$vcf_gz"`. Good.
+
+Need consider BWA index idempotency with existing files: If some index files exist but one zero? We check -s; if any missing/zero run bwa index. BWA may see existing and exit without creating missing? Could use `bwa index` maybe overwrites? It might not have force. But partial unlikely.
+
+Potential issue: The early exit checks collapsed.tsv with -s. If collapsed.tsv exists but is empty, all_present=0; proceed regenerate. Good.
+
+Need ensure no absolute paths. We use relative data/ref, results. Good.
+
+Need maybe quote variables. Yes.
+
+Now, tool inventory and `mkdir`: It's not listed. But boilerplate in plan includes mkdir -p results. So allowed. `printf` builtin. `while`, `read` builtins. Good.
+
+Could there be an issue with using process substitution? We use pipeline to while, no external. Good.
+
+Need maybe avoid `IFS=$'\t'` because `$'\t'` is bash-specific; shebang env bash okay.
+
+Potential issue: In the collapsed generation, if a line from bcftools query has leading/trailing spaces due AF like "0.123" no. If ALT contains comma and no tab, read fine. If INFO/AF missing and line ends with tab, `read` returns success? For a line ending in newline, yes. If last field empty, af set empty. Good.
+
+But if bcftools query outputs no trailing newline for last line? It does. If not, read without -r? We use -r; read returns nonzero at EOF without newline but still sets variables; while loop condition fails and last line lost. bcftools likely adds newline. Fine.
+
+Need maybe handle CRLF? No.
+
+Potential issue: `bcftools query` format `%INFO/AF` may output empty if AF not present, but for LoFreq it is present. Good.
+
+Now, idempotency with collapsed.tsv regeneration: Suppose early exit not triggered because collapsed missing, all sample outputs exist. We skip per-sample steps due files, then regenerate collapsed. Good. Suppose one sample vcf_gz exists but tbi missing; loop creates tbi, then regenerate collapsed (overwrites). Good.
+
+Potential issue: If results/collapsed.tsv exists and all final outputs exist except one sample's .bam.bai zero? Early exit false; per-sample may realign if bam nonempty but bai not -s. It will overwrite bam and index. That redoes work for that sample. But partial invalid. Fine.
+
+Need maybe ensure `lofreq call-parallel` doesn't require `--min-cov 1` to call variants in low coverage? Plan no. Use exact.
+
+Potential issue: LoFreq may write progress to stderr; allowed. It may also create a temporary file? Not concern.
+
+Now, think about BWA index files for `bwa mem`: If we check .amb .ann .bwt .pac .sa, but BWA 0.7.18 with default bwtsw2 creates `.fa.bwt`, `.fa.pac`, `.fa.amb`, `.fa.ann`, `.fa.sa`. Yes. It may also create `.fa.fai`? We separately faidx. Good.
+
+But if reference is a single line FASTA, `bwa index` might not create .amb? It does. If no Ns, .amb maybe 0 bytes? Could be nonempty header. If zero, our check fails and reruns bwa index every time? Need know: BWA .amb file for no ambiguous bases may still contain some bytes (header). Likely >0. But if zero, idempotency issue. To avoid depending on all files sizes, we can use existence rather than size for BWA index files. If a valid index has zero-byte .amb? Possibly not. Use `-e` to be safe: if any file missing, run; if exists (even zero) skip. But partial zero could cause alignment fail. Populated valid okay. For idempotent rerun, existence enough. Let's use `[[ ! -e "$f" ]]` for BWA index files and .fai? If .fai zero but exists, samtools faidx may error if run; skip. Valid .fai nonempty. Use -e to avoid rerunning due zero weirdness. But if a file is empty from failed previous run, script may fail later. Not required.
+
+For final outputs early exit: use -s for bam/vcf.gz, -e for bai/tbi? If tbi zero valid? Use -e. For collapsed use -s (header nonempty). For per-sample skip: if bam exists and bai exists, skip alignment/index. But if bam zero? Use -s for bam; if bam missing/zero realign. BAI existence maybe enough. Condition: `if [[ ! -s "$bam" || ! -e "$bai" ]]; then`. If bam nonempty but bai missing, realign (because we need index). Could instead just run samtools index on existing bam without realigning if bam exists and bai missing. That would be more idempotent/partial: 
+if [[ ! -s "$bam" ]]; then align; fi
+if [[ ! -e "$bai" ]]; then samtools index -f "$bam"; fi
+This avoids redoing alignment if only index missing. Good. But if bam is partial/invalid, not concern. Let's do separate:
+if [[ ! -s "$bam" ]]; then bwa mem ... | samtools sort ...; fi
+if [[ ! -e "$bai" ]]; then samtools index -@ "$THREADS" -f "$bam"; fi
+
+But if bam exists nonempty but is not sorted? We assume valid. Good.
+
+For VCF: 
+if [[ ! -s "$vcf_gz" ]]; then
+  if [[ ! -s "$vcf" ]]; then lofreq ...; fi
+  bcftools view -Oz -o "$vcf_gz" "$vcf"
+fi
+if [[ ! -e "$tbi" ]]; then tabix -p vcf -f "$vcf_gz"; fi
+
+If vcf_gz exists but tbi missing, no convert. Good. If vcf_gz missing and vcf intermediate exists, convert only. Good.
+
+Early exit check should mirror: all_present=1 if collapsed nonempty and for each sample bam nonempty, bai exists, vcf_gz nonempty, tbi exists. Use -e for indices. 
+for f in bam vcf_gz; do [[ ! -s $f ]] && all_present=0; done
+for idx in bai tbi; do [[ ! -e $idx ]] && all_present=0; done
+
+Need be careful with `&&` under set -e? In conditional context okay. But simpler if statements.
+
+Reference index check: use -e for .fai and BWA files. If missing run. 
+bwa_index_ok=1
+for f in ...; do if [[ ! -e "$f" ]]; then bwa_index_ok=0; fi; done
+if [[ "$bwa_index_ok" != "1" ]]; then bwa index "$REF"; fi
+if [[ ! -e "${REF}.fai" ]]; then samtools faidx "$REF"; fi
+
+But if BWA index files exist but .fai missing, run faidx. Good.
+
+Potential issue: `bwa index` may create `.fa.fai` too; then our check for .fai after bwa maybe exists. We still check and skip. Good.
+
+Now, tool constraint: `samtools index -@ 4 -f`? Does samtools index support `-@`? Yes, most samtools tools have -@ threads. It may not need. Use.
+
+Potential issue: `bwa mem` with reference data/ref/chrM.fa and index files in same dir. If we early exit before indexing when all outputs exist, no need. Good.
+
+Now, think about LoFreq and reference .fai: If BWA index created .fa.fai but samtools faidx not run? We check .fai existence; if bwa created it, skip. Is BWA's .fa.fai compatible with pysam? It should be standard. But to follow plan ordering, we run bwa index then samtools faidx. If bwa creates .fai, our idempotent check skips samtools faidx. That's okay; but if BWA's fai is incomplete? Probably fine. To ensure samtools faidx used, we could not rely on existence and always run `samtools faidx`? But idempotency says without redoing work; running faidx every time maybe minor but may emit output/error if exists? It overwrites? Could be okay but "without redoing work" prefer skip. If BWA creates .fai, it's valid. Good.
+
+Potential issue: `lofreq call-parallel` may require `.fa.fai` and also `.fa.gzi` for compressed reference; not needed.
+
+Now, possible hidden requirement: The script must be self-contained and perform requested workflow. They might run shellcheck? We should ensure no syntax errors. Let's mentally shellcheck.
+
+Script:
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+REF="data/ref/chrM.fa"
+OUTDIR="results"
+mkdir -p "$OUTDIR"
+
+all_present=1
+if [[ ! -s "${OUTDIR}/collapsed.tsv" ]]; then
+  all_present=0
+fi
+for sample in "${SAMPLES[@]}"; do
+  if [[ ! -s "${OUTDIR}/${sample}.bam" || ! -e "${OUTDIR}/${sample}.bam.bai" || ! -s "${OUTDIR}/${sample}.vcf.gz" || ! -e "${OUTDIR}/${sample}.vcf.gz.tbi" ]]; then
+    all_present=0
+  fi
+done
+if [[ "$all_present" == "1" ]]; then
+  exit 0
+fi
+
+bwa_index_ok=1
+for f in "${REF}.amb" "${REF}.ann" "${REF}.bwt" "${REF}.pac" "${REF}.sa"; do
+  if [[ ! -e "$f" ]]; then
+    bwa_index_ok=0
+  fi
+done
+if [[ "$bwa_index_ok" != "1" ]]; then
+  bwa index "$REF"
+fi
+
+if [[ ! -e "${REF}.fai" ]]; then
+  samtools faidx "$REF"
+fi
+
+for sample in "${SAMPLES[@]}"; do
+  bam="${OUTDIR}/${sample}.bam"
+  bai="${OUTDIR}/${sample}.bam.bai"
+  vcf="${OUTDIR}/${sample}.vcf.gz" # Wait need uncompressed name separate. Let's define:
+  vcf_plain="${OUTDIR}/${sample}.vcf"
+  vcf_gz="${OUTDIR}/${sample}.vcf.gz"
+  tbi="${OUTDIR}/${sample}.vcf.gz.tbi"
+
+  if [[ ! -s "$bam" ]]; then
+    bwa mem -t "$THREADS" \
+      -R "@RG\tID:${sample}\tSM:${sample}\tLB:{sample}\tPL:ILLUMINA" \
+      "$REF" "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" | samtools sort -@ "$THREADS" -o "$bam" -
+  fi
+
+  if [[ ! -e "$bai" ]]; then
+    samtools index -@ "$THREADS" -f "$bam"
+  fi
+
+  if [[ ! -s "$vcf_gz" ]]; then
+    if [[ ! -s "$vcf_plain" ]]; then
+      lofreq call-parallel --pp-threads "$THREADS" -f "$REF" -o "$vcf_plain" "$bam"
+    fi
+    bcftools view -Oz -o "$vcf_gz" "$vcf_plain"
+  fi
+
+  if [[ ! -e "$tbi" ]]; then
+    tabix -p vcf -f "$vcf_gz"
+  fi
+done
+
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > "${OUTDIR}/collapsed.tsv"
+for sample in "${SAMPLES[@]}"; do
+  bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "${OUTDIR}/${sample}.vcf.gz" | while IFS=$'\t' read -r chrom pos ref alt af; do
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sample" "$chrom" "$pos" "$ref" "$alt" "$af"
+  done >> "${OUTDIR}/collapsed.tsv"
+done
+
+Need check variable `vcf` not used. Good.
+
+Potential issue: In bwa mem -R string, we use `\t` inside double quotes. Bash does not interpret backslash-t; it passes literal backslash t to bwa? BWA expects tab characters in RG tag? The plan uses `-R "@RG\tID:{sample}\tSM:{sample}..."`. In bash double quotes, `\t` remains two chars backslash and t. Does bwa interpret `\t` as tab? I think BWA's -R option expects a string with literal tabs or maybe it interprets C-style escapes? Let's recall: In command line examples, they use `-R "@RG\tID:foo"` in bash; the shell passes `@RG\tID:foo` (backslash t). Does bwa convert `\t` to tab? I believe BWA does not interpret escape sequences; you need actual tabs. But many examples use `$'@RG\tID:...'` or single quotes with actual tabs? Let's check: In bash, double-quoted `"\t"` is backslash-t. BWA might treat backslash as literal, causing RG tag malformed? Actually SAM header lines require tab-separated tags. If bwa receives `\t`, it may insert a tab? I need know. BWA source for -R: It stores the string and later writes to BAM header; maybe it does not parse tabs; it expects actual tab characters. Many users use `-R "@RG\tID:sample"` in shell scripts and it works? How? In double quotes, `\t` is backslash t, but maybe BWA's C code interprets escape sequences? Let's recall from experience: `bwa mem -R "@RG\tID:foo\tSM:bar" ref.fa reads.fq` often used. It likely works because bwa parses the RG string and converts `\t` to tab? Or because in some shells (zsh?) double quotes interpret \t? In bash, no. But I have seen examples with `bwa mem -R "@RG\tID:..."` and it produces proper header? Maybe BWA does handle backslash escapes. Let's verify mentally: BWA main.c has function `parse_rg` maybe splits on tab character only. If string contains `\t`, not tab, then ID would be `@RG\tID:foo...` invalid. But perhaps the shell in examples is not bash? Or they use `$'...'`. To be safe, we should provide actual tabs using bash ANSI-C quoting: `-R $'@RG\tID:'"${sample}"$'\tSM:'"${sample}"$'\tLB:'"${sample}"$'\tPL:ILLUMINA'` or define RG string with printf. But plan shows double quotes; however correctness matters. We can use `printf -v rg '@RG\tID:%s\tSM:%s\tLB:%s\tPL:ILLUMINA' "$sample" "$sample" "$sample"`? Bash builtin printf interprets \t in format and creates actual tabs. Then pass `-R "$rg"`. That avoids external echo and ensures tabs. Good. Need ensure no user-facing output; printf -v assigns variable, no stdout. Use:
+printf -v rg '@RG\tID:%s\tSM:%s\tLB:%s\tPL:ILLUMINA' "$sample" "$sample" "$sample"
+bwa mem ... -R "$rg" ...
+
+This is robust. Does `printf` builtin allowed? Yes. It writes no stdout with -v. Good.
+
+Alternatively use `$'...'`: 
+RG=$'@RG\tID:'"${sample}"$'\tSM:'"${sample}"$'\tLB:'"${sample}"$'\tPL:ILLUMINA'
+This uses bash ANSI-C quoting, actual tabs. Simpler. But sample names contain no special chars. Use printf -v maybe clearer.
+
+Need ensure `printf -v` is available in bash (yes). It may be considered a tool? builtin. Good.
+
+Potential issue: If using `set -u`, variables defined. Good.
+
+Now, think about LoFreq output and bcftools view compression. `bcftools view -Oz` will write .vcf.gz but does it create .tbi? No. It may also create a temporary file in cwd? Not concern. It might require the input VCF to have no duplicate contigs etc. Fine.
+
+Could we use `bcftools index -t` instead of tabix? Tool inventory includes bcftools and tabix. Plan says tabix. Use tabix.
+
+Potential issue: `tabix -p vcf -f` on a VCF with no variants may create .tbi but if file is not bgzipped (because lofreq wrote plain to .vcf.gz? We convert via bcftools, so okay). If intermediate .vcf_plain missing and vcf_gz exists from previous direct lofreq maybe plain? Not concern.
+
+Need consider idempotency of `bcftools view -Oz`: If vcf_gz missing but vcf_plain exists, it compresses. If vcf_plain is empty (0 bytes), bcftools may fail. We check ! -s vcf_plain before lofreq; if vcf_plain zero, run lofreq. Good.
+
+Potential issue: LoFreq call-parallel may output a VCF with no header? It has header. Good.
+
+Now, possible hidden requirement: "Do not write to stderr/stdout beyond what tools naturally emit" Our script's `printf -v` no output. The while loop printf writes to file via redirection; no stdout. The final collapsed generation uses pipeline: bcftools query | while ... done >> file. The while loop's stdout is redirected to file, so no stdout. But the pipeline's stderr from bcftools naturally emits. Good.
+
+Potential issue: If `bcftools query` outputs nothing, the while loop still runs? It reads EOF immediately; no output. Pipeline status 0. Good.
+
+Now, think about using `mkdir -p results`: If results exists, no output. Good.
+
+Need maybe set `export OMP_NUM_THREADS=4`? Not necessary. LoFreq --pp-threads uses parallel. BWA/samtools threads specified. Could help but not required. Avoid extra.
+
+Potential issue: LoFreq call-parallel may use all cores by default for some steps; --pp-threads 4 sets. Good.
+
+Now, check wall clock: If early exit on populated results, instant. First run: bwa index small, faidx, 4 alignments sequential. MiSeq amplicon maybe few million reads? Could be under 600 with 4 threads? Probably. LoFreq per sample maybe heavy but mtDNA small. Sequential 4 samples could be okay. If not, could parallelize samples? But plan says for loop sequential. Wall clock constraint at THREADS=4; if each sample uses 4 threads, total CPU 16 cores? They likely have enough. Could we run samples in background to reduce wall clock? Plan authoritative ordering per-sample steps in for loop; maybe not. Keep sequential.
+
+Need consider `lofreq call-parallel` on amplicon data may be slow due many reads mapping to same region. But mtDNA 16kb, MiSeq amplicon maybe high coverage. 4 samples under 600? Likely benchmark designed. Could use `--min-cov 1 --min-bp 1`? No.
+
+Potential issue: BWA mem for short amplicons to chrM may produce many secondary alignments; LoFreq handles. Good.
+
+Now, think about collapsed.tsv columns: sample chrom pos ref alt af. Our query uses %CHROM (chrM), %POS, %REF, %ALT, %INFO/AF. Good. If multiple ALTs, one

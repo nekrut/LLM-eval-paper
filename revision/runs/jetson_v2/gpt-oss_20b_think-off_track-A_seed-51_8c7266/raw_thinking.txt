@@ -1,0 +1,160 @@
+We need to produce a bash script following constraints.
+
+Let's craft script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+Define constants: THREADS=4; SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+Create results dir: mkdir -p results
+
+Reference indexing steps with guards.
+
+Then per sample loop:
+
+- alignment pipeline guard: check if results/${sample}.bam exists. If not, run bwa mem ... | samtools sort -@ $THREADS -o results/${sample}.bam -
+
+But we need to use braces for guard: [[ -f results/${sample}.bam ]] || { bwa mem ... | samtools sort ... ; }
+
+Also need to ensure that the output of bwa mem is piped correctly. Use double quotes for RG string with \t.
+
+The RG string: "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"
+
+But we must use literal backslash t, not actual tab. So inside double quotes, we need to escape the backslashes? Actually in bash, within double quotes, \t is just a backslash and t; but if we write "\t", it becomes literal backslash + t? Wait: In double quotes, backslash escapes certain characters like `$`, `"`, `\` and newline. But not 't'. So "\t" will be interpreted as backslash followed by t. Good.
+
+So we can write "-R \"@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA\"" but easier to use single quotes? We need double quotes for variable expansion, but we can escape the backslashes. Actually we want literal \t inside string passed to bwa mem. So we can write:
+
+-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"
+
+But within double quotes, \t is not special; it remains as backslash t? Wait, in bash, inside double quotes, a backslash before certain characters escapes them. For 't', it's not one of those, so the backslash stays. So "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" will produce string with literal \t? Let's test mentally: echo "@RG\tID:test\ttest" prints @RG\tID:test\ttest (with backslashes). Good.
+
+So we can use that.
+
+Now after bam, index guard: [[ -f results/${sample}.bam.bai ]] || samtools index -@ $THREADS results/${sample}.bam
+
+Variant calling guard: check if results/${sample}.vcf.gz.tbi exists? But step 6 will produce .tbi. So we can guard on that.
+
+But spec says guard on either .vcf or .vcf.gz. We'll use .vcf.gz.tbi sentinel.
+
+[[ -f results/${sample}.vcf.gz.tbi ]] || { lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam && bgzip -f results/${sample}.vcf && tabix -p vcf results/${sample}.vcf.gz ; }
+
+But we need to separate steps: call-parallel produce .vcf; then compress and index. But if we guard on .tbi, we may skip calling if tbi exists but maybe .vcf missing? But that's fine.
+
+However we also need to ensure that if .vcf.gz.tbi exists but .vcf is missing (e.g., due to manual deletion), the guard will not run and we might have stale data. But spec says guard on both .vcf or .vcf.gz. We'll implement as:
+
+[[ -f results/${sample}.vcf.gz.tbi ]] || { lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam && bgzip -f results/${sample}.vcf && tabix -p vcf results/${sample}.vcf.gz ; }
+
+But we need to ensure that if .vcf exists but .tbi missing, the guard will run again. That's fine.
+
+Now collapsed.tsv: always rebuild.
+
+We must output header with printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+
+Then for each sample:
+
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+
+We need to ensure bcftools query uses correct format string. Use single quotes.
+
+Now we must ensure that all commands are available: bwa, samtools, lofreq, bgzip (from tabix? Actually bgzip is part of htslib; but not listed in TOOL_INVENTORY. Wait tool inventory includes tabix but not bgzip. But bgzip is usually part of htslib and often installed with tabix. However the spec didn't list bgzip explicitly. But we can use "bgzip" command from htslib, which may be available. But to be safe, maybe use "samtools view -b"? No. We need compression; bcftools can compress? Actually bcftools can compress VCF with "-O z". But easier: use "bgzip" if available. Since tabix is there, bgzip likely present.
+
+But we cannot rely on it being in PATH? Usually yes. We'll assume it's available.
+
+Alternatively we could use "samtools view -b" but that's for BAM.
+
+Ok.
+
+Now we need to ensure that the script uses only tools listed: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. bgzip is not in list but part of htslib; maybe considered part of tabix? But spec didn't mention it. However we can use "samtools view -b" to compress VCF? No.
+
+But bcftools has "-O z" option: bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf. That would produce gzipped VCF. Then tabix index. So we can avoid bgzip.
+
+Let's modify step 6:
+
+[[ -f results/${sample}.vcf.gz.tbi ]] || { lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam && bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf && tabix -p vcf results/${sample}.vcf.gz ; rm -f results/${sample}.vcf ; }
+
+But we need to delete .vcf after compressing. We can use "rm -f". That uses built-in.
+
+Now idempotency: If .tbi exists, skip all steps. Good.
+
+Now we must ensure that bcftools view -Oz will produce gzipped VCF; but we also need to index with tabix. Works.
+
+Now collapsed.tsv step uses bcftools query on results/${sample}.vcf.gz. That file exists.
+
+Edge: If .tbi missing but .vcf.gz present? But guard ensures tbi missing triggers re-run, which will produce new vcf.gz and tbi; but if .vcf.gz already there but tbi missing, we still run again, generating new vcf.gz (overwriting). That's fine.
+
+Now script final.
+
+Also need to ensure that we use "set -euo pipefail" as second line.
+
+Let's craft script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Reference indexing
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+for sample in "${SAMPLES[@]}"; do
+    # Alignment and sort
+    [[ -f results/${sample}.bam ]] || {
+        bwa mem -t $THREADS \
+            -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            data/ref/chrM.fa \
+            data/raw/${sample}_1.fq.gz \
+            data/raw/${sample}_2.fq.gz | \
+        samtools sort -@ $THREADS -o results/${sample}.bam -
+    }
+
+    # BAM index
+    [[ -f results/${sample}.bam.bai ]] || samtools index -@ $THREADS results/${sample}.bam
+
+    # Variant calling and compression
+    [[ -f results/${sample}.vcf.gz.tbi ]] || {
+        lofreq call-parallel --pp-threads $THREADS \
+            -f data/ref/chrM.fa \
+            -o results/${sample}.vcf \
+            results/${sample}.bam &&
+
+        bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf &&
+
+        tabix -p vcf results/${sample}.vcf.gz &&
+
+        rm -f results/${sample}.vcf
+    }
+done
+
+# Collapsed TSV
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' \
+        results/${sample}.vcf.gz | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+
+Now we need to ensure that bcftools query uses correct format string; we used single quotes. Good.
+
+Also, we must not use echo for user-facing prose. We only used printf for header, which is fine (tool natural output). But spec says "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." Using printf may be considered writing to stdout but it's part of script's own output. It's allowed? It might be considered user-facing. The instruction: "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." So we should avoid printing anything ourselves. But header line is required in collapsed.tsv, which is a file, not stdout. Using printf writes to stdout but redirects to file via > results/collapsed.tsv. That's fine because it's writing to a file, not to console. The script's stdout will be empty except for tool outputs. So using printf is okay.
+
+Now we must ensure that the script uses only tools listed: bwa, samtools, lofreq, bcftools, tabix. We used bcftools view and query; that's fine. We didn't use bgzip or other tools. Good.
+
+We also used rm -f which is built-in? rm is external but not in list. But we can avoid rm by using "rm" command. Is rm allowed? It's a standard Unix utility, not listed but presumably available. The instruction says only tools listed may be invoked; but rm is part of coreutils, not listed. However the instruction might mean that only those listed are guaranteed to be on PATH. But rm should exist. But to be safe, we can avoid rm by using "mv" or "cp"? We need to delete .vcf after compressing. We could use "rm -f". It's fine.
+
+But maybe better to not delete; keep .vcf as sentinel? But guard uses tbi sentinel only. If we keep .vcf, it might be stale but not harmful. We can skip deletion. Let's remove rm step to avoid using rm. We'll just leave the .vcf file present. That won't affect anything.
+
+Thus modify block: after tabix, no rm.
+
+Now script final.
+
+Also ensure that bcftools query uses %INFO/AF; correct.
+
+Edge: In collapsed.tsv, we use awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}'. This will produce sample plus the row. Good.
+
+Now final script.
+
+Let's output only script.

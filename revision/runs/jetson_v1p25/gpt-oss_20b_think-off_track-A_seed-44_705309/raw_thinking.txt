@@ -1,0 +1,341 @@
+We need to produce a bash script that follows instructions.
+
+Constraints: first line #!/usr/bin/env bash; second set -euo pipefail.
+
+Need to be idempotent: skip steps if outputs exist and are newer than inputs.
+
+We have tools: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. We only need some of them: bwa, samtools, lofreq, bgzip (not listed but part of htslib? Actually bgzip is part of htslib; but not in TOOL_INVENTORY list. But we can use bcftools view -O z to compress VCF. The plan says "Compress with bgzip (not bcftools view -O z)". But bgzip may not be listed, but it's part of samtools? Actually bgzip is a separate binary from htslib; maybe available. But we cannot guarantee. We can use bcftools view -O z to compress; but plan says not to. However the instruction: "Use only tools listed in TOOL_INVENTORY." So bgzip may not be listed, so can't use it. But bcftools is listed and can compress VCF with -Oz. The plan explicitly says not to use bcftools view -O z, but that might conflict with tool inventory constraint. We need to reconcile: we must obey both constraints. The instruction "Use only tools listed in TOOL_INVENTORY" means we cannot invoke bgzip if it's not listed. But the plan says compress with bgzip. However maybe bgzip is part of samtools? Actually bgzip is a separate binary but often installed with htslib; but not listed. So to be safe, use bcftools view -O z. The instruction "not bcftools view -O z" might be a plan detail but we can override due to tool inventory constraint. But the user explicitly says "Do not write to stderr/stdout beyond what tools naturally emit". Using bcftools view will produce output; that's fine.
+
+But maybe bgzip is available as part of samtools? Actually samtools includes bgzip binary. The TOOL_INVENTORY lists samtools 1.21, which includes bgzip. So we can use bgzip because it's part of samtools. But the inventory didn't list bgzip explicitly but it's part of samtools distribution. Usually bgzip is a separate binary in htslib; but it might be installed as /usr/bin/bgzip or similar. The environment may have it. But to be safe, we can use bcftools view -O z.
+
+But plan says "Compress with bgzip (not `bcftools view -O z`) producing `results/{sample}.vcf.gz`." So they want us to use bgzip. Let's assume bgzip is available; it's part of samtools distribution but not listed. But the instruction "Use only tools listed in TOOL_INVENTORY" may allow using bgzip because it's part of samtools? It's ambiguous. Usually you can call bgzip if it's on PATH. The inventory didn't list it, but maybe it's still on PATH. However to be safe, we might use bcftools view -O z; but that conflicts with plan.
+
+We need to decide: which constraint is higher priority? The user gave a plan and also said "Use only tools listed in TOOL_INVENTORY." So we must obey both. But the plan explicitly says not to use bcftools view -O z. That might be considered part of the plan, but if it conflicts with tool inventory, maybe we can still use bgzip because it's part of samtools and likely on PATH. The instruction "Use only tools listed in TOOL_INVENTORY" may mean you cannot invoke any other external commands except those listed. But bgzip is not listed; so maybe we can't use it. However the plan says compress with bgzip, which would violate that rule. So there's a conflict.
+
+We need to produce a script that satisfies both constraints: Use only tools in TOOL_INVENTORY and follow the plan. The plan's compression step uses bgzip, but bcftools view -O z is not allowed per plan. But we can still use bgzip if it's part of samtools; but it's not listed. However maybe the environment has bgzip binary because it's part of htslib; but not in inventory.
+
+Given the instruction "Use only tools listed in TOOL_INVENTORY", I'd interpret that as you cannot invoke any other binaries except those listed. So we must avoid bgzip if it's not listed. But bcftools view -O z is also not allowed per plan, but maybe we can still use bcftools view -O z because it's part of the plan? Wait, plan says "Compress with bgzip (not `bcftools view -O z`) producing `results/{sample}.vcf.gz`." So they explicitly say not to use bcftools view -O z. So we must not use it.
+
+Thus we need a tool that can compress VCF and is listed: maybe samtools has "samtools view" but that's for BAM/CRAM. But bgzip is separate. Another possibility: use "bgzip" from htslib, which might be on PATH even if not in inventory. But the instruction says only tools listed; so we can't rely on that.
+
+But maybe bcftools can compress VCF with "-O z" but that's part of bcftools view command; but plan forbids it. So we have a conflict.
+
+We need to decide which constraint is more important. The user gave a plan and also said "Use only tools listed in TOOL_INVENTORY." I'd think the plan is authoritative, but the tool inventory is also an instruction. But if they conflict, maybe we can still use bgzip because it's part of samtools distribution; but not listed. However many people consider bgzip as part of htslib and available on PATH. The environment might have it.
+
+Given typical HPC environment, bgzip is usually installed separately. But the inventory didn't list it. So I'd lean to using bcftools view -O z because it's safer: bcftools is in inventory. But plan says not to use bcftools view -O z. That may be a mistake or oversight. The user might have purposely said "not bcftools view -O z" but still allowed bgzip. So we should follow that.
+
+Thus we will use bgzip for compression, assuming it's available on PATH. If not, script would fail; but that's okay given constraints.
+
+Also need to index with tabix -p vcf results/{sample}.vcf.gz.
+
+We also need to skip steps if outputs exist and are newer than inputs. We'll implement a function check_newer that compares timestamps.
+
+Simplify: For each sample, we can use `if [[ ! -s results/${sample}.bam ]]` or check existence of .tbi etc. But we need idempotency: If all outputs exist and are newer than inputs, skip entire pipeline for that sample.
+
+We also need to index reference if not already indexed.
+
+Also need to create results/ directory.
+
+Also need to ensure no extraneous output; just tool outputs.
+
+Let's design script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+# Create results dir if not exist
+mkdir -p results
+
+# Reference indexing
+REF=data/ref/chrM.fa
+if [[ ! -f ${REF}.fai ]]; then
+    samtools faidx "$REF"
+fi
+if [[ ! -f ${REF}.amb || ! -f ${REF}.ann || ! -f ${REF}.bwt || ! -f ${REF}.pac || ! -f ${REF}.sa ]]; then
+    bwa index "$REF"
+fi
+
+# Function to check if output newer than inputs
+is_up_to_date() {
+    local out=$1
+    shift
+    local inputs=("$@")
+    for inp in "${inputs[@]}"; do
+        [[ -e $inp ]] || return 1
+        [[ $out -nt $inp ]] || return 1
+    done
+    return 0
+}
+
+# Process each sample
+for sample in "${SAMPLES[@]}"; do
+    # Define paths
+    fq1=data/raw/${sample}_1.fq.gz
+    fq2=data/raw/${sample}_2.fq.gz
+    bam=results/${sample}.bam
+    bai=results/${sample}.bam.bai
+    vcf_uncompressed=results/${sample}.vcf
+    vcf_gz=results/${sample}.vcf.gz
+    tbi=results/${sample}.vcf.gz.tbi
+
+    # Alignment and sorting
+    if ! is_up_to_date "$bai" "$fq1" "$fq2"; then
+        bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+            "$REF" "$fq1" "$fq2" | samtools sort -@ $THREADS -o "$bam"
+        samtools index -@ $THREADS "$bam"
+    fi
+
+    # Variant calling
+    if ! is_up_to_date "$vcf_gz" "$bam"; then
+        lofreq call-parallel --pp-threads $THREADS -f "$REF" -o "$vcf_uncompressed" "$bam"
+        bgzip -c "$vcf_uncompressed" > "$vcf_gz"
+        tabix -p vcf "$vcf_gz"
+        rm -f "$vcf_uncompressed"
+    fi
+done
+
+# Collapse step
+collapsed=results/collapsed.tsv
+# Determine if any VCF newer than collapsed
+needs_collapse=true
+if [[ -s $collapsed ]]; then
+    needs_collapse=false
+    for sample in "${SAMPLES[@]}"; do
+        vcf_gz=results/${sample}.vcf.gz
+        if [[ "$vcf_gz" -nt "$collapsed" ]]; then
+            needs_collapse=true
+            break
+        fi
+    done
+fi
+
+if $needs_collapse; then
+    # Header
+    printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed"
+    for sample in "${SAMPLES[@]}"; do
+        vcf_gz=results/${sample}.vcf.gz
+        bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\\n' "$vcf_gz" | \
+            awk -v s="$sample" '{print s"\t"$0}' >> "$collapsed"
+    done
+fi
+
+exit 0
+
+But we need to ensure that bcftools query output uses tab separators. The format string uses \t; but we used %CHROM\\t%POS... Actually we want literal tabs in output, so use `-f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`. But inside single quotes, \t will be interpreted by bcftools? In bcftools query, the format string uses \t as tab. So we can use single quotes with \t; that's fine.
+
+But we used `awk -v s="$sample" '{print s"\t"$0}'` to prepend sample name. That adds a tab between sample and first field. Good.
+
+However we need to ensure bcftools query output uses tabs, not spaces. The format string includes \t which will be replaced by actual tab characters in the output. So it's fine.
+
+But we used `printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed"`. That prints header with tabs.
+
+Now idempotency: We check if $bai is newer than inputs; but we also need to ensure that .bam exists and is newer? Actually we check only .bai. But if .bam is older, .bai may be newer but .bam older. But we want to skip alignment if both bam and bai exist and are newer than inputs. We can check for $bam instead of $bai. Let's modify: use `is_up_to_date "$bam" "$fq1" "$fq2"`; then index after sorting. But we also need to ensure .bam.bai exists. So maybe we do:
+
+if ! is_up_to_date "$bam" "$fq1" "$fq2"; then
+    bwa mem ... | samtools sort -@ $THREADS -o "$bam"
+    samtools index -@ $THREADS "$bam"
+fi
+
+But if bam exists but bai missing, this will skip alignment and not create bai. But we can check separately: after sorting, we always run samtools index; but if .bai already exists and is newer than bam, we could skip indexing. But it's okay to reindex each time? That might be unnecessary but still idempotent. But we want to avoid redoing work. So we should check for bai.
+
+Simplify: After sorting, we can run samtools index only if .bai missing or older than bam. We can implement:
+
+if [[ ! -f "$bai" || "$bam" -nt "$bai" ]]; then
+    samtools index -@ $THREADS "$bam"
+fi
+
+But we already skip alignment if bam is up to date; but still need to ensure bai exists.
+
+Let's restructure: For each sample:
+
+- If bam not up to date, run bwa mem and sort.
+- Then check if bai missing or older than bam; if so index.
+
+Similarly for variant calling: We check if vcf_gz up to date relative to bam. But we also need to consider that .vcf.gz may exist but .tbi missing. So we can check both.
+
+Simplify: We'll use a function `needs_output` that checks if output exists and newer than inputs; else run step.
+
+But for variant calling, we need to produce vcf_gz and tbi. We can check if vcf_gz exists and is newer than bam; if not, run call-parallel and compress. After compression, ensure tbi exists; if missing or older than vcf_gz, index.
+
+Let's implement accordingly.
+
+Also for collapse step: we need to rebuild only if any input VCF newer than collapsed. We'll check each sample's vcf_gz -nt collapsed.
+
+Now about the read group string: We must pass `-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`. The backslashes should be literal; we need to escape them in bash. In double quotes, `\t` will become tab unless escaped. So we use single quotes? But we need variable expansion for sample. We can use printf -v rg "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA". Then pass $rg to bwa mem.
+
+But the instruction says "The `\t` must remain the two characters backslash and `t` — bwa parses them itself. Do NOT use printf, echo -e, $'\t', or any mechanism that turns them into real tabs; bwa rejects real tabs with “the read group line contained literal <tab> characters”." So we need to pass a string containing literal backslash-t sequences. In bash, if we write `-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`, the shell will interpret `\\` as a single backslash? Actually in double quotes, `\\` becomes a single backslash. So `\\t` becomes `\t`. That's what we want: literal backslash and t. Good.
+
+But if we use single quotes, variable expansion won't happen. So we need double quotes with escaped backslashes. That is fine.
+
+Now we must ensure that the string passed to bwa mem contains literal backslash-t sequences. In double quotes, `\\t` becomes `\t`. Good.
+
+Now about idempotency: We should check if outputs exist and are newer than inputs; but also need to handle missing intermediate files like .vcf.gz.tbi. We'll incorporate that.
+
+Also we must not produce extraneous output. The script will run commands that print logs to stdout/stderr as usual. That's fine.
+
+Now about the collapse step: We used bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$vcf_gz". That outputs lines with tabs. Then we pipe into awk to prepend sample name and tab. Good.
+
+But we need to ensure that bcftools query output uses \t as actual tab; yes.
+
+Now about the header: We used printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed". That prints header with tabs. Good.
+
+Now about idempotency of collapse step: We check if collapsed exists and is newer than all vcf_gz. If so skip. Implementation uses loop to set needs_collapse accordingly.
+
+Edge case: If collapsed missing, we rebuild.
+
+Now about reference indexing: We need to index only once. We'll check for .fai and .amb etc. Good.
+
+Now about thread usage: Use THREADS=4.
+
+Now about the environment: The script should be idempotent; re-running will exit 0 without doing work if all outputs exist and are newer than inputs. Our checks should ensure that.
+
+But we need to consider that after alignment, we always run samtools index if .bai missing or older. That may happen even if bam is up to date but bai missing. That's fine; it's not redoing heavy work.
+
+Now about variant calling: We check if vcf_gz exists and newer than bam; else call. After compressing, we need to ensure tbi exists; if missing or older, index. But if vcf_gz existed but tbi missing, we will still run tabix. That's fine.
+
+But our current code only checks for vcf_gz existence relative to bam; but we also need to check tbi. We'll implement:
+
+if ! is_up_to_date "$vcf_gz" "$bam"; then
+    lofreq call-parallel ...
+    bgzip -c "$vcf_uncompressed" > "$vcf_gz"
+    rm -f "$vcf_uncompressed"
+fi
+
+# Ensure index
+if [[ ! -f "$tbi" || "$vcf_gz" -nt "$tbi" ]]; then
+    tabix -p vcf "$vcf_gz"
+fi
+
+But we need to ensure that if vcf_gz was just created, tbi will be created. Good.
+
+Now about the collapse step: We use bcftools query; but we also need to ensure that INFO/AF exists in VCF. lofreq call-parallel outputs AF? It may output AF as INFO field. We'll assume yes.
+
+Now about potential missing fields: Not relevant.
+
+Now about script structure: We should include `#!/usr/bin/env bash` and `set -euo pipefail`.
+
+Also we need to ensure that the script uses only tools listed; we used bgzip, but that's part of samtools distribution; but not in inventory. But maybe it's okay. If not, we can use bcftools view -O z. Let's decide: Use bcftools view -O z because it's safe and within inventory. But plan says not to use it. However the instruction "Use only tools listed" is higher priority than plan? The user gave a plan that includes compress with bgzip; but also said "Do not hardcode any path outside the current working directory." The tool inventory constraint might be considered part of environment, but we can still call bgzip if it's available. But to avoid risk, maybe use bcftools view -O z and ignore plan's note? That would violate plan though.
+
+Given typical instructions, I'd follow the plan over the tool inventory; but the tool inventory is a hard constraint: "Use only tools listed in TOOL_INVENTORY." So we cannot call bgzip if it's not listed. But maybe bgzip is part of samtools distribution and thus considered part of that tool? The inventory lists samtools 1.21, which includes bgzip binary. Usually you can run `bgzip` as separate command; but the environment may have it on PATH. It's not explicitly listed, but it's part of samtools installation. I'd assume it's available.
+
+Thus we can use bgzip.
+
+But to be safe, we could check if bgzip exists: `command -v bgzip >/dev/null 2>&1 || { echo "bgzip missing" >&2; exit 1; }`. But that would produce output to stderr. The instruction says "Do not write to stderr/stdout beyond what tools naturally emit". So we cannot print error messages. But if bgzip is missing, script will fail anyway. That's okay.
+
+Thus we can use bgzip.
+
+Now about bcftools query: We used `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`. That uses \t inside single quotes; but the shell interprets \t as literal backslash-t? Actually in single quotes, backslashes are not interpreted except for escaping single quote. So `\t` remains two characters: backslash and t. But bcftools query expects format string with \t to produce tab. It will interpret it accordingly. Good.
+
+Now about the awk command: We used `awk -v s="$sample" '{print s"\t"$0}'`. That prints sample name, a tab, then the line from bcftools output (which already has tabs). So final line will be "sample\tchrom\tpos\tref\talt\taf". Good.
+
+Now about header: We used printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed". That prints header with tabs. Good.
+
+Now about idempotency of collapse step: We check if collapsed exists and newer than all vcf_gz; else rebuild. Implementation uses loop to set needs_collapse accordingly.
+
+Potential bug: If collapsed exists but some VCF is newer, we will rebuild. That's correct.
+
+Now about the script's exit status: It will exit 0 at end.
+
+Now about potential missing directories: results/ may exist; we create it if not.
+
+Now about path names: We use relative paths.
+
+Now about quoting: Use double quotes around variables to avoid word splitting.
+
+Now about using `bgzip -c "$vcf_uncompressed" > "$vcf_gz"`: This writes compressed file. Good.
+
+Now about removing uncompressed VCF: rm -f "$vcf_uncompressed".
+
+Now about indexing: tabix -p vcf "$vcf_gz". That will create .tbi.
+
+Now about potential concurrency: We run sequentially; no parallelization across samples. That's fine within 600 seconds.
+
+Now about the script's idempotency: If all outputs exist and are newer than inputs, the script will skip alignment for each sample because bam exists and is newer than fq1/fq2? Wait we check `is_up_to_date "$bam" "$fq1" "$fq2"`; if bam newer than both, we skip. But we also need to ensure bai exists and newer than bam. We handle that separately: after alignment step (which may be skipped), we still run index if missing or older. If bam is up to date but bai missing, we will index. That might happen only once.
+
+Now for variant calling: We check `is_up_to_date "$vcf_gz" "$bam"`; if vcf_gz newer than bam, skip call. But if tbi missing, we still run tabix. Good.
+
+Now about collapse step: We rebuild if any VCF newer than collapsed. Good.
+
+Now potential bug: The function is_up_to_date uses `[[ $out -nt $inp ]] || return 1`. That means if out is not newer than inp, return 1 (needs update). But we also need to check that out exists; we did `[[ -e $inp ]]` for each input. But we didn't check existence of output file before comparing timestamps. We should check if output exists: If output doesn't exist, we should consider it outdated. So modify function:
+
+is_up_to_date() {
+    local out=$1
+    shift
+    [[ -f "$out" ]] || return 1
+    for inp in "$@"; do
+        [[ -e $inp ]] || return 1
+        [[ $out -nt $inp ]] || return 1
+    done
+    return 0
+}
+
+We'll implement that.
+
+Now we need to ensure that the function is defined before usage. Good.
+
+Now about quoting: Use double quotes around variables in tests.
+
+Now about `[[ ! -f "$bai" || "$bam" -nt "$bai" ]]` for indexing; but if bam missing, this will still run index? But bam should exist because we just sorted or earlier. If bam missing, script would have failed earlier due to alignment step not executed. So fine.
+
+Now about the collapse step: We used `needs_collapse=true`. Then if collapsed exists, set needs_collapse=false; then loop over samples and check if any vcf_gz newer than collapsed; if so set true. Good.
+
+Now we need to ensure that bcftools query output uses \t correctly. In single quotes, backslashes are literal. So `%CHROM\t%POS...` will be passed as string with backslash-t sequences. bcftools will interpret them as tabs. Good.
+
+Now about the `awk -v s="$sample" '{print s"\t"$0}'`. That prints sample name and tab then line. Good.
+
+Now we need to ensure that bcftools query output lines may contain commas in ALT if multiallelic; but that's fine.
+
+Now about the final exit: script ends with exit 0 implicitly, but we can add `exit 0`.
+
+Now about not writing to stderr/stdout beyond tool outputs: We don't use echo. We used printf for header; that writes to stdout. But it's part of script output? The instruction says "Do not write to stderr/stdout beyond what tools naturally emit". That means we should not produce any extraneous messages. Using printf to create collapsed.tsv is writing to file, not to stdout. So that's fine.
+
+But the `printf` command will output nothing to stdout; it writes to file via redirection > "$collapsed". So no output to console. Good.
+
+Now about using `awk` and bcftools query: They produce output to stdout which we redirect into file. That's fine.
+
+Now about potential missing dependencies: We used `bgzip`. If not available, script fails. But that's okay.
+
+Now let's write the final script accordingly.
+
+Let's double-check quoting for read group string:
+
+`-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`
+
+In bash, inside double quotes, `\\t` becomes `\t`. So the argument passed to bwa mem will be `@RG\tID:M117-bl\tSM:M117-bl\tLB:M117-bl\tPL:ILLUMINA`. That's correct.
+
+Now we need to ensure that the backslashes are not interpreted by the shell as escape for double quotes. In double quotes, a backslash before a double quote escapes it; but here it's before t, so fine.
+
+Now about `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" "$REF" "$fq1" "$fq2"`.
+
+Yes.
+
+Now we need to ensure that the script uses `samtools sort -@ $THREADS -o "$bam"`; but samtools sort expects input from stdin. We pipe bwa mem output into it. Good.
+
+Now about `samtools index -@ $THREADS "$bam"`; good.
+
+Now about variant calling: `lofreq call-parallel --pp-threads $THREADS -f "$REF" -o "$vcf_uncompressed" "$bam"`
+
+Yes.
+
+Now compress: `bgzip -c "$vcf_uncompressed" > "$vcf_gz"`
+
+Ok.
+
+Now index: `tabix -p vcf "$vcf_gz"`
+
+Ok.
+
+Now collapse step: we used bcftools query with format string. But we need to ensure that the format string uses `%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n`. In single quotes, backslashes are literal; but bcftools will interpret them as tab. Good.
+
+Now we pipe into awk: `awk -v s="$sample" '{print s"\t"$0}' >> "$collapsed"`
+
+Ok.
+
+Now header: `printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed"` writes to file; no output to console.
+
+Now final exit 0.
+
+Let's produce the script accordingly.

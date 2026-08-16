@@ -1,0 +1,395 @@
+We need to produce a bash script meeting constraints:
+
+- First line: #!/usr/bin/env bash
+- Second line: set -euo pipefail
+- Must be self-contained, no extra prose.
+- Assume cwd has data/raw and data/ref with chrM.fa already decompressed.
+- Write outputs under results/
+- Idempotent: if all artifacts exist and are up-to-date, exit 0 without redoing work. Use existence checks or compare timestamps? Simpler: check if final outputs exist; if they do, skip steps. But need to ensure each step is guarded.
+
+We can implement a script that first defines THREADS=4, sample list, ensures results dir exists (mkdir -p). Then for each sample, we can check if the final .vcf.gz.tbi exists and is newer than its inputs? Simpler: if all required outputs exist (bam, bai, vcf.gz, tbi) then skip alignment etc. But need to ensure idempotent across steps: if any intermediate missing, run that step.
+
+Simplify: At script start, define a function to check if final collapsed.tsv exists and is newer than all VCFs; but we can just check if results/collapsed.tsv exists; if it does, maybe exit 0? But need to still ensure all per-sample artifacts exist. The requirement: rerunning on a populated results/ must exit 0 without redoing work or erroring. So script should detect that everything is already done and exit cleanly.
+
+Simplest: At top, after setting up, check if results/collapsed.tsv exists; if yes, then maybe just exit 0? But need to also ensure all per-sample artifacts exist; but they would be needed for collapsed.tsv. If collapsed.tsv exists, likely all are there. However, could have partial state where some missing but collapsed.tsv still exists? Not likely. Safer: check existence of each final artifact: results/M117-bl.bam etc and results/collapsed.tsv. If all exist, exit 0.
+
+But need to also handle case where some are missing but others present; script should continue only for missing ones. Could implement per-sample loop that checks if .vcf.gz.tbi exists; if not, run steps.
+
+We'll write a script that loops over samples and for each sample ensures the chain of artifacts is built, using conditional execution based on existence of target file.
+
+Implementation plan:
+
+- THREADS=4
+- SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+- mkdir -p results
+
+- For each sample, define variables:
+  fastq1=data/raw/${sample}_1.fq.gz
+  fastq2=data/raw/${sample}_2.fq.gz
+  bam=results/${sample}.bam
+  bai=results/${sample}.bam.bai
+  vcf=results/${sample}.vcf
+  vcfz=results/${sample}.vcf.gz
+  tbi=results/${sample}.vcf.gz.tbi
+
+- Step 1: index reference (once). Check if index files exist: .fai, .amb etc. Could check if data/ref/chrM.fa.fai exists; if not, run samtools faidx and bwa index.
+
+- For each sample:
+  - If bai exists, skip alignment? Actually need to align only if bam missing or newer than bam? Simpler: if bam exists, skip. But we also need bai existence for next steps. We'll check if vcf.gz.tbi exists; if it does, skip all steps for that sample.
+
+But we must still ensure reference indexing is done before alignment; but that step can be done once globally.
+
+Implementation details:
+
+- Reference indexing: if [ ! -f data/ref/chrM.fa.fai ]; then samtools faidx data/ref/chrM.fa; fi
+  if [ ! -f data/ref/chrM.fa.amb ]; then bwa index data/ref/chrM.fa; fi
+
+But bwa index produces multiple files; we can check if any of them exist, e.g., data/ref/chrM.fa.bwt. Simpler: if [ ! -f data/ref/chrM.fa.bwt ]; then bwa index ...; fi
+
+Now per-sample:
+
+We need to generate the read group string exactly: "-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"" but we must not use echo -e etc. We can embed literal backslash t as two characters \ and t inside double quotes? In bash, inside double quotes, \t is treated as a backslash followed by t? Actually within double quotes, backslash escapes are processed; \t becomes a tab character. But the requirement says not to use mechanisms that turn them into real tabs; they want literal backslash and t characters. So we need to pass the string with actual backslash and t characters, i.e., we can write: -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" but inside double quotes, \t will be interpreted as a tab by bash unless we disable? Actually within double quotes, backslash is still an escape character; \t becomes a tab. That would produce real tab characters, which bwa rejects. They said do NOT use printf, echo -e, $'\t', or any mechanism that turns them into real tabs; bwa rejects real tabs with “the read group line contained literal<tab> characters”. So we must pass the string containing the two characters backslash and t literally, not interpreted as a tab. How to do that? We can use single quotes around the whole -R argument? In bash, single quotes prevent escape processing, so \t remains literal backslash t. But we need double quotes around the whole argument because bwa expects double quotes? Actually they said pass read group via -R as a single double-quoted argument containing literal backslash-t between fields and colons between key and value; exact form: -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA". They explicitly say the \t must remain the two characters backslash and t — bwa parses them itself. Do NOT use printf, echo -e, $'\t', or any mechanism that turns them into real tabs; bwa rejects real tabs with “the read group line contained literal<tab> characters”.
+
+Thus we need to pass a double-quoted string where \t is not interpreted as a tab. In bash, inside double quotes, backslash is still an escape character; \t becomes a tab. To keep it literal, we can use single quotes for the whole argument? But they said double-quoted argument. However maybe we can embed the literal backslash t by using $'...'? That would interpret escapes. Not allowed. So perhaps we can use printf -v? Not allowed.
+
+But we can cheat: Use double quotes but escape the backslash with another backslash, so that \t becomes \\t in the string, which then when passed to bwa will be two characters: backslash and t? Actually if we write "\\t" inside double quotes, bash interprets \\ as a single backslash, then t remains t, resulting in a literal backslash followed by t. So the argument will contain "\t" literally (two characters). That's what we want. So we can construct: -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA". Inside double quotes, each \\ becomes a single backslash in the final argument. So the resulting string passed to bwa will have literal \t characters.
+
+Thus we need to embed double backslashes.
+
+Command: bwa mem -t 4 -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" $fastq1 $fastq2
+
+Now pipeline to samtools sort.
+
+We'll write:
+
+bwa mem -t "$THREADS" -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" "$fastq1" "$fastq2" |
+samtools sort -@ "$THREADS" -o "$bam"
+
+But need to ensure that if bam already exists, we skip. We can check if bam file exists; if so, continue.
+
+Similarly, after sorting, index: samtools index -@ "$THREADS" "$bam"
+
+Then variant calling with lofreq call-parallel:
+
+lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o "$vcf" "$bam"
+
+But lofreq call-parallel expects input BAM and reference; output is VCF (plain). Actually lofreq call-parallel writes to a file via -o? Let's check: lofreq call-parallel usage: lofreq call-parallel [options]<reference.fa><bam1> [<bam2> ...]. It writes a VCF to stdout? I think it writes to a file via -o option. According to documentation, you can use -o output.vcf. So we can do:
+
+lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o "$vcf" "$bam"
+
+But need to ensure that if vcf exists, skip.
+
+Then compress: bgzip -c "$vcf" > "$vcfz"
+tabix -p vcf "$vcfz"
+
+Remove intermediate vcf: rm -f "$vcf"
+
+Now collapsed.tsv:
+
+We can generate per-sample query using bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz
+
+But they want to prepend sample name as literal column? Actually format string includes {sample} literal which is replaced by the sample name? In bcftools query, you can use %ID? Not sure. They say "the `{sample}` literal is prepended via the format string so the sample name is attached per row". So we can use: bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' file.vcf.gz
+
+But {sample} is a placeholder that gets replaced by the actual sample name? I think bcftools query supports %ID, %CHROM etc. Not {sample}. However they want to prepend the sample name as a column; we can just output the sample name manually: we can use awk to prefix each line with the sample name. Simpler: use bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' and then add sample name via paste? But they explicitly want format string with {sample}. Maybe we can use bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' and it will replace {sample} with the actual sample name? I think bcftools query supports '`%ID`', not curly braces. Actually bcftools query uses printf-like format strings; you can use '%CHROM', etc. I don't recall support for arbitrary placeholders. But they said "the `{sample}` literal is prepended via the format string so the sample name is attached per row". Possibly they refer to using the placeholder %S? Not sure.
+
+But we can circumvent: Use bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' and then prepend sample column manually via paste<(printf "sample\tchrom\tpos\tref\talt\taf\n") - . However they want collapsed.tsv with header line sample\tchrom\tpos\tref\talt\taf. So we can generate header separately.
+
+Simplify: For each sample, run:
+
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | sed "s/^/\t${sample}/" ??? Actually need to prepend sample name as first column. Could use awk: awk -v s="${sample}" '{print s"\t"$0}' but the format expects columns: sample chrom pos ref alt af. So we can output: sample\tchrom\tpos\tref\talt\taf as header, then for each variant line: sample\tchrom\tpos\tref\talt\tAF.
+
+Thus we can generate per-sample output using:
+
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s="${sample}" '{print s"\t"$0}' 
+
+But that would produce sample column then the rest columns (chrom pos ref alt AF). However the header line also needs to be included. So we can output header first: echo -e "sample\tchrom\tpos\tref\talt\taf" > results/collapsed.tsv ; then append each sample's lines.
+
+But they said no echo for user-facing prose; but echo is okay for generating header? It would produce output to stdout, which may be captured. It's not user-facing prose? Might be considered output. But it's fine as part of script; they didn't forbid echo entirely, only "do not use `echo` for user-facing prose." Generating a header is not user-facing prose; it's part of file creation. So we can use printf or echo.
+
+But to avoid extra output, we can use printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv ; then for each sample append.
+
+Better: Use a temporary file and cat.
+
+Implementation:
+
+- Initialize collapsed.tsv with header.
+- For each sample, run bcftools query ... | sed "s/^/\t${sample}/"? Actually we need to prepend sample name before each line. Could use awk -v s="${sample}" '{print s"\t"$0}' . That will output sample then the rest columns separated by tabs.
+
+Thus per-sample command:
+
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s="${sample}" '{print s"\t"$0}' >> results/collapsed.tsv
+
+But we need to ensure header only added once. So before loop, create file with header: printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+
+Then for each sample, append.
+
+We also need to rebuild collapsed.tsv only if any input VCF is newer than the TSV. Simpler: if collapsed.tsv exists and all per-sample vcf.gz are older? Actually we can just always regenerate collapsed.tsv at the end; but idempotency requires that re-running on fully populated results must exit 0 without redoing work. If we always rewrite collapsed.tsv, that would be considered redoing work? But they said "re-running on a populated results/ directory must exit 0 without re-doing work or erroring." It doesn't forbid rewriting files as long as no external commands fail? But "without re-doing work" suggests we should skip steps that are already done. So we need to check if collapsed.tsv exists and is up-to-date (newer than all VCFs). We can check timestamps: if results/collapsed.tsv exists and its modification time is newer than any of the VCF.gz files, then skip building it. Simpler: if results/collapsed.tsv exists, we can skip the whole collapsed step. But what if some VCFs were updated after collapsed.tsv? That would be rare; but to keep idempotent, we can just check if all final artifacts exist (including collapsed.tsv). If they all exist, exit 0. So at script start, after ensuring results dir, we can check if all required files exist: for each sample, check if .bam .bai .vcf.gz .tbi exist; also check if results/collapsed.tsv exists. If all exist, then exit 0 (since nothing to do). That satisfies idempotency.
+
+Thus script flow:
+
+- THREADS=4
+- SAMPLES list
+- mkdir -p results
+
+- Check if all final artifacts exist: for each sample, test -f results/${sample}.bam results/${sample}.bam.bai results/${sample}.vcf.gz.tbi ; also test -f results/collapsed.tsv . If all exist, then exit 0.
+
+- Then proceed to reference indexing (if not already done).
+
+- Loop over samples and perform steps conditionally based on missing artifacts. But we can just run full pipeline for each sample; but that would redo work if outputs already exist. To avoid redoing, we can use conditional execution: only run alignment if bam does not exist; only run indexing if bai does not exist; etc.
+
+Simplify: For each sample:
+
+  if [ ! -f "$bai" ]; then
+    # need to align and index
+    # but also need bam? Actually we can align only if bam missing.
+  fi
+
+But we also need to ensure that if vcf.gz.tbi exists, we skip everything for that sample.
+
+Thus we can check if final tbi exists; if yes, continue to next sample.
+
+Implementation:
+
+for sample in "${SAMPLES[@]}"; do
+  bam=results/${sample}.bam
+  bai=results/${sample}.bam.bai
+  vcf=results/${sample}.vcf
+  vcz=results/${sample}.vcf.gz
+  tbi=results/${sample}.vcf.gz.tbi
+
+  if [ -f "$tbi" ]; then
+    continue
+  fi
+
+  # alignment step if bam missing
+  if [ ! -f "$bam" ]; then
+    # run bwa mem and samtools sort
+    bwa mem -t "$THREADS" -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+      "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" |
+      samtools sort -@ "$THREADS" -o "$bam"
+  fi
+
+  # index if bai missing
+  if [ ! -f "$bai" ]; then
+    samtools index -@ "$THREADS" "$bam"
+  fi
+
+  # variant calling if vcf missing
+  if [ ! -f "$vcf" ]; then
+    lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o "$vcf" "$bam"
+  fi
+
+  # compress and index if vcz/tbi missing
+  if [ ! -f "$vcz" ]; then
+    bgzip -c "$vcf" > "$vcz"
+    tabix -p vcf "$vcz"
+    rm -f "$vcf"
+  fi
+done
+
+After loop, build collapsed.tsv only if not exists or older than any vcz? Simpler: if results/collapsed.tsv does not exist, create it; else skip.
+
+We can do:
+
+if [ ! -f results/collapsed.tsv ]; then
+  printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+  for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" |
+      awk -v s="${sample}" '{print s"\t"$0}' >> results/collapsed.tsv
+  done
+fi
+
+But need to ensure that bcftools query works with .vcf.gz; it can read compressed VCF.
+
+Now final exit 0.
+
+We must not produce any extra output besides tool natural output. Our script will produce some echo for header? That's okay as it's part of file creation; but it writes to stdout, which may be captured? It will appear as output to terminal; but they said "Do not write to stderr/stdout beyond what tools naturally emit". Using echo to write header would produce output to stdout, which is extra. So we must avoid any extraneous output. We can create the header by using printf without newline? Actually printf writes to stdout; that's also extra output. But maybe it's acceptable because it's part of script's normal operation? The instruction says "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." Using echo to create a header is writing to stdout, which is beyond natural tool emissions. However we can avoid any explicit output by using cat <<EOF? That also writes to stdout. But maybe it's okay because it's part of script's necessary file creation; but they explicitly forbid writing to stdout beyond what tools naturally emit. So we must not produce any extra output at all. How to create a file with header without emitting anything? We can use a here-document redirected to file: cat > results/collapsed.tsv <<'EOF'\tsample\tchrom\tpos\tref\talt\taf\nEOF . This writes to file via stdin redirection; no output to stdout. Actually the heredoc content includes a leading tab? The first line would be "sample\tchrom..." but we need a newline after header. We can write:
+
+cat > results/collapsed.tsv <<'END_HEADER'
+sample	chrom	pos	ref	alt	af
+END_HEADER
+
+But that writes a file with header lines; no extra stdout output. However the heredoc delimiter line is printed? No, it's just input to cat; cat reads from stdin and writes to file; no output to stdout unless we use echo. So we can create header using cat <<'END' > results/collapsed.tsv
+
+sample	chrom	pos	ref	alt	af
+END
+
+But need to ensure tab-separated columns; we can just write with literal tabs? In bash, we can embed literal tab via $'\t' but that's not allowed? Actually we can use a literal tab character in the script; it's fine. So we can do:
+
+cat > results/collapsed.tsv <<'END_HEADER'
+sample	chrom	pos	ref	alt	af
+END_HEADER
+
+But this will produce a file with header line containing tabs (actual tab characters). That's okay.
+
+Thus we can avoid any echo/printf that writes to stdout. Use cat <<'END' > file.
+
+Now the script must not produce any extraneous output; but we may have commands that naturally emit output (like bwa, samtools) which will go to stderr/stDOUT; that's allowed.
+
+We must ensure we don't use set -x or debug prints.
+
+Now final script structure:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+# Create results dir
+mkdir -p results
+
+# Check if everything is already done
+all_done=true
+for s in "${SAMPLES[@]}"; do
+  for f in results/${s}.bam results/${s}.bam.bai results/${s}.vcf.gz.tbi; do
+    if [ ! -f "$f" ]; then
+      all_done=false
+      break 2
+    fi
+  done
+done
+if [ "$all_done" = true ] && [ -f results/collapsed.tsv ]; then
+  exit 0
+fi
+
+# Reference indexing (once)
+if [ ! -f data/ref/chrM.fa.fai ]; then
+  samtools faidx data/ref/chrM.fa
+fi
+if [ ! -f data/ref/chrM.fa.bwt ]; then
+  bwa index data/ref/chrM.fa
+fi
+
+# Process each sample
+for sample in "${SAMPLES[@]}"; do
+  bam=results/${sample}.bam
+  bai=results/${sample}.bam.bai
+  vcf=results/${sample}.vcf
+  vcz=results/${sample}.vcf.gz
+  tbi=results/${sample}.vcf.gz.tbi
+
+  # Skip if final TBI exists
+  if [ -f "$tbi" ]; then
+    continue
+  fi
+
+  # Align if BAM missing
+  if [ ! -f "$bam" ]; then
+    bwa mem -t "$THREADS" -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+      "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" |
+      samtools sort -@ "$THREADS" -o "$bam"
+  fi
+
+  # Index if BAIT missing
+  if [ ! -f "$bai" ]; then
+    samtools index -@ "$THREADS" "$bam"
+  fi
+
+  # Variant calling if VCF missing
+  if [ ! -f "$vcf" ]; then
+    lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o "$vcf" "$bam"
+  fi
+
+  # Compress and index if needed
+  if [ ! -f "$vcz" ]; then
+    bgzip -c "$vcf" > "$vcz"
+    tabix -p vcf "$vcz"
+    rm -f "$vcf"
+  fi
+done
+
+# Build collapsed.tsv if not present
+if [ ! -f results/collapsed.tsv ]; then
+  cat > results/collapsed.tsv <<'END_HEADER'
+sample	chrom	pos	ref	alt	af
+END_HEADER
+  for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" |
+      awk -v s="${sample}" '{print s"\t"$0}' >> results/collapsed.tsv
+  done
+fi
+
+exit 0
+
+We must ensure that we use only tools from inventory: bwa, samtools, lofreq, bgzip, tabix, bcftools, awk. All are available.
+
+Check for any stray echo or printf that writes to stdout. We used cat > ... <<'END_HEADER' which writes to file without output. That's fine.
+
+We used awk -v s="${sample}" '{print s"\t"$0}' >> results/collapsed.tsv . This prints to stdout, but we redirect to file, so no extra output.
+
+We used printf? Not used.
+
+We used cat > ... <<'END_HEADER' which writes header lines with tabs; the heredoc delimiter line is just a marker; no output.
+
+Now ensure that we didn't use any stray echo. We used none.
+
+Check for any stray set -e etc; fine.
+
+Now ensure that we didn't use any absolute paths outside cwd. All paths are relative.
+
+We used data/ref/chrM.fa etc; okay.
+
+We used results/...; okay.
+
+We used $THREADS variable; okay.
+
+We used sample list; okay.
+
+Now check for potential errors: In the reference indexing step, we used samtools faidx and bwa index. They produce .fai and .bwt etc. We check existence of .fai and .bwt to decide whether to run. That's fine.
+
+Potential issue: The condition for all_done may break incorrectly if any missing file; but we set all_done=true initially, then if any missing, set all_done=false and break 2 (outer loop). Then after loop, if all_done true and collapsed.tsv exists, exit 0. However we also need to check that collapsed.tsv exists; we do that in condition: [ "$all_done" = true ] && [ -f results/collapsed.tsv ]; then exit 0. That's fine.
+
+But we also need to ensure that if all_done is false but some artifacts exist, script continues; that's okay.
+
+Now check for quoting issues: In bwa command, we used -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA". Inside double quotes, the backslashes are preserved as literal backslashes. The whole -R argument is inside double quotes? Actually we wrote -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA". The outer double quotes around the whole command? We didn't wrap in double quotes; we just wrote the string. That's fine.
+
+But we need to ensure that the backslashes are not interpreted by bash as escape sequences. Since we are inside double quotes for the whole argument? Actually we are not quoting the entire -R argument; we are passing it as part of command line without extra quoting. The string contains backslashes and t; bash will treat them literally because they are not within $'' or echo -e. So it's fine.
+
+Now ensure that we used "$THREADS" for -t option; that expands to 4.
+
+Now check that we used samtools sort -@ "$THREADS" -o "$bam". That's okay.
+
+Now ensure that we used lofreq call-parallel -o "$vcf" "$bam". The command expects reference first then bams; but they said use -f data/ref/chrM.fa -o "$vcf" "$bam". Actually lofreq call-parallel usage: lofreq call-parallel [options]<reference.fa><bam1> [<bam2> ...]. So the reference must be first argument, then bams. We used -f data/ref/chrM.fa -o "$vcf" "$bam". That's correct: -f is option for reference file; but lofreq call-parallel expects reference as positional argument, not an option. Actually according to documentation, you specify the reference file as the first non-option argument. Options like --pp-threads are options; -f is not a valid option for lofreq call-parallel; maybe it's -r? Let’s check: lofreq call-parallel usage: lofreq call-parallel [options]<reference.fa><bam1> [<bam2> ...]. Options include --pp-threads, --min-ALT-fraction, etc. There is no -f option; you just give the reference file as first argument. So we should call:
+
+lofreq call-parallel --pp-threads 4 data/ref/chrM.fa "$bam" -o "$vcf"
+
+But they said "Write uncompressed VCF to a temporary path (e.g. results/{sample}.vcf); lofreq emits plain VCF." So we can use -o "$vcf". The option -o is for output file? I think lofreq call-parallel uses -o for output file. Yes, I recall lofreq call-parallel has -o<out.vcf>. So the command is:
+
+lofreq call-parallel --pp-threads 4 data/ref/chrM.fa "$bam" -o "$vcf"
+
+Thus we need to adjust command accordingly.
+
+Thus modify that line:
+
+lofreq call-parallel --pp-threads 4 data/ref/chrM.fa "$bam" -o "$vcf"
+
+Now ensure quoting: $bam may contain spaces? Not needed.
+
+Now check that lofreq is in PATH; yes.
+
+Now after variant calling, we compress with bgzip -c "$vcf" > "$vcz". That's fine.
+
+Now index with tabix -p vcf "$vcz". Good.
+
+Now remove intermediate uncompressed .vcf: rm -f "$vcf". Good.
+
+Now collapsed.tsv building: bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" | awk -v s="${sample}" '{print s"\t"$0}' >> results/collapsed.tsv
+
+But note that %INFO/AF may be missing for some variants; but okay.
+
+Now ensure that we use tab-separated columns; the output of bcftools query uses tabs? Actually default delimiter is tab. So it's fine.
+
+Now final script must exit 0.
+
+Potential issue: The initial all_done check may exit early if collapsed.tsv exists but some per-sample artifacts missing; but we also require all Done files exist for each sample (bam, bai, vcf.gz.tbi). If any missing, all_done becomes false and script continues. That's fine.
+
+Now ensure that we didn't use any stray echo or printf that writes to stdout. The cat > results/collapsed.tsv <<'END_HEADER' writes header lines with tabs; no output to stdout. Good.
+
+But the awk command prints to stdout, but we redirect to file, so no extra output.
+
+Thus script should meet constraints.
+
+Now final step: produce only the script, no markdown fences, no commentary.
+
+Let's craft final script exactly as above.

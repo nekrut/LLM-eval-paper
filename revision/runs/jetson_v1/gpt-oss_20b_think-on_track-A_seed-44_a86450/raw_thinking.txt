@@ -1,0 +1,213 @@
+We need to produce a bash script that follows plan. Must be idempotent: check existence of outputs before generating. Use set -euo pipefail. Use only tools listed. We must not use echo for user-facing prose; but we can use echo for debugging? They said "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." So we should avoid echo unless necessary. But script may produce output from tools, that's fine.
+
+We need to ensure that the read group string uses literal backslash-t characters. In bash, we can construct it as a single-quoted string with \t inside? Wait: The requirement: "exact form: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"` The `\t` must remain the two characters backslash and t — bwa parses them itself. Do NOT use printf, echo -e, $'\t', or any mechanism that turns them into real tabs; bwa rejects real tabs with “the read group line contained literal <tab> characters”."
+
+So we need to pass a string containing \t literally. In bash, if we write "-R '@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA'"? Wait: The shell will interpret backslashes inside single quotes as literal; but we need the two characters backslash and t. So we can use single quotes to avoid interpretation, but then variable expansion doesn't happen. We could use double quotes but escape backslashes: "-R \"@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA\"" This will produce string with \t sequences. In bash, inside double quotes, \\ becomes \; so we need to write "\\t" to get literal \t? Actually in double quotes, backslash escapes next char if it's special. To preserve a backslash before t, we need to escape the backslash: "\\t". That results in \t string. So "-R \"@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA\"" should produce @RG\tID:... etc.
+
+We must ensure no real tabs inserted.
+
+Ok.
+
+Also need to use bgzip; but not listed? Wait TOOL_INVENTORY includes bcftools, tabix, lofreq. bgzip is part of htslib and usually available as bgzip command. But not explicitly in list. However bcftools view -O z uses bgzip internally. They said "Compress with bgzip (not bcftools view -O z)". So we need to use bgzip. Is it present? Not listed but likely part of htslib and available as bgzip. Since they didn't forbid, we can assume it's on PATH. But not in list; maybe they purposely omitted but still available. However safer: Use bcftools view -O z? They explicitly say not to use that. So we must use bgzip. Let's assume bgzip is present.
+
+Also need to index VCF with tabix -p vcf.
+
+Collapse step uses bcftools query.
+
+We need to ensure idempotency: For each sample, check if results/{sample}.bam.bai exists and is newer than inputs? They said "skip if results/{sample}.vcf.gz.tbi already exists". But we also need to skip earlier steps accordingly. We can implement a function that checks for existence of final outputs; but easier: For each step, guard with if [ ! -s file ]; then run command; fi.
+
+But we must ensure that if intermediate files exist but not final ones, script will still produce them. Eg if .bam exists but .bai missing, we need to index. So we can check existence of each output individually.
+
+Also reference indexing: skip if all index files exist. We can check for chrM.fa.fai and one of the bwa index files like chrM.fa.bwt; if both present, skip.
+
+We also need to create results/ directory.
+
+Also we must not write to stderr/stdout beyond tools natural emit. So no echo. But we may use printf? That writes to stdout. Not allowed. So avoid any prints. We can rely on commands output.
+
+But we might need to check existence; that's internal, no output.
+
+Ok.
+
+We also need to ensure script is idempotent: if results/ already populated with all outputs, re-running should exit 0 without doing anything. Our checks will skip each step.
+
+Also we must not use any absolute paths outside cwd. Use relative paths.
+
+Let's craft script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+samples=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+# create results dir
+mkdir -p results
+
+# reference indexing
+ref_fa=data/ref/chrM.fa
+if [ ! -f "${ref_fa}.fai" ] || [ ! -f "${ref_fa}.bwt" ]; then
+    samtools faidx "$ref_fa"
+    bwa index "$ref_fa"
+fi
+
+for sample in "${samples[@]}"; do
+    raw1=data/raw/${sample}_1.fq.gz
+    raw2=data/raw/${sample}_2.fq.gz
+    bam=results/${sample}.bam
+    bai=results/${sample}.bam.bai
+    vcf_uncompressed=results/${sample}.vcf
+    vcf_gz=results/${sample}.vcf.gz
+    tbi=results/${sample}.vcf.gz.tbi
+
+    # alignment and sorting
+    if [ ! -s "$bai" ] || [ ! -s "$bam" ]; then
+        bwa mem -t "$THREADS" \
+            -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+            "$ref_fa" "$raw1" "$raw2" | samtools sort -@ "$THREADS" -o "$bam"
+        # index
+        if [ ! -s "$bai" ]; then
+            samtools index -@ "$THREADS" "$bam"
+        fi
+    fi
+
+    # variant calling
+    if [ ! -s "$tbi" ] || [ ! -s "$vcf_gz" ]; then
+        lofreq call-parallel --pp-threads "$THREADS" \
+            -f "$ref_fa" -b "$bam" -o "$vcf_uncompressed"
+        bgzip -c "$vcf_uncompressed" > "$vcf_gz"
+        tabix -p vcf "$vcf_gz"
+        rm -f "$vcf_uncompressed"
+    fi
+done
+
+# collapse step
+collapsed=results/collapsed.tsv
+needs_collapse=false
+for sample in "${samples[@]}"; do
+    vcf_gz=results/${sample}.vcf.gz
+    if [ ! -s "$collapsed" ] || [ "$(stat -c %Y "$vcf_gz")" -gt "$(stat -c %Y "$collapsed")" ]; then
+        needs_collapse=true
+        break
+    fi
+done
+
+if $needs_collapse; then
+    # remove old collapsed if exists
+    rm -f "$collapsed"
+    first_header=true
+    for sample in "${samples[@]}"; do
+        vcf_gz=results/${sample}.vcf.gz
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$vcf_gz"
+    done | awk 'BEGIN{print "sample\tchrom\tpos\tref\talt\taf"}1' > "$collapsed"
+fi
+
+exit 0
+
+But we used awk to prepend header. That writes to stdout; but it's part of command output, allowed? They said no user-facing prose, but this is just data. It's fine.
+
+However we used 'awk' which may not be in TOOL_INVENTORY list. Not listed. We cannot use awk. Must rely only on tools listed: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java.
+
+awk is not allowed. So we need to avoid awk. Instead we can use printf? But printing header may produce output; but that's fine as data. We can use echo -e? They said no echo for user-facing prose. But using echo to print header is okay because it's part of collapsed.tsv content, not user message. But they specifically said "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." So we can use echo to produce the header line as part of file content. That's acceptable.
+
+But we need to avoid awk. We can just redirect bcftools query outputs and then prepend header using cat <<EOF > collapsed.tsv? But we need to combine all sample outputs into one file with header. Approach: Use a temporary file, or use tee? Simpler: create collapsed.tsv by first writing header line via echo, then appending each sample's output.
+
+Implementation:
+
+if $needs_collapse; then
+    rm -f "$collapsed"
+    # write header
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > "$collapsed"
+    for sample in "${samples[@]}"; do
+        vcf_gz=results/${sample}.vcf.gz
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$vcf_gz" >> "$collapsed"
+    done
+fi
+
+That uses printf, which writes to stdout. But it's part of file content; acceptable.
+
+Also we used 'stat' command; not in list. We can avoid stat by using test -nt (newer than). Use [ ! -s "$collapsed" ] || [ "$vcf_gz" -nt "$collapsed" ]; but need to compare each sample's vcf with collapsed. So:
+
+needs_collapse=false
+for sample in "${samples[@]}"; do
+    vcf_gz=results/${sample}.vcf.gz
+    if [ ! -s "$collapsed" ] || [ "$vcf_gz" -nt "$collapsed" ]; then
+        needs_collapse=true
+        break
+    fi
+done
+
+But '-nt' compares file modification times. Good.
+
+Also we used 'bgzip'; not in list but likely present. But to be safe, maybe use bcftools view -O z? They said not to use that. So bgzip is fine.
+
+We also used 'rm -f', allowed.
+
+We used 'printf', which writes to stdout; acceptable as part of file content.
+
+Now we need to ensure no other disallowed tools: awk removed. We used 'stat' earlier but replaced with '-nt'.
+
+Also we used 'echo' only for header? Actually we used printf, not echo.
+
+Ok.
+
+Check idempotency: For each sample, if bam and bai exist, skip alignment; but we also check both existence. But we might need to ensure that if bam exists but bai missing, we still index. Our code does:
+
+if [ ! -s "$bai" ] || [ ! -s "$bam" ]; then
+    bwa mem ... | samtools sort ...
+    # index
+    if [ ! -s "$bai" ]; then
+        samtools index ...
+    fi
+fi
+
+But if bam exists but bai missing, the outer condition will be true because ! -s "$bai". Then we run bwa mem again and overwrite bam. That's not idempotent; we should separate steps: first check if bam exists; if not, create it. Then separately check if bai exists; if not, index.
+
+Better:
+
+if [ ! -s "$bam" ]; then
+    bwa mem ... | samtools sort ...
+fi
+
+if [ ! -s "$bai" ]; then
+    samtools index ...
+fi
+
+Similarly for VCF: we need to create vcf_gz only if missing. But we also need to ensure that if vcf_gz exists but uncompressed vcf remains? We remove uncompressed after compression.
+
+So:
+
+if [ ! -s "$vcf_gz" ]; then
+    lofreq call-parallel ... -o "$vcf_uncompressed"
+    bgzip -c "$vcf_uncompressed" > "$vcf_gz"
+    tabix -p vcf "$vcf_gz"
+    rm -f "$vcf_uncompressed"
+fi
+
+But if vcf_gz exists but uncompressed remains? That shouldn't happen because we delete after. But to be safe, we can check existence of vcf_gz only.
+
+Ok.
+
+Also need to ensure that reference indexing step: skip if both .fai and .bwt exist. Use:
+
+if [ ! -f "${ref_fa}.fai" ] || [ ! -f "${ref_fa}.bwt" ]; then
+    samtools faidx "$ref_fa"
+    bwa index "$ref_fa"
+fi
+
+Ok.
+
+Now we need to ensure that the script uses only allowed tools. We used 'printf', which is built-in, fine. 'mkdir', 'test', etc are shell builtins or coreutils; not in list but likely available. They didn't forbid them.
+
+We used '-nt' test operator; that's part of test builtin.
+
+Ok.
+
+Now we need to ensure that the read group string uses literal backslash-t. We used "-R \"@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA\"" inside double quotes with escaped backslashes. That results in @RG\tID:... etc. Good.
+
+But we need to ensure that the shell passes the string correctly; the outermost quotes are double, so variable expansion occurs. The backslash before t is escaped as \\t -> \t. So final argument contains literal backslash and t. Good.
+
+Now we must ensure that we didn't use any disallowed commands like 'seqkit', 'fastqc', etc. Not used.
+
+Ok.
+
+Let's produce final script accordingly.

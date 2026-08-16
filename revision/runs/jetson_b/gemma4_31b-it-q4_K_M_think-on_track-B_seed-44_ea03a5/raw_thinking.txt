@@ -1,0 +1,153 @@
+*   Goal: Per-sample variant calling on 4 paired-end MiSeq amplicon samples mapped to human mitochondrial reference (chrM).
+    *   Inputs: `data/raw/*.fq.gz` and `data/ref/chrM.fa`.
+    *   Outputs: `{sample}.bam`, `{sample}.bam.bai`, `{sample}.vcf.gz`, `{sample}.vcf.gz.tbi`, and a collapsed `collapsed.tsv`.
+    *   Collapsed TSV columns: `sample chrom pos ref alt af`.
+    *   Constraints: Idempotent, no absolute paths, only tools in TOOL_INVENTORY, wall-clock < 600s at THREADS=4, output to `results/`.
+
+    *   Samples: M117-bl, M117-ch, M117C1-bl, M117C1-ch.
+    *   Reference: `data/ref/chrM.fa`.
+    *   Threads: 4.
+
+    *   Index reference: `bwa index` and `samtools faidx`.
+    *   For each sample:
+        1.  Map reads: `bwa mem` -> `samtools view -bS` -> `samtools sort`.
+        2.  Index BAM: `samtools index`.
+        3.  Variant calling: Use `lofreq` (since it's common for mitochondrial/amplicon data and in the inventory). Alternatively, `bcftools mpileup | bcftools call`. Let's check if `lofreq` is better or `bcftools`. The prompt asks for "variant calling". LoFreq is great for low-frequency variants. However, standard VCF output is required.
+        4.  Compress and index VCF: `bgzip` (usually part of htslib/tabix) and `tabix`. Wait, the inventory lists `bcftools`, `samtools`, `tabix`. I can use `bcftools view -Oz` for compression.
+
+    *   Collapsed TSV:
+        Extract fields from VCFs. Columns: sample, chrom, pos, ref, alt, af.
+        AF (Allele Frequency) is usually in the INFO field of a VCF. If using `lofreq`, it provides AF. If using `bcftools`, I might need to calculate it or use specific options.
+
+    *   `bwa mem -t 4 data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ 4 -o results/${sample}.bam`
+    *   `samtools index results/${sample}.bam`
+    *   Variant calling: `lofreq` is in the inventory. LoFreq usage: `lofreq call -f data/ref/chrM.fa -b results/${sample}.bam > results/${sample}.vcf`.
+    *   Wait, LoFreq output might not be a standard compressed VCF by default. I should use `bcftools` to compress it if needed or check the format. Actually, `lofreq call` produces a VCF-like file. Let's ensure it's gzipped and indexed.
+    *   Alternatively: `bcftools mpileup -f data/ref/chrM.fa results/${sample}.bam | bcftools call -mv -Oz -o results/${sample}.vcf.gz`. Then `tabix -p vcf results/${sample}.vcf.gz`.
+    *   Comparing LoFreq vs BCFTools: The prompt asks for "af" (allele frequency). `bcftools` doesn't put AF in the INFO field by default unless using specific plugins or options. `lofreq` does provide it. Let's use `lofreq`.
+
+    *   LoFreq output format: It produces a VCF.
+    *   To get `collapsed.tsv`:
+        Loop through samples, extract columns from VCF.
+        VCF cols: CHROM POS ID REF ALT QUAL FILTER INFO...
+        INFO field in LoFreq contains `AF=...`.
+        I can use `bcftools query` to extract these fields efficiently.
+
+    *   Reference indexing: Only if index files don't exist.
+    *   Sample processing: Check if `.vcf.gz` exists before running the pipeline for that sample.
+    *   Collapsed table: Re-generate it if any VCFs are updated or just always regenerate from existing VCFs.
+
+    *   Reference indexing is slow? No, chrM is tiny (16kb).
+    *   BWA mem on 4 samples of amplicon data (small) is fast.
+    *   LoFreq/BCFTools on 16kb is very fast.
+    *   Total time should be well under 600s.
+
+    *   `bwa index data/ref/chrM.fa`
+    *   `samtools faidx data/ref/chrM.fa`
+    *   For sample in samples:
+        - `bwa mem -t $THREADS data/ref/chrM.fa ${R1} ${R2} | samtools sort -@ $THREADS -o results/${sample}.bam`
+        - `samtools index results/${sample}.bam`
+        - `lofreq call -f data/ref/chrM.fa -b results/${sample}.bam > results/${sample}.vcf`
+        - `bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz` (Wait, is bgzip available? Tabix is there, usually bgzip comes with it. If not, `bcftools view -Oz`). Let's use `bcftools view -Oz`.
+        - `tabix -p vcf results/${sample}.vcf.gz`
+
+    *   Extracting AF:
+        `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz`
+        Wait, LoFreq puts AF in the INFO field as `AF=0.123`. BCFTools query should handle this if it's a standard VCF tag.
+
+    *   Header for collapsed.tsv: `sample chrom pos ref alt af`
+
+    *   The prompt says "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose."
+    *   I will avoid `echo "Processing sample..."`.
+
+    *   Reference indexing files are usually in the same directory as the fasta. The constraint is "Write all outputs under results/". Reference index files (`.amb`, `.ann`, `.bwt`, `.pac`, `.sa`) created by BWA go into the reference directory. Is that allowed?
+    *   "Do not hardcode any path outside the current working directory." - `data/ref/` is inside CWD.
+    *   "Write all outputs under results/" - This usually refers to the final deliverables. Reference indices are intermediate/auxiliary. However, to be safe and idempotent, I'll check if they exist.
+
+    Wait, LoFreq might not produce a standard VCF that `bcftools query` likes without some tweaks, or it might just work. Let's double-check the tool list. `bcftools` is there.
+    Actually, for mitochondrial amplicon data, `bcftools mpileup | bcftools call` is more standard if LoFreq isn't strictly required. But LoFreq is specifically listed in the inventory. I'll use it.
+
+    Wait, does `lofreq` output a VCF that contains AF? Yes.
+    Does `bcftools query` work on LoFreq VCFs? Yes, as long as they are valid VCFs.
+
+    Let's refine the collapsed table generation:
+    ```bash
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+    for s in $SAMPLES; do
+        bcftools query -f "${s}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${s}.vcf.gz" >> results/collapsed.tsv
+    done
+    ```
+
+    *   `bwa index data/ref/chrM.fa` (creates files in `data/ref/`)
+    *   `samtools faidx data/ref/chrM.fa` (creates file in `data/ref/`)
+    *   These are necessary for BWA and LoFreq.
+
+    Wait, the prompt says "Write all outputs under results/". If I can't write to `data/ref/`, I should copy the fasta to `results/` first? No, that's redundant. Usually, reference indices are acceptable in the ref folder or a temporary location. But since it's an expert bioinformatician task, and "all outputs" usually means results of the analysis, not tool-specific index files. However, if I want to be strictly compliant with "Write all outputs under results/", I could copy `chrM.fa` to `results/`, index it there, and use that. Let's do that to be safe.
+
+    Wait, copying a 16kb file is trivial.
+    ```bash
+    cp data/ref/chrM.fa results/chrM.fa
+    bwa index results/chrM.fa
+    samtools faidx results/chrM.fa
+    ```
+
+    *   `results/{sample}.bam` - OK
+    *   `results/{sample}.bam.bai` - OK
+    *   `results/{sample}.vcf.gz` - OK
+    *   `results/{sample}.vcf.gz.tbi` - OK
+    *   `results/collapsed.tsv` - OK
+
+    Wait, `lofreq call` produces a VCF. I need to compress it with `bcftools view -Oz`.
+
+    Let's check the sample list again: M117-bl, M117-ch, M117C1-bl, M117C1-ch.
+    FASTQ files are in `data/raw/`.
+
+    ```bash
+    SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+    THREADS=4
+    mkdir -p results
+    # Reference indexing (idempotent)
+    if [ ! -f results/chrM.fa.bwt ]; then
+        cp data/ref/chrM.fa results/chrM.fa
+        bwa index results/chrM.fa
+        samtools faidx results/chrM.fa
+    fi
+
+    for s in "${SAMPLES[@]}"; do
+        if [ ! -f "results/${s}.vcf.gz" ]; then
+            # Mapping
+            bwa mem -t $THREADS results/chrM.fa data/raw/${s}_1.fq.gz data/raw/${s}_2.fq.gz | \
+            samtools sort -@ $THREADS -o results/${s}.bam
+            samtools index results/${s}.bam
+
+            # Variant calling
+            lofreq call -f results/chrM.fa -b results/${s}.bam > results/${s}.vcf
+            bcftools view -Oz -o results/${s}.vcf.gz results/${s}.vcf
+            tabix -p vcf results/${s}.vcf.gz
+            rm results/${s}.vcf
+        fi
+    done
+
+    # Collapsed table (always regenerate or check if all VCFs exist)
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > results/collapsed.tsv
+    for s in "${SAMPLES[@]}"; do
+        bcftools query -f "${s}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${s}.vcf.gz" >> results/collapsed.tsv
+    done
+    ```
+
+    Wait, `lofreq` output might not have the AF tag in a way that `bcftools query %INFO/AF` recognizes if it's not standard. Let me double check LoFreq VCF format. LoFreq uses `AF=...`. This is standard.
+
+    One detail: `bwa mem` and `samtools sort` are fast, but I should ensure the pipeline is robust.
+    The prompt says "Be idempotent". My current logic checks for `.vcf.gz`. If it exists, it skips mapping and calling. Then it regenerates the collapsed table. This is idempotent.
+
+    Wait, if the user runs the script once, `results/` is created. If they run it again, it sees `results/${s}.vcf.gz` and skips to the table generation. That's correct.
+
+    One final check on tools:
+    - `bwa`: OK
+    - `samtools`: OK
+    - `bcftools`: OK
+    - `tabix`: OK
+    - `lofreq`: OK
+    - `bgzip` is not explicitly listed, but `bcftools view -Oz` does the same thing.
+
+    Wait, I should make sure `results/` directory exists before copying the fasta. Added `mkdir -p results`.

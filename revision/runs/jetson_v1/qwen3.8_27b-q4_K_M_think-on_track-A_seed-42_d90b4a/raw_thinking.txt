@@ -1,0 +1,513 @@
+We need answer user's request: produce ONE self-contained bash script only, no prose/fences. Need think through constraints and craft robust idempotent script under 600s THREADS=4. Must use only tools listed; bgzip? Tool inventory includes tabix (htslib) but not explicitly bgzip. Plan says compress with bgzip (not bcftools view -O z). But TOOL_INVENTORY lists bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. No bgzip listed. However htslib often includes bgzip but not in inventory? It says only these are on PATH; pinned versions in conda env 'bench'. tabix (htslib) 1.21 likely installed with htslib tools maybe bgzip available? But hard constraint: Use only tools listed in TOOL_INVENTORY. Does that forbid bgzip if not listed? Plan explicitly says compress with bgzip. Contradiction. Need decide. Could use `bcftools view -O z` but plan says not. Could use `tabix`? tabix can index compressed VCF, but cannot compress. Could use `samtools`? no. `seqkit`? maybe seqkit can gzip? Not sure. But tool inventory includes only listed; if bgzip absent, script fails. Maybe in conda env htslib provides bgzip even not listed? The instruction says only these are on PATH; but plan authoritative says use bgzip. We need follow plan likely assume bgzip available despite not listed? It says TOOL_INVENTORY (only these are on PATH). Hmm. Could avoid external bgzip by using `bcftools view -O z`? But violates plan. Maybe use `tabix` with `-p vcf` can compress if input uncompressed? No, tabix requires compressed and indexed; it won't compress. Could use `gzip`? Not listed. Could use `python`? no.
+
+Need output script only. Need ensure idempotent: rerun on populated results exits 0 without redoing work or erroring. Need guard each artifact with existence check, maybe newer than inputs. But if using temp .vcf and remove, need handle partial states. Must not write to stderr/stdout beyond tools naturally emit; no echo user-facing prose. Can use commands that produce output? bwa/samtools/lofreq may print progress to stderr; okay "beyond what tools naturally emit" means don't add echo. We can redirect tool stdout? Need avoid extra. Use `command -v`? That's shell builtin, okay. But no user-facing prose.
+
+Need consider performance: 4 samples MiSeq amplicon mtDNA small. bwa mem + sort + lofreq call-parallel under 600s likely. THREADS=4. Need maybe use `--pp-threads 4` and perhaps `--min-bq 20 --min-mq 30`? Plan doesn't specify, default okay. But to ensure speed, could add `--no-caller`? No. lofreq call-parallel on small mtDNA fine.
+
+Need exact read group: `-R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA"` with literal backslash-t. In bash double quotes, `\t` remains backslash t? In double quotes, backslash before t is not special, so it remains two chars \ and t. Good. Need pass as single argument. Use array maybe.
+
+Need reference indexing idempotent. `samtools faidx data/ref/chrM.fa` creates .fai; skip if exists. bwa index creates multiple files. Check all? Could check one e.g. chrM.fa.pac and .sa, but bwa 0.7.18 for mtDNA maybe produces .amb .ann .bwt .pac .sa. Need skip if all exist. Use function file_exists_all. But no echo.
+
+Need per-sample pipeline idempotent. Artifacts: bam, bai, vcf.gz, tbi. Need guard each artifact with existence check and newer than inputs? The plan says e.g. skip if tbi exists and is newer than its inputs. For final rerun fully populated must exit 0 without redoing work. If we simply check existence of final tbi for sample and skip entire per-sample, then no work. But need ensure collapsed.tsv rebuilt only if any input VCF newer than TSV. Could do:
+- Ensure ref indexes (skip if exist)
+- For each sample:
+  - if results/$s.vcf.gz.tbi exists and is newer than data/raw files? Or just exists, skip all per-sample. But what if partial missing bam but tbi exists? Not likely; but idempotent on populated only. To be robust, check final artifact existence maybe enough. However requirement: guard each artifact with existence check (e.g. skip if ...). Could implement stepwise:
+    - If bam missing or older than fastqs -> align/sort to temp then move? Need avoid partial .bam. Use tmp file results/.${s}.bam.tmp, sort output there, mv to final. But writing under results okay. Need no absolute paths. Temp in cwd/results maybe. Could use `mktemp`? Not listed? mktemp is coreutils likely but not tool inventory? It says only tools listed on PATH; shell builtins and standard utilities? Hard constraint: Use only tools listed in TOOL_INVENTORY. Does that forbid mv, mkdir, rm, test, find? Usually bash script needs basic file ops. They probably mean bioinformatics tools. But to be safe use shell builtins where possible: `mkdir -p` is external but necessary; maybe allowed as standard? The constraint says only these are on PATH; but mkdir not listed. However impossible without mkdir/mv/rm/test. In such tasks, basic POSIX utilities assumed. We can minimize external non-listed by using bash builtins for tests and redirections, but need mkdir, mv, rm, maybe stat? Could use `mkdir -p results` (external). They likely don't count coreutils. But "Use only tools listed" strict? Hmm. Need not invoke conda/pip/apt/curl/wget/package manager. It doesn't say no standard file utilities. We'll use mkdir, mv, rm, maybe find/stat? Could avoid stat by using `[[ -nt ]]` bash builtin for newer than. Good. Use `command -v bgzip`? command is builtin. But if bgzip not available, fail.
+
+Need idempotency without redoing work: If final tbi exists and is newer than inputs (bam? vcf.gz?), skip sample. But collapsed.tsv needs rebuild only if any input VCF newer than TSV. We can check with `[[ -nt ]]`. Need compare multiple files. For per-sample, we can define need_sample=0; if not [[ -s results/$s.vcf.gz.tbi ]]; then 1; elif inputs newer? The inputs to final tbi are vcf.gz and maybe bam/fastqs/ref. To avoid redo when ref index updated? Not needed. But requirement says skip if tbi exists and is newer than its inputs. Inputs: data/raw fastqs, data/ref/chrM.fa, results/$s.bam? Actually tbi depends on vcf.gz which depends on bam. Could check if any of raw fastqs or ref fa or bam is newer than tbi. But if we skip entire sample when tbi exists and not older than inputs, okay. However if bam missing but tbi exists (weird), no work? Maybe fine.
+
+But stepwise idempotency: If results has bam/bai but no vcf.gz/tbi, need call lofreq. If bam exists but bai missing, index. If fastqs newer than bam, realign. Need use temp to avoid partial. Could implement robust:
+for s in samples:
+  f1=...; f2=...
+  # if final tbi exists and is not older than inputs (f1,f2,ref,bam?) skip all? But if collapsed needs vcf.gz, it's there.
+  if [[ -s results/$s.vcf.gz.tbi ]] && ! newer_than_any ...; then continue; fi
+  # ensure bam:
+  if [[ ! -s results/$s.bam || $f1 -nt results/$s.bam || $f2 -nt results/$s.bam || ref -nt results/$s.bam ]]; then align to tmp and mv.
+  else skip align.
+  # ensure bai:
+  if [[ ! -s results/$s.bam.bai || results/$s.bam -nt results/$s.bam.bai ]]; then samtools index.
+  # ensure vcf.gz/tbi:
+  if [[ ! -s results/$s.vcf.gz.tbi || results/$s.bam -nt results/$s.vcf.gz.tbi || ref -nt ...? ]]; then lofreq to tmp vcf, bgzip, tabix, rm tmp. But need if vcf.gz exists but tbi missing; can reuse vcf.gz? Plan says write uncompressed temp then compress. If vcf.gz exists and not older than bam, maybe just index. But simpler: if final tbi missing or bam newer than tbi, redo call/compress/index. Use tmp vcf.
+  # after sample, ensure collapsed later.
+
+Need be careful with `set -euo pipefail` and pipelines. bwa mem | samtools sort. If bwa fails, pipeline fail. Good. But if using process substitution? no.
+
+Potential issue: lofreq call-parallel output to temp VCF; then bgzip. Need ensure bgzip available. Could use `bgzip -c results/$s.vcf > results/$s.vcf.gz` or `bgzip -k`. If bgzip not in inventory, maybe use `bcftools view -O z -o ...`? But plan says not. Maybe we can implement compression with `tabix`? No. Could use `seqkit`? seqkit has `seqkit gzip`? I think seqkit v2.8.2 includes `seqkit gzip` maybe compresses files? It might be a wrapper to gzip. If bgzip absent, could use `seqkit gzip -o results/$s.vcf.gz results/$s.vcf`. But plan says bgzip. Tool inventory includes seqkit; using seqkit for compression would satisfy only listed tools but not plan's exact tool choice? Plan authoritative: "Compress with bgzip (not bcftools view -O z)". It doesn't say cannot use alternative if bgzip unavailable, but likely expects bgzip command. Since htslib tabix installed, bgzip probably on PATH even if omitted accidentally. Use bgzip.
+
+Need maybe set `export OMP_NUM_THREADS=4`? Not necessary. Could set `THREADS=4`.
+
+Need no hardcoded path outside cwd. Use relative paths. Good.
+
+Need final collapsed.tsv: header line tab-separated. Need produce without echo user-facing prose? The constraint says do not use echo for user-facing prose. But writing header to file via printf or redirection is not user-facing? It says do not write to stderr/stdout beyond tools naturally emit; do not use `echo` for user-facing prose. We can use `printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv`. That's writing file, okay. Or use bcftools query with header? Need prepend single header. Use printf builtin. Is printf allowed? shell builtin. Good.
+
+Need collapsed rebuild only if any input VCF newer than TSV. Also if missing. Could check:
+need_collapsed=0
+if [[ ! -s results/collapsed.tsv ]]; then need_collapsed=1; else for s in samples; do if [[ results/$s.vcf.gz -nt results/collapsed.tsv ]]; then need_collapsed=1; break; fi; done; fi
+If need, rebuild: printf header > tmp? Then append queries. Need ensure atomic? Could write to temp and mv. But if using `bcftools query` for each sample, order samples as list. Format string: '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'. In bcftools query format, literal tabs? Need output tab-separated. If we use single quotes with `\t`, does bcftools interpret backslash-t as tab? I think bcftools query format supports C-style escapes? Let's verify: bcftools query -f '{SAMPLE}\t%CHROM...' likely outputs actual tab because it parses \t? In many tools, yes. But to be safe, we can use real tabs in format string via bash $'\t'? The plan says for bwa read group do not use real tabs; for bcftools no restriction. Could use `printf` format with actual tabs: `-f "$(printf 'sample\tchrom...')"`? That uses printf but okay. But simpler: use single-quoted format containing literal backslash-t; bcftools likely converts to tab. Need ensure columns tab-separated. If not, output would have \t characters? Let's recall bcftools query format: It supports C-style escape sequences? From docs: -f FORMAT, e.g. '{ID}\t%CHROM\t%POS'. I think yes, it interprets \t as tab. Good.
+
+But the sample name in format: They want `{sample}` literal prepended via format string so sample name attached per row. In bcftools query, `%SAMPLE` would get sample from VCF; but plan says use `{sample}` literal? Wait format string `'{sample}\t%CHROM...'`: In bcftools query, curly braces are for fields? Actually bcftools query uses %FIELD and {FIELD}? Let's recall: bcftools query -f '%ID\t%REF\n' etc. It also supports `{...}`? I think in bcftools 1.x, format can include literal text; `%` is field, `#` maybe? There is no `{sample}` variable substitution by shell if single quotes. If we pass literal `{sample}`, it will output the characters {sample}, not sample name! The plan says "the `{sample}` literal is prepended via the format string so the sample name is attached per row". That wording ambiguous: They likely mean in script, replace {sample} with actual sample variable? But they wrote exact command: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz` (the `{sample}` literal is prepended via the format string so the sample name is attached per row). Hmm. If using bash double quotes, `"{sample}"` would be literal {sample} unless variable? They might intend to use actual sample name in place of placeholder, e.g. `-f "$s\t%CHROM..."`. But they say `{sample}` literal is prepended via format string so the sample name is attached per row. Could mean use double quotes and `$sample`? Let's parse: "For each sample, run `bcftools query -f '{sample}\t%CHROM...' results/{sample}.vcf.gz` (the `{sample}` literal is prepended via the format string so the sample name is attached per row)." In task descriptions, {sample} is placeholder. They likely expect script to substitute actual sample name into both file and format. But if they say literal, maybe they want the exact characters? No, collapsed.tsv column sample should contain sample names M117-bl etc., not {sample}. So we must output actual sample name per row. How to do with bcftools query? Use `-f "$s\t%CHROM..."` with double quotes and real tab or backslash-t? If use `"$s\t"` in bash, \t remains backslash t, then bcftools may interpret as tab after variable? The format string becomes e.g. M117-bl\t%CHROM...; bcftools likely interprets \t as tab. Good. Or use real tab: `-f "$s$(printf '\t')%CHROM..."` but no need. Use double quotes: `bcftools query -h -f "$s\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/$s.vcf.gz`. Does bcftools interpret \n as newline? Yes likely. If not, could use real newline via $'\n'? But plan says no for bwa only. For bcftools, can use `printf` to create format with actual tabs/newline: `fmt=$(printf '%s\t%s\n' "$s" '%CHROM\t%POS...')`? That's messy. Better rely on bcftools escapes.
+
+Need ensure AF missing? If no AF info, %INFO/AF outputs . maybe okay. Could use `-f ... %INFO/AF`. Good.
+
+Potential issue: lofreq call-parallel may produce VCF with multiple ALTs? For mtDNA likely single. Collapsed one variant per line; if multi-allelic, bcftools query will output comma-separated ALT and AF? The column alt would be A,G maybe not ideal. Could use `bcftools norm -m -any` or `bcftools view -v snps`? Plan doesn't specify. Need follow plan exactly: query as given. But to ensure one variant per line, could normalize multi-allelic before compression? Not in plan. Maybe lofreq outputs single ALT mostly. Could add `bcftools norm -m -any --output ...` but not listed in plan; would alter. Avoid.
+
+Need maybe filter variants? No.
+
+Need idempotency with temp files: If rerun after partial failure, tmp may exist. We can remove at start of step or use unique names and cleanup. Since no trap? Could set `trap 'rm -f ...' EXIT` but rm external. Fine. But if using fixed tmp names, need ensure not considered artifacts. Under results/.tmp maybe hidden. Rerun on populated should not leave temp. If partial, remove.
+
+Need avoid writing to stdout: bwa mem writes SAM to pipe; samtools sort writes file; lofreq may write progress to stderr; bgzip no output; tabix no output; bcftools query writes to stdout which we redirect to file or append. Good. `printf` header writes file. No echo.
+
+Need use `set -euo pipefail`. Need define THREADS=4, samples array. Use bash arrays. Need maybe `IFS`? okay.
+
+Potential issue with `[[ $f1 -nt results/$s.bam ]]` if bam missing: test returns false? In bash, `-nt` with nonexistent file? It tests based on modification time; if one operand doesn't exist, it's false? Actually `[ file1 -nt file2 ]` true if file1 exists and is newer than file2. If file2 doesn't exist, maybe false? Let's check: test treats missing as not newer? I think if either file does not exist, the expression is false (except -ot?). To be safe, first check existence separately. Use helper `needs_update` with explicit checks.
+
+Could implement function `newer_than_any()` using bash builtins:
+```
+newer_than_any() {
+  local target=$1; shift
+  local f
+  for f in "$@"; do
+    if [[ -e $f && $f -nt $target ]]; then return 0; fi
+  done
+  return 1
+}
+```
+But under set -e, function returning 1 in conditional okay. Need no external. Use `local` builtin. Good.
+
+Need check all bwa index files exist:
+```
+bwa_index_files=(data/ref/chrM.fa.amb data/ref/chrM.fa.ann data/ref/chrM.fa.bwt data/ref/chrM.fa.pac data/ref/chrM.fa.sa)
+if [[ ! -s ${bwa_index_files[0]} || ... ]]; then bwa index ...; fi
+```
+Could use loop: `need=1; for f in ...; do if [[ ! -s $f ]]; then need=0?` Actually need=0 means no. Use `all_exist=1`. But simpler check `.pac` and `.sa`; but plan says skip both if index files already exist. Could check all five. For bwa 0.7.18, for small reference maybe .amb/.ann may not be created? Let's recall bwa index creates .amb, .ann, .bwt, .pac, .sa always? I think yes. But if some missing due to version? To avoid false need, check only `.pac` and `.sa`? The plan lists set; but idempotency can skip if all exist. If one not created, checking all would redo every time (bad). Better check primary files that definitely exist: .bwt .pac .sa maybe .amb .ann. BWA 0.7.18 creates all five for bwa-mem? I think yes. But to be robust, check `.pac` and `.sa`; if both exist skip. That's enough. Could also check `data/ref/chrM.fa.fai`. For faidx, check .fai.
+
+Need reference indexing before alignment. If ref index missing but results populated, script will create indexes (work) but per-sample skipped? Requirement rerun on fully populated results must exit 0 without redoing work. Does "fully populated results/" include data/ref indexes? Dataset says chrM.fa not yet indexed initially; after first run, indexes in data/ref exist. Rerun should skip indexing if exist. Good.
+
+Need maybe use `samtools faidx` only once. If .fai exists but bwa index missing, do bwa. Good.
+
+Potential issue: `bwa mem -t 4 -R ... data/ref/chrM.fa f1 f2 | samtools sort -@ 4 -o tmp`. Under pipefail, if bwa fails after producing some output, sort may still exit? pipeline fail. Need maybe use `set -o pipefail` yes.
+
+Need temp BAM: If we write directly to results/$s.bam and fail, partial remains; next run might see bam exists but incomplete and skip alignment incorrectly. Use tmp then mv atomic. But if using `samtools sort -o results/.$s.bam.tmp`, then `mv` to final. Need remove tmp on failure? Could trap. Simpler:
+```
+tmp_bam="results/.${s}.bam.tmp"
+bwa ... | samtools sort -@ "$THREADS" -o "$tmp_bam"
+mv "$tmp_bam" "results/$s.bam"
+```
+If fail, set -e exits leaving tmp; next run may still have final missing so realign overwrites tmp. Good. But if final exists and tmp leftover from previous failure, no issue? We can `rm -f` before align maybe. rm external. Could use `: > "$tmp_bam"` to truncate (builtin) but file remains. If sort fails, partial. Next run overwrite. Fine.
+
+Need temp VCF:
+```
+tmp_vcf="results/.${s}.vcf.tmp"
+lofreq call-parallel --pp-threads 4 -o "$tmp_vcf" data/ref/chrM.fa results/$s.bam
+bgzip -c "$tmp_vcf" > "results/${s}.vcf.gz.tmp"? 
+```
+Need atomic for vcf.gz. Could bgzip directly to final? If fail partial. Use tmp_gz then mv. But `bgzip` can output to stdout; redirect to tmp. Then tabix index tmp? Need index final after mv or index tmp and mv tbi? Tabix expects .vcf.gz.tbi based on filename. Could compress to `results/.$s.vcf.gz.tmp`, but tabix -p vcf that file would create `.tbi` with same name, not desired. Better:
+- lofreq -> tmp_vcf (uncompressed)
+- bgzip -c tmp_vcf > results/$s.vcf.gz.tmp
+- mv results/$s.vcf.gz.tmp results/$s.vcf.gz
+- tabix -p vcf results/$s.vcf.gz
+- rm tmp_vcf
+If tabix fails, final gz exists but no tbi; next run sees tbi missing and redoes call? Our condition if tbi missing or bam newer -> redo. It will overwrite gz. okay. Could index tmp before mv: `tabix -p vcf results/$s.vcf.gz.tmp` creates `results/$s.vcf.gz.tmp.tbi`; then mv both. But tabix may require file extension .vcf.gz? It uses `-p vcf`, should work with any name? Maybe. Simpler index final.
+
+Need ensure bgzip output is valid for tabix (block compression). yes.
+
+Could use `bgzip -k` to keep uncompressed then remove, but plan says write temp and remove. Use `bgzip -c`.
+
+Potential issue: lofreq call-parallel may require reference indexed? It uses htslib, needs .fai maybe. We have faidx. Good.
+
+Need maybe set `--no-caller`? no.
+
+Need performance: lofreq call-parallel with --pp-threads 4 per sample sequential. Four samples small. Under 600s likely. But bwa mem + sort also. Could parallelize samples? Not necessary, but wall-clock under 600 maybe if amplicon MiSeq large? 4 samples paired-end mtDNA amplicon maybe few million reads? THREADS=4 sequential could be okay. But to be safe, can run per-sample pipelines in background with max 4? However idempotency and output complexity. Total wall-clock under 600 at THREADS=4; if each sample takes >150s sequential fail. Could parallelize all four samples using `&` and wait, but then bwa/lofreq each use 4 threads => 16 threads oversubscribed maybe okay? Constraint THREADS=4 likely total? It says wall-clock under 600 seconds at THREADS=4. Probably means script uses 4 threads per tool, not necessarily limit CPU count. Parallelizing samples could reduce wall time but increase memory. For small mtDNA amplicon, fine. But idempotency with background and set -e? Need handle failures. Could implement simple sequential to be safe; likely dataset small. MiSeq amplicon maybe 10-50M reads per sample? bwa mem on mtDNA reference very fast but mapping all reads to 16kb, many unmapped? Still okay. lofreq call-parallel on whole BAM may scan all alignments; if many off-target, could be slower. But under 600 with 4 threads sequential maybe borderline. Could use `lofreq call --pp-threads`? Plan says call-parallel. It parallelizes across regions? For small ref, maybe not much.
+
+Could filter to mapped chrM before lofreq to speed: `samtools view -h results/$s.bam | samtools sort ...`? Not in plan. Avoid.
+
+Need maybe use `bwa mem -t 4 -R ... data/ref/chrM.fa f1 f2 2> >(tee?)` no.
+
+Idempotency details:
+- If final tbi exists and is newer than inputs, skip sample entirely. But what if collapsed.tsv missing? We'll rebuild later from vcf.gz. Good.
+- Inputs to tbi: raw fastqs, ref fa, maybe bam? Since tbi depends on vcf.gz which depends on bam. If bam is newer than tbi (e.g., realigned but not called), need redo call. But if we skip sample when tbi exists and not older than raw/ref/bam, okay.
+- However if bam missing but tbi exists, `newer_than_any` with target tbi and files includes bam? If bam doesn't exist, no newer; skip sample, leaving missing bam. But final artifacts require bam. On fully populated results, all present. For robustness, before skipping check all required per-sample artifacts exist: bam, bai, vcf.gz, tbi. If any missing, don't skip. So:
+```
+if [[ -s results/$s.bam && -s results/$s.bam.bai && -s results/$s.vcf.gz && -s results/$s.vcf.gz.tbi ]] && ! newer_than_any "results/$s.vcf.gz.tbi" "$f1" "$f2" data/ref/chrM.fa; then continue; fi
+```
+Should we include bam in inputs? If tbi exists but bam older, okay. If bam newer than tbi, need redo call. But if bam missing, first condition false. Include `results/$s.bam` in newer_than_any? If bam is newer than tbi, yes need redo. But if bam was touched after tbi without content change (e.g., mv), could cause unnecessary redo. Acceptable. For idempotent rerun on populated, mtimes: bam older than vcf.gz/tbi because created before; no redo. Good.
+- Need also ensure bai newer than bam? If final tbi exists but bai missing? first condition false. Stepwise will index.
+
+Stepwise conditions:
+1. Align if bam missing or any raw/ref newer than bam OR maybe bwa index changed? Not needed. Use `needs_bam=0`; if [[ ! -s results/$s.bam ]]; then 1; elif newer_than_any results/$s.bam f1 f2 ref; then 1. Note: If bam exists but is older than tbi? doesn't matter.
+But if final tbi exists and we skipped sample, no align. If not skip and bam missing, align.
+2. Index BAM if bai missing or bam newer than bai. Use `if [[ ! -s results/$s.bam.bai || results/$s.bam -nt results/$s.bam.bai ]]; then samtools index`. But if bam just created via mv, mtime now; bai older -> index. If rerun, bai newer -> skip.
+3. Call/compress/index VCF if tbi missing or vcf.gz missing? Or bam/ref/raw newer than tbi? Since call depends on bam and ref. Use `if [[ ! -s results/$s.vcf.gz.tbi || ! -s results/$s.vcf.gz ]] || newer_than_any results/$s.vcf.gz.tbi "$f1" "$f2" data/ref/chrM.fa "results/$s.bam"; then ...`. But if bam is newer than tbi due to realignment, redo. If raw newer but bam not updated? We would have aligned first because bam older than raw; after align, bam new, then call condition true. Good.
+Could also check vcf.gz newer than tbi? If tbi missing but vcf.gz exists and is newer than bam, we could just index instead of recall. But plan says write temp VCF each time. For idempotency, if tbi missing due to partial failure after bgzip, recalling wastes but okay under 600? Could be extra. To avoid redo work on rerun populated, tbi exists so skip. On partial, acceptable. But requirement "without redoing work" only for fully populated. Good.
+
+Need collapsed rebuild condition: if missing or any vcf.gz newer than collapsed.tsv. Should we include sample list order. Use `newer_than_any results/collapsed.tsv results/$s.vcf.gz ...` but target first. If any VCF newer, rebuild. Also if collapsed.tsv exists but some vcf.gz missing? Then need rebuild? But per-sample ensures vcf.gz exists before collapsed. Could check all exist.
+```
+need_collapsed=1
+if [[ -s results/collapsed.tsv ]]; then
+  need_collapsed=0
+  for s in samples; do
+    if [[ ! -s results/$s.vcf.gz ]] || newer_than_any "results/collapsed.tsv" "results/$s.vcf.gz"; then need_collapsed=1; break; fi
+  done
+fi
+```
+But `newer_than_any` returns 0 if any file newer. For each, call in conditional. Good.
+
+Rebuild collapsed atomically:
+```
+tmp_tsv="results/.collapsed.tsv.tmp"
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$tmp_tsv"
+for s in samples; do
+  bcftools query -h -f "$s\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/$s.vcf.gz" >> "$tmp_tsv"
+done
+mv "$tmp_tsv" results/collapsed.tsv
+```
+Need ensure `bcftools query` with `-h`? It suppresses header. Good. If no variants, outputs nothing. Header remains.
+
+Potential issue: format string with `$s\t%CHROM...`: In double quotes, `\t` is two chars backslash t. bcftools should interpret as tab. But what about `%INFO/AF\n` at end; if bcftools doesn't interpret \n, it will output literal newline? It likely does. If not, lines may be concatenated? Let's verify bcftools query format escapes: I know `bcftools query -f '%CHROM\t%POS\n'` works. Yes.
+
+Need maybe use `-O v`? no.
+
+Potential issue with sample names containing hyphen; okay in filenames and variables. In bcftools format, `$s` literal may contain `%`? No. Hyphen fine.
+
+Need ensure read group exact: `-R "@RG\tID:$s\tSM:$s\tLB:$s\tPL:ILLUMINA"`. In double quotes, backslash-t remains. But bash history expansion? `!` not present. Good. Need pass as one argument. Could use array to be safe:
+```
+rg="@RG\tID:${s}\tSM:${s}\tLB:${s}\tPL:ILLUMINA"
+bwa mem -t "$THREADS" -R "$rg" data/ref/chrM.fa "$f1" "$f2" | samtools sort ...
+```
+This is single double-quoted argument. Good.
+
+Need maybe bwa index reference before each alignment? We do once.
+
+Potential issue: `bwa mem` with read group line containing literal backslash-t; in bash double quotes, `\t` remains backslash t. But if using variable assignment `rg="@RG\tID..."`, the value contains backslash t. Good. Do not use `$'...'`.
+
+Need no absolute paths. Use relative.
+
+Need maybe create results directory: `mkdir -p results`. If mkdir not allowed? necessary. Could use bash builtin? No. We'll use.
+
+Need maybe clean hidden temp files at start to ensure idempotent? If rerun populated, hidden temps shouldn't exist. But if they do from previous failure, and final artifacts exist, script may skip and leave temps. Requirement leaves all eight per-sample artifacts plus collapsed intact; doesn't say no extra hidden files. Could remove hidden temps at end or start. Use `rm -f results/.*.tmp`? Glob with dot? Need careful not remove . and ... Could use specific temp names in loop after each step. At final, maybe `rm -f "results/.${s}.bam.tmp" ...`. But if skip sample due to final tbi, leftover tmp from previous failure remains; could clean at start for all samples:
+```
+for s in "${samples[@]}"; do rm -f "results/.$s.bam.tmp" "results/.$s.vcf.tmp" "results/.$s.vcf.gz.tmp"; done
+rm -f results/.collapsed.tsv.tmp
+```
+This uses rm. On rerun populated, it will remove non-existent files (no work? It's a command but no file ops). Is that considered redoing work? Minor. Could avoid by only cleaning when needed. But okay. To strictly "performs no work", removing nonexistent temp files is not meaningful. But maybe they check no commands? Hard to know. Better clean temps only before creating them, and after successful mv remove source (mv removes). For leftover from failure, next run will overwrite or rm before use. If final artifacts exist and skip sample, leftover tmp may remain; but not required? Could be undesirable. We can at end of each sample if skipped still `rm -f` its temps? That is work. Hmm.
+
+Maybe implement trap to remove current temp on exit:
+```
+tmp_bam="" tmp_vcf="" tmp_gz="" tmp_tsv=""
+cleanup() { [[ -n $tmp_bam ]] && rm -f "$tmp_bam"; ...; }
+trap cleanup EXIT
+```
+But if successful mv, variable still points to old path? After mv, source doesn't exist; rm -f no effect. On rerun populated, trap will attempt rm -f on empty variables? If set empty, no. But if we set temp names at start of loop for skipped sample? We can not set. Good. However `set -e` with cleanup using `[[ -n ... ]] && rm` may return 1 if variable empty and cause exit? In trap, maybe okay but could affect exit status? Better use if statements.
+```
+cleanup() {
+  if [[ -n ${tmp_bam:-} ]]; then rm -f "$tmp_bam"; fi
+  ...
+}
+trap cleanup EXIT
+```
+This uses rm on failure only (or no-op). On successful run, temp variables may still contain paths that were mv'd; rm -f nonexistent. That's okay but extra. Could unset after mv: `tmp_bam=""`. Good.
+
+But adding trap and rm maybe overkill. Simpler no trap; use fixed temps and remove before use. Under set -e, if failure leaves temp, next run can handle. For idempotent rerun populated, if we don't clean skipped sample temps, they may remain from previous failed run but final artifacts exist? If previous failed after creating tmp then somehow final exists? unlikely. Could ignore.
+
+Need ensure script exits 0 on rerun populated. With set -e, all conditionals okay. Need avoid `(( ))` that returns nonzero when false. Use if statements.
+
+Potential issue: `newer_than_any` function under `set -u`: local variables. Good.
+```
+newer_than_any() {
+  local target=$1; shift
+  local f
+  for f in "$@"; do
+    if [[ -e $f && $f -nt $target ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+```
+If no files after shift? It will loop none, return 1. Good. But under set -e, calling `if newer_than_any ...; then` okay. If used in `elif newer_than_any ...` okay.
+
+Need maybe compare target exists? In conditions we ensure target exists before calling? For bam condition: if [[ ! -s results/$s.bam ]]; then align elif newer_than_any results/$s.bam ...; target exists due to first check. Good. For tbi condition: if [[ ! -s results/$s.vcf.gz.tbi ]] || newer_than_any ...; If tbi missing, short-circuit? In bash `||` with command: if first true, second not executed. But we need also if vcf.gz missing. Use explicit if to avoid calling with target missing? Could call even if target missing; `-nt` with target missing maybe false, but okay. Better:
+```
+if [[ ! -s results/$s.vcf.gz.tbi || ! -s results/$s.vcf.gz ]] || newer_than_any "results/$s.vcf.gz.tbi" ...; then
+```
+If tbi missing, first true, second not executed due to `||`? Actually expression: `if A || B || C`; if A true, B and C not evaluated. Good. If A false but B true (vcf.gz missing), C not evaluated. So target exists when C called. Good.
+
+Need align condition with ref index? If bwa index files updated after bam? Not considered. Could include `data/ref/chrM.fa.pac` as input to bam? If reference index changed, realign. But if we check ref fa only, okay. Maybe include all raw and ref. For idempotent rerun, ref fa older than bam. Good.
+
+Need maybe use `samtools sort -@ 4` but THREADS variable. Use `-@ "$THREADS"`. bwa mem `-t "$THREADS"`. lofreq `--pp-threads "$THREADS"`. samtools index `-@ "$THREADS"`? Plan says index -@ 4. Use.
+
+Need maybe set `export OMP_NUM_THREADS=$THREADS` to limit OpenBLAS? Not necessary but could help. It's shell builtin export, okay. But may affect tools. Could include. No user-facing output.
+
+Potential issue: lofreq call-parallel syntax in v2.1.5: `lofreq call-parallel --pp-threads 4 -o out.vcf ref.fa bam`. Does it require `--no-caller`? no. It may need `--min-bq`, etc. Good. But maybe `call-parallel` expects reference and BAM, with `-o` optional; if not, stdout. Use `-o`.
+
+Potential issue: lofreq call-parallel on BWA 0.7.18 SAM/BAM? okay.
+
+Need maybe use `samtools faidx` before bwa index. If .fai exists but reference changed (fa newer than fai), should update. Condition:
+```
+if [[ ! -s data/ref/chrM.fa.fai || data/ref/chrM.fa -nt data/ref/chrM.fa.fai ]]; then samtools faidx ...; fi
+```
+Good. For bwa index, check .pac/.sa and ref newer? If ref changed, reindex. Use:
+```
+if [[ ! -s data/ref/chrM.fa.pac || ! -s data/ref/chrM.fa.sa ]] || data/ref/chrM.fa -nt data/ref/chrM.fa.pac; then bwa index ...; fi
+```
+But if .pac exists and .sa missing, reindex. Good. If ref newer than pac, reindex. This may redo if reference touched but not changed; okay.
+
+Need maybe check all five? Could use `.pac` and `.sa`. The plan says skip both if index files already exist. It's fine.
+
+Potential issue: bwa index on mtDNA 16kb very fast. Good.
+
+Need final script no markdown fences. Must start exactly `#!/usr/bin/env bash` second `set -euo pipefail`. No commentary. We can include comments? The user says output only script, no commentary. Comments inside script maybe okay? But "No prose" likely comments not desired. Could omit comments for safety. But comments are part of script; not user-facing. However final answer should be just script. I can include minimal or no comments. Better no comments to avoid any perceived commentary.
+
+Need ensure no `echo`. Use printf only for file header. Is printf considered tool? builtin. Good.
+
+Potential issue: "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." Our script may produce no stdout except bcftools query redirected, bwa/samtools/lofreq progress to stderr. `mkdir -p` no output. `rm -f` no output. Good.
+
+Need maybe redirect lofreq progress? It naturally emits to stderr; okay. But if we want quiet, could `2>/dev/null`, but that suppresses tool natural emit? Constraint says do not write beyond what tools naturally emit; suppressing is okay? But don't need. Leave.
+
+Potential issue: `bcftools query` output appended to tmp_tsv; if no variants, fine. If AF missing, outputs . maybe. Good.
+
+Need consider multi-allelic and AF list: `%INFO/AF` may output comma-separated values corresponding to ALTs. The collapsed column alt would be comma-separated too? Actually %ALT outputs comma-separated. One variant per line not true for multiallelic. Could use `bcftools norm -m -any` before query to split multi-allelic sites into separate lines. But plan doesn't mention. Should we add to ensure one variant per line? The final spec says one variant per line. If lofreq outputs multiallelic, our output violates. We can preprocess VCF with `bcftools norm -m -any` during compression step: after lofreq temp vcf, run `bcftools norm -m -any --output tmp_norm.vcf` then bgzip. But plan says variant calling with lofreq writes uncompressed VCF to temp; compress and index. It doesn't forbid normalization? Plan authoritative follow ordering and tool choices. Adding bcftools norm may be extra but uses allowed tool. However it changes AF? `bcftools norm -m -any` splits multiallelic sites, preserving INFO/AF? I think it adjusts AF per allele? Maybe yes if using `-a .`? Not sure. Could also use `bcftools view -v snps` to filter indels? mtDNA amplicon may have indels; spec doesn't say SNPs only. Avoid.
+
+Maybe lofreq by default outputs single ALT for each site? It can output multiallelic if multiple alleles. In mitochondrial heteroplasmy, maybe one alt per position. Fine.
+
+Need maybe use `bcftools query -f ... %INFO/AF` but if AF not present because no variants? okay. If variant has no AF (e.g., low qual), outputs .; acceptable.
+
+Potential issue: The collapsed.tsv header must be exactly tab-separated. Use printf with `\t`. Good.
+
+Need maybe ensure results directory exists before temp cleanup. yes.
+
+Let's draft script:
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+samples=(M117-bl M117-ch M117C1-bl M117C1-ch)
+ref=data/ref/chrM.fa
+raw_dir=data/raw
+res=results
+
+mkdir -p "$res"
+
+newer_than_any() {
+  local target=$1
+  shift
+  local f
+  for f in "$@"; do
+    if [[ -e $f && $f -nt $target ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [[ ! -s ${ref}.fai || $ref -nt ${ref}.fai ]]; then
+  samtools faidx "$ref"
+fi
+
+if [[ ! -s ${ref}.pac || ! -s ${ref}.sa ]] || $ref -nt ${ref}.pac; then
+  bwa index "$ref"
+fi
+
+for s in "${samples[@]}"; do
+  f1="$raw_dir/${s}_1.fq.gz"
+  f2="$raw_dir/${s}_2.fq.gz"
+  bam="$res/$s.bam"
+  bai="$res/$s.bam.bai"
+  vcf_gz="$res/$s.vcf.gz"
+  tbi="$res/$s.vcf.gz.tbi"
+
+  if [[ -s "$bam" && -s "$bai" && -s "$vcf_gz" && -s "$tbi" ]] && ! newer_than_any "$tbi" "$f1" "$f2" "$ref" "$bam"; then
+    continue
+  fi
+
+  tmp_bam="$res/.$s.bam.tmp"
+  if [[ ! -s "$bam" || newer_than_any "$bam" "$f1" "$f2" "$ref" ]]; then
+    rg="@RG\tID:${s}\tSM:${s}\tLB:${s}\tPL:ILLUMINA"
+    bwa mem -t "$THREADS" -R "$rg" "$ref" "$f1" "$f2" | samtools sort -@ "$THREADS" -o "$tmp_bam"
+    mv "$tmp_bam" "$bam"
+  fi
+
+  if [[ ! -s "$bai" || $bam -nt "$bai" ]]; then
+    samtools index -@ "$THREADS" "$bam"
+  fi
+
+  tmp_vcf="$res/.$s.vcf.tmp"
+  tmp_gz="$res/.$s.vcf.gz.tmp"
+  if [[ ! -s "$tbi" || ! -s "$vcf_gz" ]] || newer_than_any "$tbi" "$f1" "$f2" "$ref" "$bam"; then
+    lofreq call-parallel --pp-threads "$THREADS" -o "$tmp_vcf" "$ref" "$bam"
+    bgzip -c "$tmp_vcf" > "$tmp_gz"
+    mv "$tmp_gz" "$vcf_gz"
+    tabix -p vcf "$vcf_gz"
+    rm -f "$tmp_vcf"
+  fi
+done
+
+tmp_tsv="$res/.collapsed.tsv.tmp"
+need_collapsed=1
+if [[ -s "$res/collapsed.tsv" ]]; then
+  need_collapsed=0
+  for s in "${samples[@]}"; do
+    if [[ ! -s "$res/$s.vcf.gz" ]] || newer_than_any "$res/collapsed.tsv" "$res/$s.vcf.gz"; then
+      need_collapsed=1
+      break
+    fi
+  done
+fi
+
+if [[ $need_collapsed -eq 1 ]]; then
+  printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$tmp_tsv"
+  for s in "${samples[@]}"; do
+    bcftools query -h -f "$s\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$res/$s.vcf.gz" >> "$tmp_tsv"
+  done
+  mv "$tmp_tsv" "$res/collapsed.tsv"
+fi
+```
+
+Need check `newer_than_any` with target tbi and file bam: If bam is newer than tbi, returns true. But in skip condition, if all artifacts exist and no input newer than tbi, continue. Suppose after first run, tbi mtime > bam? yes because call after bam. Good.
+
+Potential issue: In per-sample step, if final tbi exists but vcf.gz missing (weird), skip condition false due to ! -s vcf_gz. Then align maybe skipped if bam okay; index skipped; call condition true due to ! -s vcf_gz, redo call. Good.
+
+Potential issue: If bam needs realign because raw newer, we use tmp_bam and mv. But what about old bai? After mv, bam mtime new, bai older -> reindex. Good. Old tbi maybe exists but bam newer -> call condition true. Good.
+
+Potential issue: If reference changed (ref newer than bam), align; if ref newer than tbi but bam not? We realign because ref newer than bam. Good.
+
+Potential issue: `bwa index` skip condition uses `$ref -nt ${ref}.pac`. If .pac missing, first true short-circuit? In bash `if [[ ! -s ... || ! -s ... ]] || $ref -nt ...`; if first part true, second not evaluated. Good. But if .pac exists and .sa missing, first true. If both exist but ref newer than pac, reindex. What if ref newer than sa but older than pac? unlikely; could check both: `[[ ${ref}.pac -ot $ref || ${ref}.sa -ot $ref ]]`? Simpler okay.
+
+Potential issue: `samtools faidx` skip condition uses `$ref -nt ${ref}.fai`. If .fai missing, first true short-circuit. Good.
+
+Potential issue: `bgzip` not in tool inventory. Could we instead use `tabix`? No. Maybe use `bcftools view -O z` despite plan? Need decide final. The hard constraint says Use only tools listed in TOOL_INVENTORY. bgzip is not listed. But plan says compress with bgzip. Which has priority? It says PLAN (authoritative — follow the ordering and tool choices). So follow plan, use bgzip. The inventory may have omitted bgzip inadvertently; htslib tabix likely includes bgzip on PATH in conda env. Use bgzip.
+
+Potential issue: `rm -f` not listed. But necessary. Could avoid rm by using `mv` to overwrite? For tmp_vcf, after bgzip we could leave it? Final outputs would include extra .vcf.tmp; plan says remove intermediate uncompressed .vcf. Need remove. Use rm. Basic utility assumed.
+
+Potential issue: `mkdir -p`, `mv`, `rm` not in inventory. But impossible otherwise. The constraint likely targets bioinformatics tools, not coreutils. Fine.
+
+Need maybe use `command -v bgzip`? no.
+
+Potential issue: Under `set -u`, `${ref}.fai` okay. In newer_than_any, if called with target and no files? We always pass at least one. Good.
+
+Potential issue: The function returns 1 when no file newer. Under set -e, if used in `elif newer_than_any ...; then` okay. But in skip condition: `if [[ ... ]] && ! newer_than_any ...; then continue; fi`. If newer_than_any returns 1, `!` makes true? Actually `! cmd` negates exit status. If no file newer (return 1), `!` returns 0, so condition true if artifacts exist. Good. If any file newer (return 0), `!` returns 1, condition false. Good.
+
+Potential issue: In align condition: `if [[ ! -s "$bam" || newer_than_any "$bam" ... ]]; then`. Here `newer_than_any` is inside `[[ ]]`? Wait I wrote `|| newer_than_any` outside? Actually syntax: `if [[ ! -s "$bam" || newer_than_any "$bam" ... ]]; then` is invalid because command substitution not allowed inside [[. Need separate:
+```
+if [[ ! -s "$bam" ]] || newer_than_any "$bam" "$f1" "$f2" "$ref"; then
+```
+Yes. Similarly call condition. Need ensure correct syntax.
+
+Draft corrected:
+```
+if [[ ! -s "$bam" ]] || newer_than_any "$bam" "$f1" "$f2" "$ref"; then
+...
+fi
+```
+But if bam missing, `newer_than_any` not called due to short-circuit? In shell `||` between commands: first is `[[ ! -s "$bam" ]]`; if true (missing), second not executed. Good.
+
+Call condition:
+```
+if [[ ! -s "$tbi" || ! -s "$vcf_gz" ]] || newer_than_any "$tbi" "$f1" "$f2" "$ref" "$bam"; then
+```
+Here first `[[ ... ]]` can be true if either missing; if true, second not executed. Good.
+
+Skip condition:
+```
+if [[ -s "$bam" && -s "$bai" && -s "$vcf_gz" && -s "$tbi" ]] && ! newer_than_any "$tbi" "$f1" "$f2" "$ref" "$bam"; then
+  continue
+fi
+```
+Good.
+
+Collapsed condition:
+```
+if [[ ! -s "$res/$s.vcf.gz" ]] || newer_than_any "$res/collapsed.tsv" "$res/$s.vcf.gz"; then
+```
+If vcf missing, second not executed. Good.
+
+Need maybe define `collapsed="$res/collapsed.tsv"` for clarity.
+
+Potential issue: `printf 'sample\tchrom\tpos\tref\talt\taf\n'` uses backslash escapes; printf builtin interprets them as tabs/newline. Good.
+
+Potential issue: bcftools query format with `$s\t...`: If sample name contains backslashes? no. If sample name contains `%`? no. Good.
+
+Need maybe use `bcftools query -h -f ... --output-file`? No, redirect append.
+
+Potential issue: If a VCF has no variants, bcftools query outputs nothing; okay. But if all samples no variants, collapsed.tsv header only. Good.
+
+Potential issue: The final collapsed.tsv should be rebuilt only if any input VCF newer than TSV. Our condition also rebuilds if any vcf.gz missing. On fully populated, no rebuild. Good.
+
+Potential issue: If per-sample skipped due to tbi exists but collapsed.tsv missing, we still build collapsed from existing vcf.gz. Good.
+
+Potential issue: If results directory has all artifacts but data/ref indexes missing (e.g., user deleted indexes), script will create indexes then skip samples and maybe rebuild collapsed? It does work in data/ref, not results. Requirement rerun on populated results must exit 0 without redoing work; likely includes ref indexes present from first run. If not, creating indexes is necessary for future but not per-sample. Could be considered work. But dataset initially not indexed; after first run they exist. Good.
+
+Potential issue: Wall-clock under 600. Sequential maybe okay. But let's consider if MiSeq amplicon samples are large (e.g., 100M reads). bwa mem to mtDNA reference with -t4 for 4 samples sequential could exceed 600? Maybe not; mapping to small ref is fast but still reading FASTQ and writing BAM. lofreq call-parallel on whole BAM may be slow if many unmapped/off-target. Could optimize by using `bwa mem` only mtDNA reference, all reads mapped or soft-clipped/unmapped. Sorting large BAM maybe time. But amplicon MiSeq likely small (few million). Under 600 with THREADS=4 okay.
+
+Could parallelize samples to improve wall-clock while still each tool uses 4 threads? If CPU has 4 cores, running 4 bwa mem -t4 simultaneously oversubscribes but maybe still faster due I/O? Could be worse. The constraint "at THREADS=4" likely means total thread budget 4; sequential is expected. Keep sequential.
+
+Could use `lofreq call-parallel` with `--pp-threads 4` and also `--no-caller`? no.
+
+Potential issue: bwa mem read group exact form: They require literal backslash-t between fields and colons. Our variable in double quotes contains `\t`. But when passed to bwa, does bash preserve backslash? Yes. Let's test mentally: `rg="@RG\tID:$s"` -> characters @ R G \ t I D : ... Good. bwa parses. Good.
+
+Potential issue: In script final answer, the line with rg will show `\t`. The output should not be markdown fenced; it will include backslashes. Fine.
+
+Need maybe avoid `local` because bash? yes bash. First line env bash.
+
+Potential issue: `set -euo pipefail` and function newer_than_any returning 1 at end. If called in a context where its return status is not tested, set -e would exit. We always call in conditional contexts (`if`, `||`, `!`). In skip condition with `&& ! newer_than_any`, it's part of if list, okay. In align/call conditions as second operand of `||` in if, okay. In collapsed loop, inside if condition, okay. Good.
+
+Potential issue: The `for f in "$@"; do if ... return 0; fi; done; return 1` under set -e inside function called from conditional is fine. If no files, returns 1 but conditional handles.
+
+Potential issue: Use of `-s` to check non-empty. For BAM/BAI/VCF/TBI, okay. For .fai/.pac, okay. If file exists empty due failure, redo. Good.
+
+Potential issue: `samtools index -@ "$THREADS" "$bam"` creates bai. If bam is not sorted? It is sorted. Good.
+
+Potential issue: lofreq call-parallel may require BAM indexed? I think no, but maybe it uses random access? It can stream. But we have bai anyway.
+
+Potential issue: `lofreq call-parallel` output VCF may include header with contig length from reference; okay. bgzip and tabix index. Tabix requires sorted by position; lofreq outputs sorted. Good.
+
+Potential issue: If no variants, VCF has only header. bgzip/tabix works? Yes, tabix can index empty VCF? I think yes. bcftools query outputs nothing. Good.
+
+Potential issue: `tabix -p vcf` on VCF with no sequences? okay.
+
+Potential issue: The collapsed.tsv AF column for multiple ALTs maybe comma; if one variant per line required, maybe need split. Should we add `bcftools norm -m -any` to be safe? Let's evaluate. Plan step 8 says run bcftools query on results/{sample}.vcf.gz with format. It doesn't mention normalization. If we insert normalization before compression, the VCF.gz content differs from direct lofreq output but still valid. The plan's ordering: variant calling writes uncompressed VCF to temp; compress and index. It doesn't explicitly forbid processing between call and compress? "Write uncompressed VCF to a temporary path (e.g., results/{sample}.vcf); lofreq emits plain VCF." Then step 7 compress. Adding norm would be extra tool choice not in plan. The instruction says PLAN authoritative — follow ordering and tool choices. Better not add.
+
+But final spec one variant per line could be satisfied by assuming no multiallelic. Fine.
+
+Potential issue: Use of `bcftools query` format `%INFO/AF`: If AF is a list, for single ALT okay. For missing, .; good.
+
+Need maybe ensure collapsed.tsv lines are tab-separated if bcftools interprets `\t`. It does. But what about the sample name part `$s\t%CHROM...`: The backslash-t after variable is in double quotes. Bash leaves it as two chars. bcftools format parser sees `M117-bl\t%CHROM...` and should convert \t to tab. Good. If it doesn't, output would have literal `\t`, violating. Could use actual tabs in format string to be certain. How to create actual tabs without echo? Use bash `$'\t'`? The plan forbids for bwa read group only: "Do NOT use printf, echo -e, $'\t', or any mechanism that turns them into real tabs" specifically for bwa RG. For bcftools, we can use real tabs. To be safe, we can construct format with actual tab using `TAB=$'\t'`? That uses $'\t' but not for bwa; allowed? The hard constraint doesn't forbid. But maybe they globally dislike? It says for read group exact form must remain backslash-t. For bcftools, real tabs are fine. However using `$'\t'` in script may be seen as violating "Do NOT use ... $'\t'" if interpreted broadly? That sentence is under step 3 bwa. But to avoid any risk, rely on bcftools escapes. I know it works.
+
+Need maybe use `bcftools query -f '{%SAMPLE}\t...'`? No.
+
+Let's verify bcftools query format: It uses `%CHROM`, `%POS`, etc. Literal text can be included. Escape sequences? From docs: "The format string is a C-style string, so \n and \t are interpreted." I think yes. Good.
+
+Potential issue: The plan says `bcftools query -f '{sample}\t%CHROM...'` with curly braces around sample literal. If we use `$s` without braces, output sample name no braces. Correct for TSV. If they expected literal `{M117-bl}`? No, column sample should be sample name. Good.
+
+Potential issue: Need maybe include `--no-version`? no.
+
+Potential issue: The script must be self-contained and idempotent. It uses relative paths. Good.
+
+Could there be an issue with hidden temp files starting with dot in results causing glob? We don't use globs. Fine.
+
+Need maybe remove tmp_vcf after successful bgzip; if `rm -f` fails (permissions) set -e exits. okay.
+
+Potential issue: If lofreq call produces no variants, VCF header only. bgzip and tabix okay. But `bcftools query` with `%INFO/AF` on no records outputs nothing. Good.
+
+Potential issue: If a sample has zero mapped reads, bwa mem still outputs SAM header; sort creates BAM; index; lofreq may fail? It might produce empty VCF or error due no alignments? Probably okay. If fails, script exits nonzero. Dataset likely valid.
+
+Potential issue: `bwa mem` with `-R` read group and paired FASTQs. Good.
+
+Need maybe use `samtools sort -@ 4 -o results/{sample}.bam` directly per plan, not temp. But idempotency better with temp. Does using tmp violate "Pipe bwa mem stdout into samtools sort ... -o results/{sample}.bam"? It says do that; but we can output to tmp then mv. The final artifact same. Might be considered deviation? Probably okay for robustness. If strict, maybe direct. But idempotency guard with existence check could skip if bam exists; partial failure less concern. The plan says treat every output step as idempotent: guard each artifact with existence check (e.g., skip if ...). It doesn't require atomic temp. Could simplify to direct `samtools sort -o "$bam"`. But then if rerun on populated, skip due final tbi. If partial failure, maybe issue. Temp is safer but extra mv. I think acceptable.
+
+Need maybe ensure no work on rerun: Our script still checks ref indexes and per-sample conditions; these are tests, not work. It does not run bio tools. Good. It may call `mkdir -p results` (no output) even if exists. Is that "work"? negligible. Could guard mkdir? Can't easily without external test? We can use `if [[ ! -d $res ]]; then mkdir -p "$res"; fi`. That avoids command on rerun. Use bash builtin test. Good.
+```
+if [[ ! -d $res ]]; then mkdir -p "$res"; fi
+```
+Better for no work.
+
+Need maybe avoid cleaning temps on rerun. We don't clean globally. Good.
+
+Potential issue: If results directory doesn't exist, hidden temp names not matter. Good.
+
+Need maybe use `mkdir -p` only if missing. Good.
+
+Potential issue: The function newer_than_any uses `-e` and `-nt`. If target is a symlink? okay.
+
+Potential issue: In skip condition, we include `$bam` as input to tbi. Suppose after first run, bam mtime older than tbi. Good. But if user touches bam (mtime newer) without changing content, script will redo call/compress/index, violating no work on rerun populated? "Rerunning on a populated results/ directory must exit 0 without redoing work or erroring." If the populated directory has mtimes such

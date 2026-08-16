@@ -1,0 +1,90 @@
+Let me analyze this task carefully:
+
+1. I need to create a bash script that performs per-sample variant calling on 4 paired-end MiSeq amplicon samples mapped to human mitochondrial reference (chrM).
+
+2. The outputs should be:
+   - results/{sample}.bam
+   - results/{sample}.bam.bai
+   - results/{sample}.vcf.gz
+   - results/{sample}.vcf.gz.tbi
+   - results/collapsed.tsv
+
+3. Key requirements:
+   - First line must be #!/usr/bin/env bash
+   - Second line must be set -euo pipefail
+   - Must be idempotent (rerunning on populated results/ should exit 0 without redoing work)
+   - No hardcoded paths outside cwd
+   - Only use tools from TOOL_INVENTORY
+   - Total wall-clock under 600 seconds at THREADS=4
+
+4. Looking at the plan:
+   - Reference indexing with bwa and samtools faidx
+   - Per-sample alignment, sorting, indexing
+   - Variant calling with lofreq
+   - VCF compression and tabix indexing
+   - Collapsed TSV generation
+
+5. For idempotency, I need to check if outputs already exist before running each step.
+
+Let me write the script:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Reference indexing — BWA (idempotent check)
+if [ ! -f data/ref/chrM.fa.bwt ]; then
+    bwa index data/ref/chrM.fa
+fi
+
+# Reference indexing — samtools faidx (idempotent check)
+
+
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    # Per-sample alignment + sort
+    if [ ! -f results/${sample}.bam ] || [ data/raw/${sample}_1.fq.gz -nt results/${sample}.bam ]; then
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            data/ref/chrM.fa \
+            data/raw/${sample}_1.fq.gz \
+            data/raw/${sample}_2.fq.gz | \
+        samtools sort -@ ${THREADS} -o results/${sample}.bam -
+    fi
+
+    # BAM index
+    if [ ! -f results/${sample}.bam.bai ]; then
+        samtools index -@ ${THREADS} results/${sample}.bam
+    fi
+
+    # Variant calling — LoFreq
+    if [ ! -f results/${sample}.vcf.gz ] || [ results/${sample}.bam -nt results/${sample}.vcf.gz ]; then
+        lofreq call-parallel --pp-threads ${THREADS} \
+            -f data/ref/chrM.fa \
+            -o results/${sample}.vcf \
+            results/${sample}.bam
+    fi
+
+    # VCF compression + tabix index
+    if [ ! -f results/${sample}.vcf.gz.tbi ]; then
+        bgzip -f results/${sample}.vcf
+        tabix -p vcf results/${sample}.vcf.gz
+    fi
+done
+
+# Collapsed TSV generation
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' \
+        results/${sample}.vcf.gz | \
+    awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+
+The script handles each sample through alignment, indexing, variant calling, and VCF compression. It then generates a collapsed TSV with allele frequencies across all samples by querying the compressed VCF files and appending sample identifiers to each row.

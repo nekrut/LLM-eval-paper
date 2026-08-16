@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+mkdir -p results
+
+# Reference indexing (skip if already done)
+if [ ! -f data/ref/chrM.fa.fai ]; then
+    bwa index data/ref/chrM.fa
+fi
+samtools faidx data/ref/chrM.fa
+
+for sample in "${SAMPLES[@]}"; do
+    # Check for existing outputs to skip work (idempotency)
+    if [ -f "results/${sample}.bam" ] && \
+       [ -f "results/${sample}.vcf.gz.tbi" ]; then
+        continue
+    fi
+
+    bwa mem -t 4 -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ 4 -o results/${sample}.bam -
+    samtools index -@ 4 results/${sample}.bam
+
+    lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+    bgzip -c results/${sample}.vcf > "results/${sample}.vcf.gz"
+    tabix -p vcf results/${sample}.vcf.gz
+
+done
+
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" | awk -v s="${sample}" 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done

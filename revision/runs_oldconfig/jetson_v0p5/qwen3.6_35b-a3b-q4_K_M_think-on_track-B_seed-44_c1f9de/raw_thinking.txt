@@ -1,0 +1,326 @@
+The user wants a bash script that performs variant calling on 4 paired-end samples mapped to chrM.
+The script must be self-contained, idempotent, and use only the specified tools.
+Outputs: per-sample BAM, BAI, VCF.GZ, TBI, and a collapsed.tsv with columns sample, chrom, pos, ref, alt, af.
+
+Steps:
+1. Index chrM.fa if not already indexed (chrM.fa.fai).
+2. For each sample:
+   - Map reads using bwa mem to chrM.fa.
+   - Sort BAM and index it (samtools sort, samtools index).
+   - Call variants using lofreq or bcftools mpileup + bcftools call. Since lofreq is in the inventory, I can use it, but bcftools is standard. The prompt says "lofreq" is available. I'll stick to bcftools for variant calling as it's robust and standard, or lofreq if preferred. Actually, lofreq is good for amplicon data. But bcftools is simpler and less prone to parameter issues in a script. I'll use bcftools mpileup + call, or just lofreq. Let's use bcftools for simplicity and reliability, or follow the plan: "bwa → samtools → lofreq → bcftools → awk". The plan explicitly says lofreq. I'll use lofreq variant calling. Wait, lofreq requires a reference index (.fai) and .amb/.ann files? Actually, lofreq needs `lofreq call` which takes a BAM and reference. It handles indexing internally or expects it. I'll just use bcftools mpileup + call to be safe, or follow the plan's suggestion. The plan says "Recommended tool sequence: bwa → samtools → lofreq → bcftools → awk". I'll stick to bcftools for variant calling as it's standard and less finicky in scripts, but I can also use lofreq. Actually, `lofreq call` is straightforward. Let's use `bcftools mpileup -f data/ref/chrM.fa results/{sample}.bam | bcftools call -mv -Oz -o results/{sample}.vcf.gz`. This is robust.
+   Wait, the prompt says "Recommended tool sequence: bwa → samtools → lofreq → bcftools → awk". I'll follow it or just use bcftools. I'll use bcftools for variant calling as it's standard. Actually, lofreq is fine too. I'll stick to bcftools for simplicity.
+   Let's check lofreq syntax: `lofreq call -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam`. Then compress with bgzip and index with tabix.
+   Actually, bcftools is easier: `bcftools mpileup -f data/ref/chrM.fa results/{sample}.bam | bcftools call -mv -Oz -o results/{sample}.vcf.gz`
+   I'll use bcftools.
+
+3. Collapse VCFs into a single TSV with columns: sample, chrom, pos, ref, alt, af.
+   Use `bcftools query` or `awk` on each VCF.GZ to extract these fields, then combine.
+   `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\n' results/{sample}.vcf.gz | awk ...` wait, AF might be in INFO/AF or FORMAT/GT. For haploid chrM, it's usually just the alt allele frequency. I'll use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\n'`. If AF is missing, maybe use `%INFO/AF` or compute from DP/AD. But for simplicity, `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\n'` works if AF is present. Alternatively, `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`.
+   Actually, a safer way for collapsed table: use `bcftools query -f '%ID\t%CHROM\t%POS\t%REF\t%ALT\t%QUAL\t%FILTER\t%INFO/AF\n'` but we only need sample, chrom, pos, ref, alt, af.
+   I'll use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\n'` and handle missing AF by defaulting to 0 or leaving empty? The prompt says columns: sample chrom pos ref alt af. I'll just extract them.
+   Wait, chrM is haploid, so AF might be in INFO or FORMAT. I'll use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\n'`. If it's missing, I can compute from DP/AD or just leave it. Actually, `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'` is fine.
+   Alternatively, use `awk` to parse VCF directly if bcftools query is tricky with AF format. But bcftools query is standard.
+   Let's stick to `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\n'`. If AF is not present, it might be empty. I'll add a fallback or just use `%INFO/AF`.
+   Actually, for amplicon data, `bcftools mpileup` outputs INFO/AF. So `%INFO/AF` works.
+   I'll construct the collapsed.tsv by looping over samples, querying each VCF.GZ, and appending to results/collapsed.tsv with a header.
+
+Let's draft the script carefully.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+REF="data/ref/chrM.fa"
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+# Index reference if needed
+if [[ ! -f "${REF}.fai" ]]; then
+    samtools faidx "$REF"
+fi
+
+mkdir -p results
+
+for S in "${SAMPLES[@]}"; do
+    BAM="results/${S}.bam"
+    VCF="results/${S}.vcf.gz"
+
+    # Mapping
+    if [[ ! -f "$BAM" ]]; then
+        bwa mem -t 4 "$REF" "data/raw/${S}_1.fq.gz" "data/raw/${S}_2.fq.gz" | \
+            samtools sort -@ 4 -o "$BAM" -
+    fi
+
+    # BAM indexing
+    if [[ ! -f "${BAM}.bai" ]]; then
+        samtools index "$BAM"
+    fi
+
+    # Variant calling
+    if [[ ! -f "$VCF" ]]; then
+        bcftools mpileup -f "$REF" -Ou "$BAM" | \
+            bcftools call -mv -Oz -o "$VCF"
+    fi
+
+    # VCF indexing
+    if [[ ! -f "${VCF}.tbi" ]]; then
+        tabix -p vcf "$VCF"
+    fi
+done
+
+# Collapse VCFs into TSV
+COLLAPSED="results/collapsed.tsv"
+if [[ ! -f "$COLLAPSED" ]]; then
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"
+    for S in "${SAMPLES[@]}"; do
+        VCF="results/${S}.vcf.gz"
+        bcftools query -f "%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$VCF" | \
+            awk -v s="$S" '{print s"\t"$0}' >> "$COLLAPSED"
+    done
+fi
+```
+
+Wait, `bcftools query` with `%INFO/AF` might output multiple values if there are multiple alt alleles. The prompt says columns: sample chrom pos ref alt af. Usually, for single alt, it's fine. If multiple alts, AF might be comma-separated. I'll keep it simple. Alternatively, use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\n'` which is standard.
+Actually, `bcftools mpileup` + `call` outputs INFO/AF. So `%INFO/AF` is correct.
+To be robust against missing AF or multiple alts, I could just use `%INFO/AF`. It's fine for this task.
+
+Check idempotency: The script checks for file existence before running each step. This makes it idempotent.
+Check paths: All relative to cwd. `data/raw/`, `data/ref/`, `results/`.
+Check tools: bwa, samtools, bcftools, tabix, awk are all in inventory.
+Check threads: `-t 4` and `-@ 4` used.
+Check output format: collapsed.tsv has header and columns sample chrom pos ref alt af.
+One minor thing: `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'` might print empty lines for filtered variants or no-call sites. I should probably filter out lines where AF is empty or variant is filtered, but the prompt doesn't specify filtering. I'll assume standard VCF output is fine. To be safe, I can add `grep -v '^$'` or just let it be. Actually, `bcftools query` skips header and filters by default? No, it prints all records unless `-i` is used. I'll leave it as is.
+
+Wait, `bcftools mpileup` might output sites with no variant (depth > 0). `bcftools call -mv` outputs only variants. So VCF.GZ contains only variant sites. That's good.
+The AF column might be missing for some variants if not computed, but usually it is. I'll stick with `%INFO/AF`.
+
+Let's verify the `bcftools query` format string. `%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n` works in bcftools 1.21.
+Actually, for haploid chrM, AF might be in FORMAT/AD or just INFO/AF. I'll use `%INFO/AF`. If it's empty, it prints nothing. That's acceptable.
+
+One detail: `samtools sort -@ 4 -o "$BAM" -` might need `-m` option for memory, but default is fine.
+Also, `bwa mem` output is SAM. Piping to samtools sort is standard.
+Idempotency: The `if [[ ! -f ... ]]` checks ensure reruns skip work.
+The script should be strictly bash.
+
+Let's refine the script to ensure it meets all constraints.
+- First line: #!/usr/bin/env bash
+- Second line: set -euo pipefail
+- No absolute paths outside cwd.
+- Use only listed tools.
+- Wall-clock < 600s at THREADS=4. (chrM is tiny, so it will be very fast).
+- Output format matches exactly.
+
+One potential issue: `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'` might output multiple AF values separated by commas if there are multiple alts. The prompt says "alt" and "af" columns, implying one alt per row or comma-separated is fine. I'll keep it simple.
+
+Another point: `bcftools mpileup -f "$REF" -Ou "$BAM"` might complain about unsorted BAM? `samtools sort` produces sorted BAM by default. So it's fine.
+Actually, `bcftools mpileup` requires coordinate-sorted BAM. `samtools sort` does that.
+
+Let's check `lofreq` vs `bcftools`. The plan says "Recommended tool sequence: bwa → samtools → lofreq → bcftools → awk". I'll stick to bcftools as it's standard and less prone to environment issues, but if the prompt explicitly recommends lofreq, maybe I should use it? The prompt says "Recommended tool sequence... Design and implement the workflow yourself, using only the tools above." It's a recommendation, not a strict requirement. I'll use bcftools for variant calling as it's more robust in scripts. Actually, I'll follow the recommendation just in case: `lofreq call -f "$REF" -o results/${S}.vcf results/${S}.bam`. Then compress with bgzip and index with tabix. But lofreq outputs VCF directly. I'll stick to bcftools for simplicity and reliability. The prompt says "Recommended tool sequence", not mandatory.
+
+Wait, `bcftools query` might output `.` for AF if not present. That's fine.
+I will add `grep -v '^$'` to the collapsed.tsv generation to avoid empty lines from bcftools query when AF is missing or filtered. Actually, `bcftools query` skips header and filters by default? No, it prints all records in the VCF. Since we used `bcftools call -mv`, only variants are in VCF. So it's fine.
+
+Let's construct the final script carefully.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+REF="data/ref/chrM.fa"
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Index reference if not present
+if [[ ! -f "${REF}.fai" ]]; then
+    samtools faidx "$REF"
+fi
+
+for S in "${SAMPLES[@]}"; do
+    BAM="results/${S}.bam"
+    VCF="results/${S}.vcf.gz"
+
+    # Mapping & sorting
+    if [[ ! -f "$BAM" ]]; then
+        bwa mem -t 4 "$REF" "data/raw/${S}_1.fq.gz" "data/raw/${S}_2.fq.gz" | \
+            samtools sort -@ 4 -o "$BAM" -
+    fi
+
+    # BAM indexing
+    if [[ ! -f "${BAM}.bai" ]]; then
+        samtools index "$BAM"
+    fi
+
+    # Variant calling
+    if [[ ! -f "$VCF" ]]; then
+        bcftools mpileup -f "$REF" -Ou "$BAM" | \
+            bcftools call -mv -Oz -o "$VCF"
+    fi
+
+    # VCF indexing
+    if [[ ! -f "${VCF}.tbi" ]]; then
+        tabix -p vcf "$VCF"
+    fi
+done
+
+# Collapse to TSV
+COLLAPSED="results/collapsed.tsv"
+if [[ ! -f "$COLLAPSED" ]]; then
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"
+    for S in "${SAMPLES[@]}"; do
+        VCF="results/${S}.vcf.gz"
+        bcftools query -f "%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$VCF" | \
+            awk -v s="$S" '{print s"\t"$0}' >> "$COLLAPSED"
+    done
+fi
+```
+
+Wait, `bcftools query` might output multiple AF values separated by commas if there are multiple alts. The prompt says "alt" column, which in VCF is comma-separated for multiple alts. So it's consistent.
+One thing: `bcftools mpileup` on chrM might produce many sites with depth but no variant if not filtered properly, but `-mv` handles that.
+Also, `bcftools query -f "%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"` might output empty AF for some variants. I'll add a filter to only include lines where AF is present, or just leave it. It's fine.
+
+Let's check if `samtools sort` needs `-m` or `-T`. Default is fine.
+Check `bwa mem` parameters: `-t 4` is correct.
+Check file names: `M117-bl_1.fq.gz` etc. match the prompt.
+Check reference: `data/ref/chrM.fa` matches.
+Check outputs: `results/{sample}.bam`, `.bai`, `.vcf.gz`, `.tbi`, `collapsed.tsv`. All match.
+Idempotency: Checked with `if [[ ! -f ... ]]`.
+No absolute paths outside cwd.
+Tools used: bwa, samtools, bcftools, tabix, awk. All in inventory.
+Wall-clock: chrM is 16kb, 4 samples, very fast. Well under 600s.
+Output format: header matches exactly. Columns match exactly.
+
+One minor adjustment: `bcftools query` might output `.` for AF if not computed. I'll keep it as is. If needed, I could use `%AF` instead of `%INFO/AF`, but `%INFO/AF` is safer for mpileup+call output. Actually, `bcftools call` puts AF in INFO by default. So `%INFO/AF` is correct.
+
+Wait, `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\n'` is also valid and might be simpler. I'll stick with `%INFO/AF`.
+
+Let's verify the exact column names in the prompt: "sample  chrom  pos  ref  alt  af". My header: `sample\tchrom\tpos\tref\talt\taf`. Matches.
+
+One thing: `bcftools query` might print empty lines if AF is missing. I'll add `grep -v '^$'` or just let it be. It's fine.
+
+I will make sure the script uses `#!/usr/bin/env bash` and `set -euo pipefail` exactly as requested.
+I'll also ensure no extra output is printed. The prompt says "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." So I won't add any echo/printf except for the header in collapsed.tsv generation, which is necessary for the file content. Actually, `printf` is fine.
+
+Wait, `bcftools query` might output multiple values for ALT and AF separated by commas. That's standard VCF format. The prompt says "alt" and "af", so comma-separated is acceptable.
+
+One detail: `samtools sort` might produce a `.bam.bai` directly if I use `samtools index`, but the prompt asks for `results/{sample}.bam.bai`. `samtools index` creates `.bai` next to BAM. So `results/{sample}.bam.bai` will exist.
+
+All good.
+
+Let's double check the `bcftools query` format string. In bcftools 1.21, `%INFO/AF` works. Alternatively, `%AF` works if it's in FORMAT. I'll use `%INFO/AF`.
+Actually, to be extremely safe against missing AF or formatting issues, I could just use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\n'`. But `%INFO/AF` is explicit.
+
+I'll write the script now.
+One minor point: `bcftools mpileup -f "$REF" -Ou "$BAM"` might complain if BAM is not sorted, but it is. It's fine.
+I'll add `-l 16569` to bcftools call? Not necessary for chrM.
+The script looks solid.
+
+Final check of the prompt: "results/{sample}.bam", "results/{sample}.bam.bai", "results/{sample}.vcf.gz", "results/{sample}.vcf.gz.tbi", "results/collapsed.tsv".
+All match.
+"collapsed.tsv must have columns (tab-separated, with header): sample  chrom  pos  ref  alt  af"
+Matches.
+"Assume the current working directory contains data/raw/ ... and data/ref/ ..."
+Matches.
+"Write all outputs under results/ (relative to cwd)."
+Matches.
+"Be idempotent..."
+Matches.
+"Do not hardcode any path outside the current working directory."
+Matches.
+"Use only tools listed in TOOL_INVENTORY."
+Matches.
+"Total wall-clock must be under 600 seconds at THREADS=4."
+Matches.
+"Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose."
+Matches.
+
+One thing: `bcftools query` might output `.` for AF if it's missing. That's fine.
+I will produce the script exactly as requested.
+No extra text.
+Ready. 
+Let's generate. 
+Wait, should I use `lofreq` as recommended? The prompt says "Recommended tool sequence: bwa → samtools → lofreq → bcftools → awk". It's a recommendation. I'll stick to bcftools for variant calling as it's more standard and less prone to parameter issues in a constrained environment. But if they explicitly recommend lofreq, maybe I should use it? Actually, the plan says "Recommended tool sequence... Design and implement the workflow yourself". I'll follow bcftools mpileup+call as it's robust. If I want to be safe, I could use `lofreq call -f "$REF" -o results/${S}.vcf results/${S}.bam` then `bgzip` and `tabix`. But bcftools is fine. I'll stick with bcftools.
+
+Actually, `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\n'` might be better because `%INFO/AF` could be empty for some callers. I'll use `%AF`. But in mpileup+call, AF is in INFO. So `%INFO/AF` is correct.
+
+I'll proceed.
+One minor adjustment: `bcftools query` might output multiple lines per site if there are multiple alts? No, one line per site.
+All good.
+Script generation. 
+Output matches constraints exactly.
+Proceeds. 
+(Self-Correction/Refinement during thought)
+Wait, `bcftools mpileup` on chrM might produce sites with depth but no variant if not filtered. `bcftools call -mv` filters them. So VCF only has variants.
+The collapsed.tsv should probably exclude sites where AF is missing or `.`. I'll add a simple filter in awk: `awk -v s="$S" '$0 != "" {print s"\t"$0}'` to avoid empty lines. Or just let it be. It's fine.
+I'll keep it simple.
+
+Final script:
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+REF="data/ref/chrM.fa"
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+if [[ ! -f "${REF}.fai" ]]; then
+    samtools faidx "$REF"
+fi
+
+for S in "${SAMPLES[@]}"; do
+    BAM="results/${S}.bam"
+    VCF="results/${S}.vcf.gz"
+
+    if [[ ! -f "$BAM" ]]; then
+        bwa mem -t 4 "$REF" "data/raw/${S}_1.fq.gz" "data/raw/${S}_2.fq.gz" | \
+            samtools sort -@ 4 -o "$BAM" -
+    fi
+
+    if [[ ! -f "${BAM}.bai" ]]; then
+        samtools index "$BAM"
+    fi
+
+    if [[ ! -f "$VCF" ]]; then
+        bcftools mpileup -f "$REF" -Ou "$BAM" | \
+            bcftools call -mv -Oz -o "$VCF"
+    fi
+
+    if [[ ! -f "${VCF}.tbi" ]]; then
+        tabix -p vcf "$VCF"
+    fi
+done
+
+COLLAPSED="results/collapsed.tsv"
+if [[ ! -f "$COLLAPSED" ]]; then
+    printf "sample\tchrom\tpos\tref\talt\taf\n" > "$COLLAPSED"
+    for S in "${SAMPLES[@]}"; do
+        VCF="results/${S}.vcf.gz"
+        bcftools query -f "%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$VCF" | \
+            awk -v s="$S" 'NF {print s"\t"$0}' >> "$COLLAPSED"
+    done
+fi
+```
+This looks solid. `NF` in awk ensures we skip empty lines.
+All constraints met.
+Output matches exactly.
+Proceeds. 
+One detail: `bcftools query -f "%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"` might output `.` for AF if missing. That's fine.
+The script is ready.
+I will output only the script.
+No markdown fences.
+Done. 
+Let's verify the exact column names in the prompt: "sample  chrom  pos  ref  alt  af". My header matches.
+All good. 
+Output generation. 
+[Done] 
+(Self-Correction/Verification during generation prep)
+Wait, `bcftools query` format string uses `%` not `$`. I used `%CHROM\t...` which is correct for bcftools.
+The prompt says "collapsed.tsv must have columns (tab-separated, with header): sample  chrom  pos  ref  alt  af".
+My printf: `printf "sample\tchrom\tpos\tref\talt\taf\n"` matches.
+All good.
+Proceeds. 
+Output matches request.
+Final check of the prompt: "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." -> I used `printf` for header, which is necessary for file content, not user-facing prose. It's fine.
+All constraints satisfied.
+Outputting script. 
+[Done]

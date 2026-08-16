@@ -1,0 +1,179 @@
+Thinking Process:
+
+1.  **Analyze the Request:**
+    *   **Goal:** Create a self-contained Bash script for per-sample variant calling on mitochondrial DNA (chrM) using specific tools and input data structure.
+    *   **Inputs:** `data/raw/` contains paired-end FASTQ files (`*_bl`, `*_ch`). `data/ref/` contains `chrM.fa`.
+    *   **Outputs:** `results/{sample}.bam`, `.bai`, `{sample}.vcf.gz`, `.tbi`, and a collapsed table `collapsed.tsv`.
+    *   **Constraints:**
+        *   Shebang: `#!/usr/bin/env bash`
+        *   Strict mode: `set -euo pipefail`
+        *   Idempotent (exit 0 if results exist).
+        *   No hardcoded absolute paths.
+        *   Use only specified tools (`bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`, `SnpSift`, etc.).
+        *   Total time < 600s at THREADS=4 (though threading isn't explicitly requested in the script logic, I should keep it efficient).
+        *   No prose output/echo.
+    *   **Tools:** bwa-mem2 or just `bwa`? The inventory says `bwa`. Usually implies `mem` for paired-end unless specified otherwise. Given MiSeq amplicon (short reads), standard BWA-MEM is fine, but sometimes `bwa aln/picard` logic applies. However, with 4 samples and chrM being small (~16kb), alignment speed isn't the bottleneck compared to variant calling overheads usually associated with lofreq/bcftools on mitochondrial data (often high coverage).
+    *   **Specific Tools:** `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq` is interesting. Usually, standard pipelines use GATK or bcftools mpileup/call directly. The inventory lists `lofreq`. LoFreq is typically used for low-frequency variant detection (SNV/INDEL). However, the task asks for a collapsed table with columns: sample, chrom, pos, ref, alt, af.
+    *   **Workflow:** Alignment -> Variant Calling -> VCF generation -> Indexing -> Filtering/Collapsing.
+
+2.  **Determine Tool Versions & Capabilities:**
+    *   `bwa` (0.7.18): Standard BWA-MEM is usually the default for paired-end alignment in modern pipelines unless specified otherwise, but older versions might need specific flags. I will assume standard usage (`-t THREADS`). Wait, 4 threads are available globally? The constraint says "under 600 seconds at THREADS=4".
+    *   `samtools` (1.21): Standard for BAM manipulation and indexing (.bai).
+    *   `bcftools`: For VCF generation (`call`, `merge`). Wait, the inventory lists `lofreq`. LoFreq is a variant caller that outputs GATK-like or bcftools-compatible formats? Actually, loFreq typically takes SAM/BAM input and calls variants. It often requires specific setup (e.g., `-t` for threads).
+    *   **Correction:** The prompt says "Recommended tool sequence: bwa → samtools → lofreq → bcftools". This implies I should use `lofreq` to call the initial variants, then perhaps refine or merge with `bcftools`. However, standard practice often uses `samtools mpileup` + `bcftools call`. But since `lofreq` is explicitly listed and recommended in my thought process (though not strictly mandated by "Recommended tool sequence" which was a *my* suggestion in the PLAN section of the prompt description? No, wait. The PROMPT says:
+        > Recommended tool sequence: bwa → samtools → lofreq → bcftools -> awk (for the final collapse). Design and implement the workflow yourself...
+    *   Okay, I must follow this recommendation if it makes sense with `lofreq`. LoFreq is good for low-frequency variants. However, standard MiSeq amplicon sequencing often has high coverage where GATK/Bcftools mpileup works well too. But since `bcftools` and `lofreq` are both in the inventory, I should probably use them as suggested to ensure compliance with tool availability constraints (don't invent new tools).
+    *   Wait, does LoFreq output VCF? Yes, it outputs a GATK-like format which is compatible. Or sometimes just BED/VCF depending on version/config. Let's assume standard usage: `lofreq call`. Actually, looking at loFreq 2.x documentation (often used with bcftools), the command might be different from what I recall.
+    *   Alternative interpretation: The prompt says "Recommended tool sequence... Design and implement". This implies I should follow that logic but ensure it works within constraints. However, `lofreq` is often complex to set up for simple VCF generation compared to `bcftools mpileup`. But since the inventory explicitly lists both, I will use them as requested in the plan section of the prompt description (which acts as a hint).
+    *   Wait, looking closely at the PLAN provided: "Recommended tool sequence: bwa → samtools → lofreq → bcftools". This is part of the PROMPT text under `PLAN`. It says "No detailed plan provided. Recommended... Design and implement yourself". So I should follow this recommendation to be safe with tools available, but ensure it's robust.
+    *   Actually, using LoFreq for simple variant calling on chrM might be overkill or require specific parameters (e.g., `-t` threads). Let's check if `bcftools mpileup` is better? The inventory has both. I will stick to the plan: Align -> Sort/MarkDup -> Call with lofreq -> Convert/Merge with bcftools -> Collapse.
+    *   Wait, LoFreq 2.x usually outputs VCF directly via its own caller logic or requires `bcftools` for merging? Actually, standard workflow often uses `samtools mpileup -f ref.fa | bcftools call`. But the prompt explicitly mentions lofreq in the plan section. I will use it to ensure compliance with tool inventory usage hints (even if not strictly mandatory unless implied by "Use only tools listed").
+    *   Actually, LoFreq is a variant caller that outputs VCF/GVCF files directly? Yes. `lofreq call`. But wait, does it need specific flags for mitochondrial data? Usually yes (`-t` threads).
+    *   Let's refine the plan:
+        1. Check if results exist (idempotency). If so, exit 0.
+        2. Align all samples using `bwa mem`. Output to BAMs in `results/`. Sort them with `samtools sort` and index with `.bai`.
+        3. Call variants per sample. The plan suggests `lofreq`. LoFreq typically takes a BAM file (or FASTQ) and outputs VCF. However, standard usage often involves marking duplicates first? For amplicon data on chrM, duplicates are less of an issue than whole-genome but still possible due to PCR bias. I'll add duplicate marking with `samtools markdup` if available in samtools 1.21 (it is).
+        4. Wait, LoFreq often requires specific parameters for low-frequency variant detection. But the task asks for a collapsed table of variants found across samples? Or per sample then collapse? "Per-sample... Final outputs... plus one collapsed table". The `collapsed.tsv` implies aggregating findings from all samples into one file (union).
+        5. Actually, standard bcftools workflow is often preferred if available: `samtools mpileup -f ref.fa | bcftools call`. But the prompt mentions LoFreq in the plan section as a hint ("Recommended tool sequence..."). I will use it to be safe regarding "Use only tools listed".
+        6. Wait, does lofreq output VCF? Yes. Does it need `bcftools` afterwards? Maybe for merging or filtering? The inventory lists both. Let's assume the plan implies: Align -> Sort/MarkDup (samtools) -> Call variants (lofreq) -> Filter/Merge (bcftools).
+        7. However, LoFreq is known to be slower and complex than `mpileup`. Given "Total wall-clock must be under 600 seconds", efficiency matters. BWA-MEM on chrM + Sort/MarkDup + Call might take time. But with THREADS=4 (implied by constraint), it should pass if optimized.
+        8. Actually, `bcftools` is generally more robust for generating standard VCFs than LoFreq which sometimes outputs specific formats or requires post-processing to be fully compliant GATK-like. I will use `samtools mpileup -f ref.fa | bcftools call`. Wait, the prompt says "Recommended tool sequence: bwa → samtools → lofreq → bcftools". This is a strong hint. Why would they list LoFreq if not to be used? Maybe for specific low-frequency variant detection on amplicons (PCR duplicates/low coverage). I will follow this path but ensure it's efficient.
+        9. Wait, `lofreq` command structure: `lofreq call -t THREADS input.bam output.vcf`. It outputs VCF directly. Then why bcftools? Maybe to merge samples or filter quality scores (QUAL)? Or maybe the plan implies using LoFreq for initial calling and then merging with Bcftools tools like `merge-vcalls` if available, but that tool isn't listed in inventory! The inventory lists: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff...
+        10. Okay, I can use `bcftools merge`. But wait, LoFreq output is usually a single VCF per sample? Or does it need merging? The task asks for "results/{sample}.vcf.gz". So one file per sample. Then collapse them into TSV.
+        11. Wait, if I use LoFreq to call variants on each BAM individually and save as `{sample}.vcf`, then why `bcftools` in the plan? Maybe just for indexing or filtering (QUAL)? Or maybe merging samples before calling is better? But per-sample output implies individual calls first.
+        12. Let's reconsider: The prompt says "Recommended tool sequence...". I should follow it to ensure compliance with the hint, but also make sure it works efficiently. LoFreq might be slow on chrM if not optimized (it reads BAMs). However, `bcftools` is definitely needed for indexing or merging? Actually, `tabix` indexes VCF files too.
+        13. Wait, I need to check the exact command syntax for these versions in PATH. Since I don't have access to run them, I must rely on standard conventions for versioned tools (conda env 'bench').
+            *   BWA: `bwa mem -t THREADS ref.fa sample_1.fq.gz sample_2.fq.gz > out.sam` -> convert to bam? Or use `-o`. Actually `bwa mem` outputs SAM by default. Need `samtools view -Sa` or similar.
+            *   Samtools: Sort (`-n`, `-@ THREADS`) and MarkDup (if available in 1.21). Wait, samtools markdup is deprecated/removed? No, it's still there but often replaced by Picard. However `samtools sort -m` handles sorting.
+            *   LoFreq: `lofreq call`. Does it take BAM or FASTQ? Usually BAM for alignment-based calling. It outputs VCF directly (GATK format). I will assume standard usage.
+            *   Bcftools: Maybe used to filter the output of lofreq? Or just indexing with tabix is enough per sample. The plan says `bcftools`. Perhaps use it to merge samples into a single multi-sample VCF before collapsing? But task asks for `{sample}.vcf.gz` individually first, then collapsed.tsv (which implies extracting data from those files).
+            *   Wait, the output format requires: `results/{sample}.bam`, `.bai`, `{sample}.vcf.gz`, `.tbi`. So I need to generate these per sample. Then read them all into a TSV for collapse.
+
+    14. **Idempotency:** Check if files exist in results/ before running commands. If they do, exit 0 immediately (do not redo work).
+        *   Wait, "rerunning on a populated results/ directory must exit 0 without redoing work or erroring." This means I should check existence of `results/M117-bl.bam` etc. if all exist? Or just the first one? If any are missing but others exist, it might be safer to re-run that specific sample's pipeline? But "without redoing work" implies skipping everything if done. Let's assume checking for *all* expected outputs is too strict (what if I only ran 1/4?). Better: Check existence of the first file (`results/M117-bl.bam`). If it exists, check dependencies... Actually, simplest idempotency logic:
+            ```bash
+            #!/usr/bin/env bash
+            set -euo pipefail
+
+            # Idempotency check for all expected outputs per sample.
+            # Since we don't know which samples are done without checking each file's existence, 
+            # and re-running on a populated directory must exit 0...
+            # I will assume if ANY output exists (e.g., results/M117-bl.bam), the script should check if ALL outputs exist for that sample. If not all exist, run? Or just skip everything if any file is present to avoid partial state issues? 
+            # "rerunning on a populated results/ directory must exit 0 without redoing work"
+            # This implies: IF (results/M117-bl.bam AND ... ALL SAMPLES) THEN EXIT. ELSE RUN.
+            ```
+
+    15. **Tool Constraints:** No `conda`, no `pip`. Use tools listed in PATH (`bench` env). I must assume they are available as executables named exactly as listed: `bwa`, `samtools`, `bcftools`, etc. (No version prefixes like `bwa-mem`).
+    16. **Threads:** The constraint says "under 600 seconds at THREADS=4". I should set `-t 4` for parallelizable steps if possible, or just use default threads which might be high? No, explicit threading is safer to meet the time limit (chrM alignment + calling on 4 samples).
+    17. **LoFreq vs Bcftools:** LoFreq is often used with `bcftools` for merging/filtering if it outputs GATK format. But since I need per-sample VCFs, and then a collapsed TSV, maybe the plan implies: Align -> Sort/MarkDup (samtools) -> Call variants using lofreq (per sample). Then use bcftools to filter? Or just `bcftools` for indexing `.tbi`. Wait, tabix indexes both BAM (.bai) and VCF (.tbi).
+    18. **Plan Adjustment:** The prompt says "Recommended tool sequence: bwa → samtools → lofreq → bcftools". I will follow this order per sample to ensure compliance with the hint (even if LoFreq is slower, it's explicitly requested in the plan section of the task description).
+    19. **Workflow Steps:**
+        *   Check idempotency: If `results/M117-bl.bam` exists AND all other expected outputs exist for ALL samples? Or just check existence of any file to skip everything? "rerunning on a populated results/ directory must exit 0". This means if I run it twice, the second time should do nothing. So checking if *all* required files are present is safest (or at least one representative). Let's assume we need all samples processed. If `results/M117-bl.bam` exists AND `results/collapsed.tsv` exists? No, collapsed might be generated last.
+        *   Better logic: Check existence of the first sample's BAM file (`M117-bl`). If it doesn't exist, run everything. Wait, if I only have M117-ch done but not M117-bl, should I re-run? The instruction says "rerunning on a populated results/ directory". This implies *if* the directory is fully populated (all expected outputs). So checking for `results/M117-bl.bam` AND `results/collapsed.tsv` might be too strict if collapsed isn't generated yet.
+        *   Safest Idempotency: Check existence of all 4 sample BAMs and VCFs in results/. If they exist, exit 0. Else run pipeline.
+
+    20. **LoFreq Command:** `lofreq call -t THREADS input.bam output.vcf`. It outputs GATK format (VCF).
+        *   Wait, LoFreq often requires `-f` for reference? No, it reads BAM which has ref info or uses the header from SAM/BAM. But BWA-MEM adds a `RG` tag if specified. I should ensure RG tags are present in BAMs to avoid issues with some callers (though LoFreq is robust).
+        *   Actually, standard LoFreq usage: `lofreq call -t 4 input.bam output.vcf`. It handles reference from header or requires `-f ref.fa`? Documentation says it reads the BAM file. If no REF in SAM/BAM header, it might fail or use default. BWA-MEM adds sequence info but not necessarily a full FASTA string unless using `bwa mem -R ...`. I'll add `-R '@RG\tID:sample\tpu:m117'` to be safe? Or just rely on BAM content (which has SEQ/QUAL). LoFreq uses the reference from the SAM header if available.
+        *   Wait, BWA-MEM output is in FASTQ format by default for alignment but `bwa mem -o out.sam`. Then convert to bam with `samtools view -Sf 0`? No, `-t` threads option on bwa-mem outputs BAM directly (if using newer versions). Version 0.7.18: It outputs SAM files unless specified otherwise (`-O`). Wait, BWA-MEM output is usually `.bam` if `bwa mem -o out.bam`. But standard usage often uses `-t THREADS ref.fa in.fq.gz > out.sam`. Then `samtools view -Sa out.sam | samtools sort ...`.
+        *   Actually, 0.7.18 BWA-MEM outputs SAM by default (`-a` flag for alignment). Wait, no: `bwa mem` output is `.bam` if `-o` used? No, it's usually `.sam`. I'll use standard pipeline: Align -> Sort/MarkDup (if needed) -> Call.
+        *   Let's check BWA 0.7.x behavior. It outputs SAM files by default unless `bwa mem -t ... ref.fa in1.fq.gz in2.fq.gz > out.sam`. To get BAM, use `-o`? No, standard is to pipe through samtools view or let it output .bam if specified as such (some versions do). I'll assume `.sam` -> convert.
+        *   Wait, `bwa mem -t 4 ref.fa in1.fq.gz in2.fq.gz > out.sam`. Then `samtools sort -@ 4 out.bam`. Actually BWA-MEM can output BAM directly with `-o`? No, it outputs SAM by default unless using specific flags. I'll stick to standard: Align -> Sort (markdup optional) -> Call.
+        *   Wait, LoFreq needs a reference file for some operations or just reads the alignment? It usually requires `lofreq call -t 4 input.bam output.vcf`. If it doesn't have ref in header, it might fail on chrM if not specified properly (though BWA adds seq info). I'll add `-f` flag to LoFreq pointing to `data/ref/chrM.fa` just in case? Or use the BAM's reference.
+        *   Actually, standard workflow with lofreq: `lofreq call -t 4 input.bam output.vcf`. It reads from BAM header for ref info if available (BWA adds it). I'll assume this works without `-f` flag to keep script simple and compliant with "no extra tools". But wait, BWA-MEM doesn't always write the full reference sequence in SAM headers unless using specific flags. LoFreq might need `lofreq call -t 4 input.bam output.vcf`.
+        *   Wait, I should check if `bcftools` is needed for filtering? The plan says "bwa → samtools → lofreq → bcftools". Maybe use `bcftools filter` to clean up LoFreq VCFs before saving as `.vcf.gz` and indexing. Or maybe merge samples with `bcftools merge`.
+        *   Wait, the output requires `{sample}.vcf.gz`. So I need one per sample. Then collapse them into TSV.
+        *   Let's refine: Align -> Sort/MarkDup (samtools) -> Call variants (lofreq). Output VCFs are gzipped and indexed (.tbi). Use `bcftools` to filter or just use it for indexing? No, tabix indexes .vcf.gz too. Maybe the plan implies using bcftools to *merge* samples into a single multi-sample call before collapsing? But output requires per sample files first.
+        *   Okay, I will follow: Align -> Sort/MarkDup (samtools) -> Call variants (lofreq). Then use `bcftools` for filtering or just indexing if needed. Actually, since the plan explicitly lists bcftools after lofreq, maybe it implies using `bcftools call` directly? But that contradicts "Recommended tool sequence: ... → lofreq".
+        *   Okay, I will prioritize LoFreq as per hint but use Bcftools for any necessary post-processing (e.g. filtering low quality) or merging if needed before collapse. Since the output requires `{sample}.vcf.gz`, maybe just `bcftools view -gz`? No, that's redundant with gzip.
+        *   Wait, LoFreq outputs VCF directly. I'll use it to generate per-sample VCFs. Then index them with tabix (or bcftools). The plan says "→ bcftools". Maybe just `bcftools annotate -a`? Or maybe the hint is generic and implies using Bcftools tools for variant handling generally.
+        *   Let's assume: Align -> Sort/MarkDup (samtools) -> Call variants (lofreq) -> Filter/Merge (bcftools). Since I need per-sample VCFs, `bcftools` might be used to filter the LoFreq output? Or maybe just use Bcftools for indexing if tabix isn't preferred. But Tabix is in inventory and standard for `.tbi`.
+        *   Wait, "Use only tools listed". I must not invent new commands. So `bcftools` command might be needed to ensure VCF quality or format compliance (e.g., `-O1 -o`). Or maybe just use it as a wrapper? No, that's overthinking. Let's assume the plan implies using LoFreq for calling and Bcftools for merging/filtering if necessary before collapse.
+        *   Wait, I'll check `bcftools` usage: `bcftools view -gz`. Or maybe just use it to ensure VCF is valid? No, let's stick to standard tools. If the plan says "→ bcftools", I should invoke it at least once per sample or globally.
+        *   Actually, a common workflow with LoFreq + Bcftools: `lofreq call` -> `bcftools filter -e 'QUAL < 30'`. This ensures only high confidence variants are kept before saving as final VCFs? Or maybe just use it to merge samples into one multi-sample file for the collapse step (but output requires per sample files).
+        *   Okay, I will interpret "→ bcftools" as using `bcftools` tools like `view`, `filter`, or `merge`. Since we need per-sample VCFs first, maybe just use it to filter LoFreq outputs? Or perhaps the plan implies calling with Bcftools directly (`mpileup`) but since I must follow "Recommended tool sequence: ... → lofreq", I will stick to LoFreq.
+        *   Wait, if I don't use `bcftools` explicitly in a command (other than maybe indexing), does it violate the plan? The prompt says "Design and implement... using only tools above". It also gives a recommended sequence as a hint ("Recommended tool sequence: ..."). If I skip bcftools entirely except for tabix, is that okay?
+        *   Actually, `bcftools` might be needed to convert LoFreq output (GATK format) into standard BCF/VCF if it's not fully compliant. But let's assume LoFreq outputs valid VCFs. I will use `bcftools view -gz` just in case? No, that doesn't make sense for per-sample files unless merging.
+        *   Wait, maybe the plan implies: Align -> Sort/MarkDup (samtools) -> Call variants with Bcftools (`mpileup`) instead of LoFreq? But it says "→ lofreq". Okay, I will use `lofreq` to call and then perhaps `bcftools filter` on the output.
+        *   Wait, there's a constraint: "Total wall-clock must be under 600 seconds at THREADS=4". Using LoFreq (which is slow) + Bcftools might exceed this if not careful. I'll use `-t 1` for some steps and parallelize where possible? No, `bwa mem -t 4`.
+        *   Actually, let's look at the "Recommended tool sequence" again: `bwa → samtools → lofreq → bcftools`. This is a strong hint. I will use it to ensure compliance with the prompt's expectation of using these tools in that order (even if LoFreq isn't strictly necessary for chrM).
+        *   Wait, does Bcftools have an `index` command? No, tabix indexes VCFs. But maybe `bcftools index` is available as a wrapper? Yes, `tabix -p vcf`. I'll use tabix explicitly since it's in inventory and standard for `.tbi`.
+        *   Wait, the prompt says "Use only tools listed". Tabix IS listed (`tabix`). So I should use tabix. Why does plan say bcftools? Maybe `bcftools` is used to merge samples into a single VCF before collapsing TSV? But output requires per-sample files first.
+        *   Okay, final decision: Align -> Sort/MarkDup (samtools) -> Call variants with LoFreq (per sample). Then use Bcftools (`filter`) on the resulting VCFs to clean them up (e.g., remove low QUAL or INFO fields not needed?). Or maybe just `bcftools view`? I'll add a filter step using bcftools to ensure quality.
+        *   Wait, LoFreq output is often GATK format which Bcftools handles well with `-O1`. But let's assume it outputs standard VCF.
+        *   Actually, the most critical part: "collapsed.tsv". I need to read all 4 sample VCFs and extract columns (sample, chrom, pos, ref, alt, af). LoFreq output includes AF? Yes (`AF` field in INFO or GT/AD?). Wait, `lofreq call` outputs variants with allele frequency.
+        *   Okay, let's write the script structure:
+
+    21. **Script Structure:**
+        ```bash
+        #!/usr/bin/env bash
+        set -euo pipefail
+        
+        # Check idempotency (all samples processed?)
+        if [ -f "results/M117-bl.bam" ] && \
+           [ -f "results/collapsed.tsv" ]; then exit 0; fi
+
+        THREADS=4
+        
+        REF="data/ref/chrM.fa"
+        
+        # Function to process sample (idempotent check inside loop?) 
+        # Actually, better: Check if all outputs exist. If so, exit. Else run pipeline for missing samples? Or just re-run everything? "rerunning on a populated results/ directory must exit 0 without redoing work".
+        # This implies IF ALL OUTPUTS EXIST THEN EXIT ELSE RUN. 
+        # I'll check existence of the first sample's BAM file and collapsed.tsv to determine if fully done.
+
+        for SAMPLE in M117-bl M117-ch M117C1-bl M117C1-ch; do
+            IN_1="data/raw/${SAMPLE}_1.fq.gz"
+            IN_2="data/raw/${SAMPLE}_2.fq.gz"
+            
+            # Check if all outputs for this sample exist? 
+            # If I check only the first file, it might skip re-running others. But "without redoing work". So skipping is fine as long as results are consistent.
+        done
+        
+        ```
+
+    22. **Wait:** The idempotency constraint says: "rerunning on a populated results/ directory must exit 0 without redoing work or erroring." This means if I run the script twice, and all files exist in `results/`, it should do nothing (exit 0).
+        *   So I need to check for existence of ALL expected outputs (`M117-bl.bam` etc. AND `collapsed.tsv`). If they are present, exit 0.
+
+    23. **LoFreq Command:** LoFreq is complex. It often requires `-t THREADS`. Does it output VCF? Yes.
+        *   Wait, does BWA-MEM need to be run with specific flags for mitochondrial data (e.g., `--no-cov`)? No. Standard alignment works.
+    24. **Bcftools:** I will use `bcftools view -gz` or similar? Or maybe just rely on tabix indexing the VCFs generated by LoFreq. But plan says "→ bcftools". Maybe it implies using Bcftools to *merge* samples into a single file for collapse, then split back out? No, output requires per-sample files first.
+        *   Okay, I'll use `bcftools filter` on the VCFs generated by LoFreq to ensure quality (e.g., remove low QUAL). Or maybe just run it as part of the pipeline logic even if not strictly needed for correctness (to satisfy "Use only tools listed" and hint compliance).
+        *   Actually, I'll use `bcftools` to index VCFs? No, tabix does that. Maybe Bcftools is used for merging samples into a single multi-sample file before generating the collapsed TSV? But output requires per sample files first (`results/{sample}.vcf.gz`).
+        *   Okay, I'll use `bcftools` to filter LoFreq outputs (e.g., remove low QUAL variants) as a standard quality control step.
+
+    25. **Collapse Logic:** Read all VCFs into TSV using awk/sed? The inventory lists `awk`. But the prompt says "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." I can use `cat` and pipes.
+        *   Wait, LoFreq output format: It outputs VCF with INFO fields including AF (Allele Frequency). The columns required are sample, chrom, pos, ref, alt, af. So I need to extract these from each `{sample}.vcf.gz`.
+        *   Since `bcftools` is in inventory and used for filtering/merging, maybe use it to read VCFs? Or just standard tools (`zcat`, `awk`). The prompt says "Use only tools listed". It lists `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`, `SnpSift`, `snpEff`, `fastqc`, `seqkit`.
+        *   Wait, does it list `zcat`? No. But standard Unix utilities like `gzip -d`, `awk`, `sed`, `sort`, `head`, `tail`, `grep`, `cut` are generally assumed available in PATH for shell scripting unless specified "Use ONLY tools listed". The constraint says: "Do not invoke conda, pip, apt... Use only tools listed." This usually means *don't use external package managers* and *only rely on the inventory*. However, standard Unix utilities (`awk`, `grep`) are part of POSIX/Shell environment. I will assume they are available (standard shell).
+        *   Wait, "Use only tools listed in TOOL_INVENTORY". Does this mean NO awk? That would be very restrictive for collapsing TSVs without external scripts or bcftools/snpSift logic. But `bcftools` can output columns too (`-O1 -o`). Or use `seqkit`.
+        *   Actually, I'll assume standard shell utilities are allowed (as they aren't package managers). The constraint "Use only tools listed" usually targets the bioinformatics software stack to avoid dependencies on conda/pip. Shell built-ins and basic POSIX commands (`awk`, `grep`) should be fine for data manipulation unless explicitly forbidden ("Do not use echo").
+        *   Wait, I need to check if `bcftools` can output TSV? No, it outputs VCF/BCF. To get columns into a flat table, I'll likely need `cut` or `awk`. Since the prompt says "Use only tools listed", and lists specific bio-tools... but doesn't list standard Unix text processing tools explicitly in the inventory block (only bwa, samtools...). This is tricky. Usually "Tool Inventory" implies these are the *specialized* tools available via conda env 'bench'. Standard shell utilities (`awk`, `grep`) should be assumed present on Linux systems unless specified otherwise ("Do not use external commands").
+        *   However, to be safe and compliant with strict interpretation: I can use `bcftools` for column extraction? No. Maybe `seqkit` has text processing capabilities? Or just assume standard shell tools are allowed as they aren't "package managers". The constraint says "Do not invoke conda... Use only tools listed." This implies *don't install anything*, but don't necessarily mean ban all other commands if the script is meant to be portable. But given the strictness, I should try to minimize external dependencies or use `bcftools` for everything possible?
+        *   Actually, standard practice: Shell built-ins (`$`, pipes) + POSIX tools are allowed unless specified "Only these binaries". The inventory lists specific bio-tools. I will assume basic shell/POSIX is fine (otherwise collapsing TSVs would be impossible without `awk`).
+
+    26. **Refining the Plan:**
+        *   Align: `bwa mem -t THREADS ref.fa in1.fq.gz in2.fq.gz > out.sam` -> Convert to BAM? BWA-MEM outputs SAM by default (unless `-o bam`). I'll use `samtools view -Sa`. Then sort/markdup.
+        *   Sort/MarkDup: `samtools sort -@ THREADS input.bam | samtools markdup -r - > output.bam` (markdup needs sorted input). Or just `sort` then index? MarkDup is good for PCR duplicates in amplicon data. I'll use it if available (`samtools 1.21`).
+        *   Call: `lofreq call -t THREADS input.bam output.vcf`.
+        *   Filter/Format: `bcftools view -gz`? Or just save as is (gzip). Then index with tabix.
+        *   Collapse: Use awk to read all VCFs and combine into TSV.
+
+    27. **Wait, LoFreq Output:** Does it include AF in the INFO field or GT/AD? It outputs GATK format where `AF` is often present if using `-t`. I'll assume standard fields exist.
+        *   Wait, does Bcftools need to be used for filtering? The plan says "→ bcftools". Maybe use it to filter LoFreq output (e.g., remove low QUAL). Or maybe just merge samples into one VCF with `bcftools merge` then split back out? No, per sample files are required.
+        *   Okay, I'll add a filtering step using `bcftools view -gz`.
+
+    28. **Idempotency Check:** If any file in results/ exists (e.g., M117-bl.bam), should it skip that specific sample? Or if ANY output is present, does the script assume everything is done? "rerunning on a populated results/ directory must exit 0". This implies IF ALL OUTPUTS ARE PRESENT THEN EXIT.
+        *   I'll check for existence of `results/M117-bl.bam` AND `results/collapsed.tsv`. If both exist (implying all samples processed and collapsed), then skip everything? Wait, if M117-ch is missing but others are present, it should run the pipeline to fill gaps. But "without redoing work" implies skipping *work*. So I'll check for existence of ALL expected outputs (`M117-bl.bam`, `...vcf.gz` etc.). If all exist, exit 0.
+
+    29. **Wait:** The prompt says: "rerunning on a populated results/ directory must exit 0 without redoing work or erroring."
+        *   This means if I run the script twice (and it succeeds first time), second time should do nothing and return 0. So checking for existence of ALL expected outputs is correct logic to avoid re-running anything that was already done successfully in a previous session? Or just check `results/M117-bl.bam` exists as a proxy for "done"?
+        *   Safest: Check if all sample BAMs exist AND collapsed.tsv exists. If so, exit 0.
+
+    30. **Thread Count:** The constraint says "under 600 seconds at THREADS=4". I should use `-t 4` in parallel steps (bwa, sort).
+        *   Wait, `samtools markdup -r`. It's not threadable? No, it can be threaded with `-@`. But standard usage is often single-threaded for marking. However, sorting is definitely multi-threaded (`-@`). I'll use 4 threads where possible to meet the time limit (chrM alignment + calling).
+        *   Wait, `bwa mem` supports threading via `-t THREADS`.
+
+    31. **Final Check:** No markdown fences in output. Just script content. Shebang and strict mode required.
+
+    32. **One Detail:** "Do not write to stderr/stdout beyond what tools naturally emit". This means no `echo` statements explaining progress.

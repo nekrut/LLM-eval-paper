@@ -1,0 +1,240 @@
+1.  **Analyze the Request:**
+    *   **Goal:** Create a single bash script for variant calling on 4 paired-end MiSeq amplicon samples mapped to human mitochondrial DNA (chrM).
+    *   **Input:** `data/raw/` contains 4 pairs of FASTQ files. `data/ref/` contains `chrM.fa`.
+    *   **Output:** `results/{sample}.bam`, `results/{sample}.bam.bai`, `results/{sample}.vcf.gz`, `results/{sample}.vcf.gz.tbi`, `results/collapsed.tsv`.
+    *   **Constraints:**
+        *   Shebang: `#!/usr/bin/env bash`
+        *   Set: `set -euo pipefail`
+        *   Paths: Relative only. No absolute paths.
+        *   Output dir: `results/`.
+        *   Idempotent: Must not redo work if results exist.
+        *   Tools: `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`, `SnpSift`, `snpEff`, `fastqc`, `seqkit`, `snakemake`, `shellcheck`, `java`. No package managers.
+        *   Time: Under 600s at THREADS=4.
+        *   Format: Single script, no markdown, no commentary.
+
+2.  **Determine the Workflow:**
+    *   **Step 1: Reference Indexing.** `bwa index` and `samtools faidx` (or `tabix faidx`) on `data/ref/chrM.fa`. Since `chrM.fa` is decompressed, `bwa index` creates `.bwt`, `.pac`, `.ann`, `.amb`. `samtools faidx` creates `.fai`. `tabix faidx` creates `.tbi` (though usually for VCFs, but `samtools faidx` is standard for FASTA indexing). Let's stick to `bwa index` and `samtools faidx`.
+    *   **Step 2: Alignment.** Use `bwa mem` to map reads to `chrM.fa`. Output SAM, convert to BAM, sort, index.
+        *   Command: `bwa mem -t $THREADS data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools view -b - | samtools sort -@ $THREADS -o results/${sample}.bam -`
+        *   Indexing: `samtools index results/${sample}.bam`
+    *   **Step 3: Variant Calling.** Use `lofreq call-parallel` or `bcftools mpileup` + `call`. The prompt lists `lofreq` and `bcftools`. `lofreq` is often faster for small genomes like mtDNA, but `bcftools` is standard. Let's use `lofreq` as it's explicitly listed and good for amplicons/small data.
+        *   Command: `lofreq call-parallel -f data/ref/chrM.fa -o results/${sample}.vcf.gz -m lofreq -O z -p $THREADS results/${sample}.bam`
+    *   **Step 4: Indexing VCF.** `tabix -p vcf results/${sample}.vcf.gz`
+    *   **Step 5: Collapsing.** Combine all VCFs into one table.
+        *   Command: `bcftools concat -O z -o results/temp_combined.vcf.gz results/*.vcf.gz && bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\n' results/temp_combined.vcf.gz > results/collapsed.tsv`
+        *   Wait, `bcftools query` output format needs to match `sample chrom pos ref alt af`. The prompt asks for `sample` column.
+        *   `bcftools query` doesn't output the sample name by default unless using specific format strings or `bcftools view` with `-s`.
+        *   Better approach: Use `bcftools view` to add the sample name to the INFO field or just iterate through files.
+        *   Actually, `bcftools concat` keeps the INFO. We can use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\t%SAMPLE\n'`. Wait, `bcftools query` doesn't have a `%SAMPLE` tag in older versions, but in newer ones it might. Let's check standard behavior.
+        *   Safer approach: `bcftools view -a -h results/temp_combined.vcf.gz` gives a header. We need to extract the data.
+        *   Let's use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\t%SAMPLE\n'`. (Note: `bcftools query` supports `%SAMPLE` in recent versions, but let's verify if we can rely on it. If not, we might need to loop).
+        *   Alternative: `bcftools view -a -h results/temp_combined.vcf.gz` -> extract lines without header -> `cut -f1-5,9` (assuming sample is column 9 in VCF). This is robust.
+        *   Let's refine the command: `bcftools view -a results/temp_combined.vcf.gz | grep -v '^#' | cut -f1-5,9 > results/collapsed.tsv`. This is simple and effective.
+        *   Wait, `bcftools view -a` adds INFO fields. The sample name is usually the last column in the VCF data line.
+        *   Let's use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\t%SAMPLE\n'`. If `bcftools query` is available in the inventory (it is, as `tabix` implies `htslib` which includes `bcftools`), this is the cleanest way.
+
+3.  **Refining the Script Structure:**
+
+    *   **Variables:** `THREADS=4`, `RAW=data/raw`, `REF=data/ref`, `OUT=results`.
+    *   **Check existence:** Ensure `data/raw` and `data/ref` exist.
+    *   **Indexing:**
+        *   `bwa index ${REF}/chrM.fa`
+        *   `samtools faidx ${REF}/chrM.fa`
+    *   **Loop over samples:**
+        *   Define samples array: `M117-bl`, `M117-ch`, `M117C1-bl`, `M117C1-ch`.
+        *   Check if `results/${sample}.bam` exists. If yes, skip alignment and calling.
+        *   Align: `bwa mem -t $THREADS ${REF}/chrM.fa ${RAW}/${sample}_1.fq.gz ${RAW}/${sample}_2.fq.gz | samtools view -b - | samtools sort -@ $THREADS -o ${OUT}/${sample}.bam -`
+        *   Index BAM: `samtools index ${OUT}/${sample}.bam`
+        *   Call VCF: `lofreq call-parallel -f ${REF}/chrM.fa -o ${OUT}/${sample}.vcf.gz -m lofreq -O z -p $THREADS ${OUT}/${sample}.bam`
+        *   Index VCF: `tabix -p vcf ${OUT}/${sample}.vcf.gz`
+    *   **Collapsing:**
+        *   Concatenate: `bcftools concat -O z -o ${OUT}/temp_combined.vcf.gz ${OUT}/*.vcf.gz`
+        *   Extract: `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\t%SAMPLE\n' ${OUT}/temp_combined.vcf.gz > ${OUT}/collapsed.tsv`
+        *   Cleanup temp: `rm ${OUT}/temp_combined.vcf.gz`
+
+4.  **Addressing Constraints & Edge Cases:**
+    *   *Idempotency:* The `if [ -f ... ]` checks handle BAM/VCF existence.
+    *   *Paths:* All relative.
+    *   *Tools:* Only `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`, `java` (maybe needed for SnpSift/SnpEff, but not strictly required for the basic workflow unless requested. The prompt asks for variant calling. `lofreq` is sufficient. `SnpSift`/`SnpEff` are listed but not strictly necessary for a basic VCF output unless filtering is needed. I will stick to the core pipeline to ensure speed and simplicity, as adding SnpSift/SnpEff adds overhead and complexity not strictly required for "variant calling" in the basic sense, though the prompt lists them. I will use `lofreq` for calling).
+    *   *Wall-clock:* `lofreq` is fast. `bwa mem` is fast. `samtools sort` is fast. 4 samples * small genome (16kb) is very fast. 600s is plenty.
+    *   *Output format:* `sample chrom pos ref alt af`. `bcftools query` format string: `%CHROM\t%POS\t%REF\t%ALT\t%AF\t%SAMPLE`. This matches.
+
+5.  **Drafting the Script:**
+
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    THREADS=4
+    RAW=data/raw
+    REF=data/ref
+    OUT=results
+
+    # Ensure directories exist
+    mkdir -p "$OUT"
+
+    # 1. Index Reference
+    bwa index "$REF/chrM.fa"
+    samtools faidx "$REF/chrM.fa"
+
+    # 2. Define Samples
+    SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+    # 3. Process Samples
+    for SAMPLE in "${SAMPLES[@]}"; do
+        BAM="$OUT/${SAMPLE}.bam"
+        VCF="$OUT/${SAMPLE}.vcf.gz"
+
+        # Check if BAM exists (idempotency)
+        if [ -f "$BAM" ]; then
+            echo "Skipping $SAMPLE (BAM exists)"
+            continue
+        fi
+
+        # Align
+        bwa mem -t "$THREADS" "$REF/chrM.fa" "$RAW/${SAMPLE}_1.fq.gz" "$RAW/${SAMPLE}_2.fq.gz" \
+            | samtools view -b - \
+            | samtools sort -@ "$THREADS" -o "$BAM" -
+
+        # Index BAM
+        samtools index "$BAM"
+
+        # Call Variants
+        lofreq call-parallel -f "$REF/chrM.fa" -o "$VCF" -m lofreq -O z -p "$THREADS" "$BAM"
+
+        # Index VCF
+        tabix -p vcf "$VCF"
+    done
+
+    # 4. Collapse VCFs
+    # Concatenate all VCFs
+    bcftools concat -O z -o "$OUT/temp_combined.vcf.gz" "$OUT"/*.vcf.gz
+
+    # Extract columns: chrom, pos, ref, alt, af, sample
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\t%SAMPLE\n' "$OUT/temp_combined.vcf.gz" > "$OUT/collapsed.tsv"
+
+    # Cleanup temp file
+    rm "$OUT/temp_combined.vcf.gz"
+    ```
+
+6.  **Review against constraints:**
+    *   First line: `#!/usr/bin/env bash` (Check)
+    *   Second line: `set -euo pipefail` (Check)
+    *   Paths: `data/raw`, `data/ref`, `results` (Check)
+    *   Idempotent: Checks for BAM existence (Check)
+    *   Tools: `bwa`, `samtools`, `lofreq`, `bcftools`, `tabix` (Check)
+    *   Output files: `results/{sample}.bam`, `.bai`, `.vcf.gz`, `.tbi`, `collapsed.tsv` (Check)
+    *   Collapsed columns: `sample chrom pos ref alt af` (Check)
+    *   No absolute paths (Check)
+    *   No package managers (Check)
+    *   Wall-clock: 4 samples * small genome is trivial.
+
+    *Self-Correction on `bcftools concat`*: If no VCFs exist (unlikely, but possible if script fails mid-way), `bcftools concat` might error. However, the script is designed to be run once. If it fails, it exits. If it succeeds, files exist. The `set -e` handles the failure. The `bcftools concat` command is safe if files exist.
+
+    *Self-Correction on `lofreq`*: `lofreq call-parallel` creates a temporary directory for parallel processing. It usually cleans up, but sometimes leaves files. The prompt doesn't forbid temporary files, but `set -e` ensures it cleans up if it exits normally. If it crashes, it might leave junk. Given the constraints, this is acceptable.
+
+    *Refining the `bcftools query` format*: The prompt asks for `sample chrom pos ref alt af`.
+    `%CHROM` -> chrom
+    `%POS` -> pos
+    `%REF` -> ref
+    `%ALT` -> alt
+    `%AF` -> af
+    `%SAMPLE` -> sample
+    This looks correct.
+
+    *One detail*: `lofreq call-parallel` output is a VCF. `tabix` indexes it.
+
+    *Final check on tool versions*: `lofreq` version 2.1.5. `bcftools` 1.21. `samtools` 1.21. `bwa` 0.7.18. All compatible.
+
+    *Idempotency check*: If `results/collapsed.tsv` exists, should I regenerate it? The prompt says "rerunning on a populated results/ directory must exit 0 without redoing work or erroring". It doesn't explicitly say "don't regenerate the table". However, usually, "redoing work" implies the heavy lifting (alignment/calling). Regenerating the table is cheap. But to be strictly safe and "idempotent" in the sense of "state doesn't change", I should check if the table exists. If it exists, I can skip the concat/query step.
+    Actually, the prompt says "without redoing work". Concatenating 4 small VCFs is negligible work, but technically redoing it. I'll add a check for `collapsed.tsv`.
+
+    *Revised Plan for Collapsing*:
+    ```bash
+    if [ ! -f "$OUT/collapsed.tsv" ]; then
+        bcftools concat -O z -o "$OUT/temp_combined.vcf.gz" "$OUT"/*.vcf.gz
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\t%SAMPLE\n' "$OUT/temp_combined.vcf.gz" > "$OUT/collapsed.tsv"
+        rm "$OUT/temp_combined.vcf.gz"
+    fi
+    ```
+
+    *One small thing*: `bwa mem` output to stdout, pipe to `samtools view -b -`. `samtools sort` reads from stdin. This is correct.
+
+    *Output format*: The prompt asks for `results/{sample}.bam` etc. The script generates these.
+
+    *Tool Inventory*: I am using `bwa`, `samtools`, `bcftools`, `tabix`, `lofreq`. These are all in the inventory.
+
+    *Constraint Check*: "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose."
+    I will remove the `echo "Skipping..."` lines to strictly adhere to "no user-facing prose". The script will just run silently.
+
+    *Final Script Construction*:
+    ```bash
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    THREADS=4
+    RAW=data/raw
+    REF=data/ref
+    OUT=results
+
+    mkdir -p "$OUT"
+
+    # Index Reference
+    bwa index "$REF/chrM.fa"
+    samtools faidx "$REF/chrM.fa"
+
+    # Process Samples
+    for SAMPLE in M117-bl M117-ch M117C1-bl M117C1-ch; do
+        BAM="$OUT/${SAMPLE}.bam"
+        VCF="$OUT/${SAMPLE}.vcf.gz"
+
+        if [ -f "$BAM" ]; then
+            continue
+        fi
+
+        bwa mem -t "$THREADS" "$REF/chrM.fa" "$RAW/${SAMPLE}_1.fq.gz" "$RAW/${SAMPLE}_2.fq.gz" \
+            | samtools view -b - \
+            | samtools sort -@ "$THREADS" -o "$BAM" -
+
+        samtools index "$BAM"
+        lofreq call-parallel -f "$REF/chrM.fa" -o "$VCF" -m lofreq -O z -p "$THREADS" "$BAM"
+        tabix -p vcf "$VCF"
+    done
+
+    # Collapse
+    if [ ! -f "$OUT/collapsed.tsv" ]; then
+        bcftools concat -O z -o "$OUT/temp_combined.vcf.gz" "$OUT"/*.vcf.gz
+        bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\t%SAMPLE\n' "$OUT/temp_combined.vcf.gz" > "$OUT/collapsed.tsv"
+        rm "$OUT/temp_combined.vcf.gz"
+    fi
+    ```
+
+    Wait, `lofreq call-parallel` might complain if the BAM is not sorted? `bwa mem` produces SAM, `samtools view -b -` produces BAM, `samtools sort` sorts it. `lofreq` usually accepts sorted BAMs. The `-m lofreq` flag in `lofreq call-parallel` is the default for the caller. It should work.
+
+    One potential issue: `lofreq call-parallel` creates a temp directory. If the script is interrupted, cleanup might fail. But `set -e` ensures it exits on error. If it exits, the temp dir remains. This is acceptable for a single script task.
+
+    Double check `bcftools query` format string. `%CHROM` is standard. `%POS` is standard. `%REF` is standard. `%ALT` is standard. `%AF` is standard. `%SAMPLE` is standard in `bcftools query`.
+    Wait, `bcftools query` output format: `CHROM POS ID REF ALT QUAL FILTER INFO FORMAT/SAMPLE`.
+    `%CHROM` -> CHROM
+    `%POS` -> POS
+    `%REF` -> REF
+    `%ALT` -> ALT
+    `%AF` -> FORMAT/AF (This is the allele frequency in the sample).
+    `%SAMPLE` -> This is the sample name.
+    The order requested is `sample chrom pos ref alt af`.
+    My format string: `%CHROM\t%POS\t%REF\t%ALT\t%AF\t%SAMPLE`
+    This produces: `chrom pos ref alt af sample`.
+    The prompt asks for `sample chrom pos ref alt af`.
+    I need to swap the last two.
+    Correct format string: `%CHROM\t%POS\t%REF\t%ALT\t%AF\t%SAMPLE` -> Wait, `%SAMPLE` is the last field.
+    Let's look at the output of `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%AF\t%SAMPLE\n'`.
+    It prints: `chr pos ref alt af sample`.
+    The prompt wants: `sample chrom pos ref alt af`.
+    So I need: `%SAMPLE\t%CHROM\t%POS\t%REF\t%ALT\t%AF`.
+    Let's verify `%SAMPLE` behavior. Yes, it prints the sample name.
+
+    Final check on `lofreq` command. `lofreq call-parallel -f ref.fa -o out.vcf.gz -m lofreq -O z -p threads bam`.
+    `-m lofreq` specifies the caller. `-O z` specifies output format (gzipped VCF). `-p threads` specifies threads.
+    This looks correct.
+
+    The script looks solid.
