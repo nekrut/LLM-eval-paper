@@ -160,7 +160,7 @@ We assembled five computers spanning the lab-scale hardware tier (Table 3) — a
 
 | Computer | Manufacturer | Year released | RAM | OS | GPU |
 |---|---|---|---|---|---|
-| NVIDIA Jetson AGX Orin Developer Kit | NVIDIA | 2022 | 64 GB LPDDR5 (unified with GPU) | Ubuntu 22.04 LTS (NVIDIA JetPack 6) | Integrated Ampere, 2,048 CUDA cores + 64 Tensor cores |
+| NVIDIA Jetson AGX Orin Developer Kit | NVIDIA | 2022 | 64 GB LPDDR5 (unified with GPU) | Ubuntu 20.04.6 LTS (NVIDIA JetPack 5.1.2, L4T 35.4.1) | Integrated Ampere, 2,048 CUDA cores + 64 Tensor cores |
 | RTX 5080 desktop | Dell | 2025 (GPU) | 128 GB DDR5 (system) | Linux (Ubuntu) | NVIDIA RTX 5080, 10,752 CUDA cores, 16 GB GDDR7 |
 | MacBook Pro M4 Pro (48 GB) | Apple | 2024 | 48 GB LPDDR5X (unified with GPU) | macOS Sequoia 15.6 | Apple M4 Pro integrated GPU, 16 to 20 cores |
 | MacBook Air M4 (24 GB) | Apple | 2025 | 24 GB LPDDR5X (unified with GPU) | macOS Sequoia 15.6 | Apple M4 integrated GPU, 10 cores |
