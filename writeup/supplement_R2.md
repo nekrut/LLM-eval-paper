@@ -38,7 +38,7 @@ The reasoning-effort row is 20 cells, not the 27 its design implies. The high-ef
 | Cells archived under `revision/runs/` | 813 | all blocks except the budget ablation (6 cells, `revision/runs_ablation/`) and the reasoning-effort sweep (29 cells, `revision/runs_effort/`) |
 | Archived cells carrying a `run.sh` | 766 | the emitted-script constraint audit corpus (Supplementary Results, *What the emitted scripts actually did*) |
 | Archived cells carrying no `run.sh` | 47 | exactly the 47 non-`ok` generations in those blocks: 1 + 18 + 1 + 27 from the four gradient and sampling passes; the other 5 non-`ok` cells are in the ablation and effort blocks |
-| Reasoning-off scripts | 514 | the transcription-index corpus: 433 local plus 81 API |
+| Reasoning-off scripts | 787 | the transcription-index corpus: 706 local plus 81 API, including the 273 seed-extension scripts |
 
 <!-- addresses: R1.1, R2.11, T11-corpus, R3.10 -->
 
@@ -349,6 +349,8 @@ Computed over all 324 reasoning-off runs by `revision/scripts/variant_metrics.py
 | v1.5 | 36 | 287 | 0 | 37 | 1.000 | 0.886 | 0.833 (30/36) | +0.053 |
 | v2 | 36 | 306 | 0 | 18 | 1.000 | 0.944 | 0.944 (34/36) | 0.000 |
 | **Pooled over all conditions** | **324** | **1,042** | **0** | **1,874** | **1.000** | **0.357** | **0.321 (104/324)** | **+0.036** |
+
+Rows in `variant_metrics_thinkoff.json` carry the model and plan column but no per-run identifier, so one-row-per-run provenance cannot be audited from the file alone; the totals above were re-derived from the run logs.
 
 The pooled F1, 0.527 in the first version of this manuscript, is deleted: it averages over conditions that share no denominator of interest and re-expresses a binary.
 
