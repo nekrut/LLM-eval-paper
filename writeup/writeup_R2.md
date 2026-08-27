@@ -12,7 +12,7 @@ An RNA-seq case study produced benchmark-matching counts. It required human inpu
 
 Routine sequencing analyses require an operator to connect a fixed workflow to new files, execute it, detect failures, and repeat failed steps. This study measured whether language models can perform these execution tasks from a separately authored plan.
 
-The study used two workflows. Benchmark 1 used per-sample mitochondrial variant calling from paired-end Illumina reads. Benchmark 2 used per-sample RNA-seq quantification on a public Galaxy server. The study tested fixed model sets on five machines. It did not test analysis design or measure human time. Neither benchmark achieved unsupervised operation. <!-- addresses: R2.1, R3.15, R3.2 -->
+The study used two workflows. Benchmark 1 used per-sample mitochondrial variant calling from paired-end Illumina reads. Benchmark 2 used per-sample RNA-seq quantification on a public Galaxy server. The study tested fixed model sets on one local machine, an NVIDIA Jetson AGX Orin, plus a commercial API. It did not test analysis design or measure human time. Neither benchmark achieved unsupervised operation. <!-- addresses: R2.1, R3.15, R3.2 -->
 
 Stable pipelines do not require a language model. A validated shell script, workflow rule set, CWL file, or saved Galaxy workflow is a better choice (Di Tommaso et al. 2017; Mölder et al. 2021). These tools are deterministic and auditable. They also do not require a GPU. A language model can be useful for a one-time analysis or a change in file layout or tool version. It can also give a natural-language interface to a user who does not write code. Another possible use is *binding*. Binding connects a fixed workflow to a specific set of local inputs. Benchmark 2 tested some parts of binding (Results, *Case study*). The perturbed-plan test examined path binding directly. Two of thirteen local models changed the path correctly (Results, *A one-path perturbation*). <!-- addresses: R3.2 -->
 
@@ -56,7 +56,6 @@ Extended methods are in the Supplement.
     Figure S1 -> figures/fig1_workflow_dag.png
     Figure S2 -> revision/figures/rev_fig2_gradient_thinkon.png
     Figure S3 -> revision/figures/rev_fig3_reasoning_delta.png
-    Figure S4 -> figures/ms_fig2_5080_gradient.png
    addresses: R3.14 -->
 
 ### Study design
@@ -167,15 +166,15 @@ The two halves of the prose-versus-syntax contrast are not equally well resolved
 
 The mechanism is more specific than a count of command lines. v1.25 and v1g each add one literal `lofreq` invocation to v1, but present it differently. v1.25 supplies one runnable line: `lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam`. v1g supplies a six-line block in the registry's long-form style, with two bare, valueless flags (`--sig`, `--bonf`) that the plan itself says may be omitted. Their pooled success proportions were 0.496 and 0.246, respectively. v1g also states that `results/{sample}.bam` is a positional argument at the end, so the contrast is not explained by omission of that information. Across the 13 paired model-level proportions, v1.25 exceeded v1g by a mean of 0.253 (exact sign-flip p = 0.027). This result is consistent with copy-pasteability, rather than information content or verbosity alone, as the relevant plan property. v1.5 is the shortest plan and the second best; v2 is the longest and the best; and v1g is the second longest but the weakest of the plans containing command syntax (Table 4). No rank correlation is quoted over five points with ties. <!-- addresses: Q5, R3.6, R2.8, R2.24, spearman -->
 
-**Table 4.** Syntax density against outcome, Track A, reasoning off. "Literal command lines" counts non-blank lines inside fenced blocks that invoke a workflow tool or shell construct. That is an operational definition, and the count is sensitive to it. v1g's single `lofreq` invocation is written across six physical lines in the registry's long-form style; it is counted as one, because it is one invocation. v1g's author is the Galaxy IUC registry, extracted mechanically; every other plan was authored by a frontier model. Jetson values are recomputed under this manuscript's retention rule, which scores the one truncated v1g generation 0 and keeps it. They therefore differ in the third decimal from `revision/galaxy_demo/SYNTAX_DENSITY.md`, which drops it. RTX 5080 values come from that file under its own convention. They are given only to show that the ordering reproduces on a second machine. Every frontier cell here is 9/9. The RTX 5080 sheet reports 0.667 in its frontier v1g cell, on a different set of 9 runs; neither figure should be over-read at n = 9. The ten-seed column pools the seed extension over thirteen local executors (Methods; Supplementary Table S16). v1 and v2 were not extended; v2's headline pooling to n = 10 is Table S11.
+**Table 4.** Syntax density against outcome, Track A, reasoning off. "Literal command lines" counts non-blank lines inside fenced blocks that invoke a workflow tool or shell construct. That is an operational definition, and the count is sensitive to it. v1g's single `lofreq` invocation is written across six physical lines in the registry's long-form style; it is counted as one, because it is one invocation. v1g's author is the Galaxy IUC registry, extracted mechanically; every other plan was authored by a frontier model. Jetson values are recomputed under this manuscript's retention rule, which scores the one truncated v1g generation 0 and keeps it. They therefore differ in the third decimal from `revision/galaxy_demo/SYNTAX_DENSITY.md`, which drops it. Every frontier cell here is 9/9. The ten-seed column pools the seed extension over thirteen local executors (Methods; Supplementary Table S16). v1 and v2 were not extended; v2's headline pooling to n = 10 is Table S11.
 
-| Plan | Author | Words | Literal command lines | Local mean M3, Jetson (n = 3/model) | Local mean M3, Jetson (n = 10/model) | Local mean M3, RTX 5080 | Frontier mean M3, Jetson |
-|---|---|---:|---:|---:|---:|---:|---:|
-| v1 | frontier planner | 422 | 0 | 0.250 (n = 36) | — | 0.211 (n = 38) | 1.000 (n = 9) |
-| v1g | Galaxy IUC registry (mechanical) | 558 | 1 | 0.250 (n = 36) | 0.246 (n = 126) | 0.189 (n = 37) | 1.000 (n = 9) |
-| v1.25 | frontier planner | 413 | 1 | 0.417 (n = 36) | 0.496 (n = 127) | 0.528 (n = 36) | 1.000 (n = 9) |
-| v1.5 | frontier planner | 159 | 10 | 0.833 (n = 36) | 0.858 (n = 127) | 0.892 (n = 37) | 1.000 (n = 9) |
-| v2 | frontier planner | 660 | 8 | 0.944 (n = 36) | — | 0.949 (n = 39) | 1.000 (n = 9) |
+| Plan | Author | Words | Literal command lines | Local mean M3, Jetson (n = 3/model) | Local mean M3, Jetson (n = 10/model) | Frontier mean M3, Jetson |
+|---|---|---:|---:|---:|---:|---:|
+| v1 | frontier planner | 422 | 0 | 0.250 (n = 36) | — | 1.000 (n = 9) |
+| v1g | Galaxy IUC registry (mechanical) | 558 | 1 | 0.250 (n = 36) | 0.246 (n = 126) | 1.000 (n = 9) |
+| v1.25 | frontier planner | 413 | 1 | 0.417 (n = 36) | 0.496 (n = 127) | 1.000 (n = 9) |
+| v1.5 | frontier planner | 159 | 10 | 0.833 (n = 36) | 0.858 (n = 127) | 1.000 (n = 9) |
+| v2 | frontier planner | 660 | 8 | 0.944 (n = 36) | — | 1.000 (n = 9) |
 
 Across the same five plans, the API executors were correct in 45 of 45 runs. The local success proportion increased from 0.250 to 0.944. Thus, greater plan detail reduced the observed difference between the two executor groups. The API result is a point estimate from nine runs per plan. v1g is not a planner-comparison arm because syntactic density was not matched. It is a mechanically extracted plan with a non-model author. Its result shows that authorship and plan length do not explain the observed pattern. The data support a narrower conclusion: local models produced working pipelines more often when the plan contained commands that could be copied without modification. Explanatory prose produced no detectable effect at the tested sample size. The moved-path test below measures direct transcription. <!-- addresses: R3.6, R2.1, R3.15, R3.preamble, Q5, v1g-joint-worst -->
 
@@ -295,7 +294,7 @@ The bound must be stated at the session level and conditionally. The six judgeme
 
 ### Cost: a local executor does not pay for itself on a task this small
 
-Median wall time per generation on the sufficient plan varies from 29 s on two RTX A5000s to 518 s on a MacBook Air, across the five platforms (Supplementary Table S13). Accuracy was not measured comparably across platforms at these sample sizes. No claim of platform-independent accuracy is therefore made. <!-- addresses: R2.19, R3.11, R2.3, T15-fullrange, R3.12, R2.22 -->
+On the Jetson, median generation time on the sufficient plan is 105 s (IQR [98–107], full range [97–227], n = 36; Supplementary Table S13). All performance results in this paper come from this one machine and one inference configuration. No cross-platform claim is made. <!-- addresses: R2.19, R3.11, R2.3, T15-fullrange, R3.12, R2.22 -->
 
 The cost model does not support local execution on economic grounds for a task this small. Measured API cost was $0.0662 per run over 81 runs. Measured local wall-clock time was 86.7 s per run, corresponding to $0.00016 of marginal electricity. Against a three-year cost of ownership of $5,045, recovering the full cost would require 76,424 runs, or 15.3 years at 5,000 runs per year. In the annualised comparison, fixed local cost is $1,682 per year. The crossover is approximately 25,475 runs/year with no API-side labour, 17,900 with 4 h/year and 10,325 with 8 h/year. At 16 h/year, the assumed API-side fixed labour cost already exceeds the annualised local fixed cost, so no positive crossover exists. Six of the model's eight inputs are assumptions, and supervision labour is excluded. Holding the three-year total fixed, the number of runs needed for cost recovery falls to 5,046 at $1.00 per API run and 1,009 at $5.00. Thus, larger multi-step workloads could change the economic comparison, but the single-pass task measured here does not justify the local hardware on cost alone (Supplementary Table S9). <!-- addresses: R2.17, R3.13, R3.15, R3.2, R1.4 -->
 
@@ -403,4 +402,4 @@ Zhou D, Schärli N, Hou L, Wei J, Scales N, Wang X, Schuurmans D, Cui C, Bousque
 
 ## Supplementary material
 
-Supplementary Methods, Supplementary Results, Supplementary Tables S1–S20 and Supplementary Figures S1–S4 are in `supplement_R2.md`.
+Supplementary Methods, Supplementary Results, Supplementary Tables S1–S20 and Supplementary Figures S1–S3 are in `supplement_R2.md`.
