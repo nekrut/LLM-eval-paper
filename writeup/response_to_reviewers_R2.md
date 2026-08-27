@@ -49,7 +49,7 @@ We have also removed material rather than only adding it. The model catalogue, t
 
 | ID | Issue | Disposition |
 |---|---|---|
-| R1.1 | Security guardrails absent | **Accepted.** Guardrails documented; unsandboxed status stated; lexical audit of 766 scripts replaces the "nothing observed" claim; one genuinely out-of-sandbox action reported. |
+| R1.1 | Security guardrails absent | **Accepted.** Guardrails documented; unsandboxed status stated; lexical audit of 1,039 scripts replaces the "nothing observed" claim; two genuinely out-of-sandbox actions reported, one from a plan-conditioned run. |
 | R1.2 | Prior art for planner–executor | **Accepted.** Six primary citations added; architectural originality claim removed. |
 | R1.3 | Generalization and production | **Accepted.** Production concerns section added (Table S20); workflow-class taxonomy added (Table S19); no row claimed as tested. |
 | R1.4 | Data governance; planner prompt detail | **Accepted, with a finding against us.** Payload audit run; the boundary held for the planner only — the frontier *executor* arms carried subject labels across it. All prompts and two plan files reproduced verbatim. |
@@ -103,7 +103,7 @@ We have also removed material rather than only adding it. The model catalogue, t
 | T3.4 | Second biological benchmark | **Run**, as a case study, without perturbations. |
 | T3.5 | Expanded error suite | **Not run as a designed matrix**; existing suite recategorised instead (R3.7). |
 | T3.6 | More replicates | **Run.** n raised from 3 to 10 at the headline condition, and later at the three discriminating conditions (273 further cells). |
-| T3.7 | Standardised cross-hardware benchmark | **Not run**; the accuracy claim it would have supported is withdrawn instead. |
+| T3.7 | Standardised cross-hardware benchmark | **Not run**; the paper is now single-local-platform, so no cross-platform claim needs its support. |
 | T3.8 | Biomni head-to-head | **Not run**; declined with reasons (§5). |
 
 ---
@@ -116,7 +116,7 @@ The premise that the same model on different hardware should produce equivalent 
 
 Two further engine facts affect the results and are now reported. Flash attention was disabled on the Jetson after "22 illegal-memory-access faults in six hours across 5 of 12 models, against zero faults in roughly 41 h after disabling it". The key–value cache was set to `f16` rather than `q8_0`. 400 earlier local runs made under the quantised cache were discarded rather than pooled.
 
-The revision resolves this point by narrowing scope rather than by defending a claim. Only the Jetson dataset is complete across all conditions and passes, so all performance results now come from that one machine and one inference configuration. The four other platforms are out of scope; their runs remain in the repository (Table S7 states this). No cross-platform claim of any kind remains in the paper. The standardised fixed-prompt, fixed-length, matched-configuration benchmark (T3.7) that would put platforms on one scale was not run.
+The revision resolves this point by narrowing scope rather than by defending a claim. Only the Jetson dataset is complete across all conditions and passes, so all local-model performance results now come from that one machine and one inference configuration; the frontier results are remote API calls and are labelled as such. The four other platforms are out of scope; their runs remain in the repository (Table S7 states this). No cross-platform claim of any kind remains in the paper. The standardised fixed-prompt, fixed-length, matched-configuration benchmark (T3.7) that would put platforms on one scale was not run.
 
 ### 3.2 R2.8 — no published rubric exists for this task shape
 
@@ -250,7 +250,7 @@ See R2.6 for the unrun pinned-decoder re-run.
 **What changed.**
 
 - Methods: "Generated scripts were executed on the model host in a per-cell working directory under a pinned conda environment, killed at 600 s, without human review and with no container, VM, seccomp profile, namespace, cgroup quota or egress restriction. Only the wall-clock kill, the PATH-restricted inventory and the working directory are enforced; the constraints on absolute paths, package managers and network fetches are prompt instructions a model is free to violate … **The local arm does not meet the sandboxing bar a production deployment needs and is not a deployment template**".
-- Results: "A lexical audit of the 766 archived `run.sh` files replaces the claim that no destructive or escape behaviour was observed: none invokes a package manager, network fetch tool or `sudo`, none directs output to an absolute path outside `/dev/` and `/tmp/`, and 17 (2.2%) write under `/tmp/`. One script — `rm -f /tmp/*.txt /tmp/temp_*.vcf.gz` — **is a genuinely out-of-sandbox action**, and it came from a no-plan run; the `/tmp/` writes concentrate there generally, 11 of 303 no-plan scripts against 6 of 463 written with a plan, because a model given no plan invents its own scratch-space convention and the convention it invents leaves the sandbox."
+- Results: "A lexical audit of the 1,039 archived `run.sh` files replaces the claim that no destructive or escape behaviour was observed … Two scripts perform a genuinely out-of-sandbox action … one came from a no-plan run … the other … from a plan-conditioned run (v1g)."
 - A first-version claim is withdrawn by name: "no audit of available escalation paths on the JetPack image — sudoers entries, docker group membership, writable setuid binaries on `PATH` — was performed, so the first version's claim of 'no route to elevation' is withdrawn."
 - Another is corrected: the benchmark-2 isolation claim "the blast radius of any error is one history" "was wrong" — a Galaxy API key is account-scoped, and what narrowed the blast radius was the MCP server's bounded verb set, not the credential.
 - Prompt-injection exposure, previously unmentioned: "Attacker- or accident-controlled text reached the executor through at least five channels here: dataset and history names on a shared multi-user public server, job stderr, tool output read back through MCP, the descriptions of the MCP tools themselves, and — in benchmark 1 — 200 lines of adversarially shaped stderr injected deliberately through a PATH shim … no indirect-prompt-injection test was run."
@@ -568,7 +568,7 @@ The minimum viable fix R3 proposed — freeze the protocol, run it on a held-out
 - Its behaviour tracks its content, not its authorship: "v1g is **not** an arm of a planner comparison, which would have to hold syntactic density fixed: it is a mechanically extracted plan at v1-level density with a non-model author, which behaves as its *content* predicts rather than as its authorship or length would, and that is useful evidence that the gradient is not an artifact of one planner's house style."
 - The mechanism it reveals is one of the paper's central results: "v1.25 and v1g each add exactly one literal `lofreq` invocation to v1, and they do opposite things: at ten seeds v1.25 lifts the local executors to 0.496 while v1g leaves them at 0.246, indistinguishable from v1 itself. The difference is *which* line … **The finding is not that more command lines are better. It is that a plan helps when it supplies an invocation the executor can copy verbatim.**" v1g carries *more* information than v1.25 — it even states the one detail models most often get wrong — and performs half as well; the variable that moves the score is whether the command can be pasted and run.
 - The seed extension raised the comparison to as many as ten seeds per model over thirteen executors, giving pooled descriptive totals of 31/126 for v1g and 63/127 for v1.25. Because seeds are clustered within models, the primary analysis uses the 13 paired model-level proportions: mean within-model difference 0.253, exact two-sided sign-flip p = 0.027 (Supplementary Table S16).
-- Table 4 reports syntax density against outcome on two machines and at both seed counts, with the operational definition of a "literal command line" and its sensitivity disclosed in the caption.
+- Table 4 reports syntax density against outcome on the Jetson at both seed counts, beside the remote API arm, with the operational definition of a "literal command line" and its sensitivity disclosed in the caption.
 - A rank correlation is deliberately not quoted: "No rank correlation is quoted over five points, two of them tied in both variables; the v1.25-versus-v1g contrast is the argument, and since the seed extension it is a measured contrast … rather than a two-cell reading." (`SYNTAX_DENSITY.md` reports Spearman +0.85 for command-line count and +0.10 for word count; we regard five points with ties as too few to publish a coefficient from, and give the contrast instead.)
 
 **Not addressed by new data.** The human-expert and second-frontier planner arms were **not run**; Limitations states "the planner comparison at matched syntactic density was not run, since v1g's density is not matched and the human-expert and second-frontier-planner arms remain unrun". See §5.2.
@@ -643,7 +643,7 @@ Folded into C4. For local models, the seed selects a trajectory at fixed decodin
 
 - Supplement, *Platforms, engines, and reproducibility metadata*: the build facts are retained as guidance for re-running elsewhere — distributed builds differ (GGUF `q4_K_M` vs MLX 4-bit, different kernels and batching) — while the paper itself is single-platform.
 - Engine configuration that materially changes behaviour is reported: flash attention disabled after 22 illegal-memory-access faults in six hours across 5 of 12 models; `f16` KV cache; one model loaded at a time; 400 earlier runs under a `q8_0` cache discarded rather than pooled.
-- The paper is now single-platform: all performance results come from the Jetson under one configuration, and the other platforms are stated as out of scope (Table S7). No cross-platform claim remains to defend.
+- The paper is now single-local-platform: all local-model performance results come from the Jetson under one configuration, the frontier arm is a remote API labelled as such, and the other platforms are stated as out of scope (Table S7). No cross-platform claim about local hardware remains to defend.
 
 **Not addressed by new data.** The standardised fixed-configuration cross-hardware benchmark (T3.7) was **not run**. See §5.9.
 
@@ -655,7 +655,7 @@ Folded into C4. For local models, the seed selects a trajectory at fixed decodin
 
 **Response.** Correct, and worse than reported. It was a hand-entry failure in a table whose own caption claimed hand-entry had been eliminated.
 
-**What changed.** The impossible A5000 row, and the other non-Jetson rows, were first corrected by regenerating the table and have since been removed with those platforms (the paper is now single-platform; Table S7). The remaining table (now Table S13, Jetson only) is "**fully generated** by `revision/scripts/table6.py --markdown`", and the generator "asserts min ≤ Q1 ≤ median ≤ Q3 ≤ max before printing". The caption states the full extent of the original defect: "the generator emitted no min–max column, so the 'full range' was hand-entered, four of its five rows were wrong in the direction that understates the maximum — the M4 Pro row by a factor of eight — and the RTX 5080 row printed that platform's IQR in the full-range column while declaring the IQR unreportable. At n = 6 and n = 3 a quartile estimate is weak and should be read as such, but withholding it while reporting a hand-typed range was the worse choice."
+**What changed.** The impossible A5000 row, and the other non-Jetson rows, were first corrected by regenerating the table and have since been removed with those platforms (the paper is now single-platform; Table S7). The remaining table (now Table S13, Jetson only) is the Jetson row of the table emitted by `revision/scripts/table6.py --markdown`; the generator also emits the out-of-scope platforms, and the caption says so, and the generator "asserts min ≤ Q1 ≤ median ≤ Q3 ≤ max before printing". The caption states the full extent of the original defect: "the generator emitted no min–max column, so the 'full range' was hand-entered, four of its five rows were wrong in the direction that understates the maximum — the M4 Pro row by a factor of eight — and the RTX 5080 row printed that platform's IQR in the full-range column while declaring the IQR unreportable. At n = 6 and n = 3 a quartile estimate is weak and should be read as such, but withholding it while reporting a hand-typed range was the worse choice."
 
 A related archival pitfall found during the recomputation is documented.
 
@@ -819,7 +819,7 @@ We do not offer this as a reason to have no external anchor. We do not pretend t
 
 ### 5.9 T3.7 / R3.11 — Standardised cross-hardware benchmark
 
-**Not run.** Fixed prompt, fixed output length, fixed repetitions, matched model configuration on each of the five machines, reported as tokens/s with dispersion. Why: three of the five platforms are not co-located and two run a different inference engine entirely, so "matched configuration" requires deciding what counts as matched across GGUF `q4_K_M` and MLX 4-bit, which is the same problem the reviewer's premise raises. What we did instead: reported the mixed-workload timing with dispersion from a generated table (Table S13), and withdrew the accuracy claim the comparison was being used to support.
+**Not run.** Fixed prompt, fixed output length, fixed repetitions, matched model configuration on each of the five machines, reported as tokens/s with dispersion. Why: three of the five platforms are not co-located and two run a different inference engine entirely, so "matched configuration" requires deciding what counts as matched across GGUF `q4_K_M` and MLX 4-bit, which is the same problem the reviewer's premise raises. What we did instead: narrowed the paper to a single local platform (Table S13 is now Jetson-only), so no cross-platform accuracy claim remains the comparison was being used to support.
 
 ---
 
