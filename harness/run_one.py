@@ -200,9 +200,17 @@ def call_ollama(model: str, think: bool, system_text: str, user_text: str, seed:
     }
 
 
-def setup_sandbox(run_dir: Path) -> None:
+def setup_sandbox(run_dir: Path, data_dir: str = "data") -> None:
+    """Link the dataset the generated script will see.
+
+    data_dir is normally "data". The perturbed-plan condition passes
+    "data_shifted", which holds the same reads but keeps the reference at
+    data/ref/GRCh38_chrM/rCRS.fa instead of data/ref/chrM.fa. Plan v2 names the
+    old path literally, so a script that copies the plan's command lines fails
+    and a script that binds them to the stated inputs succeeds.
+    """
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "data").symlink_to(BENCH / "data")
+    (run_dir / "data").symlink_to(BENCH / data_dir)
     (run_dir / "results").mkdir(exist_ok=True)
 
 
@@ -282,7 +290,7 @@ def main() -> int:
     ap.add_argument("--model", required=True)
     ap.add_argument("--track", choices=["A", "B"], required=True)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--think", choices=["on", "off"], default="on",
+    ap.add_argument("--think", choices=["on", "off", "low", "medium", "high"], default="on",
                     help="Only meaningful for ollama models")
     ap.add_argument("--run-id", default=None)
     ap.add_argument("--plan", default=str(PLAN_FILE),
@@ -298,6 +306,9 @@ def main() -> int:
                          "binding limit on thinking length.")
     ap.add_argument("--gen-timeout", type=int, default=900,
                     help="Ollama HTTP timeout in seconds (default 900)")
+    ap.add_argument("--data-dir", default="data",
+                    help="dataset directory to link into the sandbox (default data). "
+                         "Use data_shifted for the perturbed-plan condition.")
     ap.add_argument("--track-template", default=None,
                     help="Override template stem (default: track_<a|b>_user). "
                          "E.g. 'track_b_with_order_user' for the v0.5 condition.")
@@ -327,13 +338,17 @@ def main() -> int:
 
     print(f"[run_one] generating script via {args.model} (track {args.track}, seed {args.seed})", file=sys.stderr)
     if is_ollama:
-        gen = call_ollama(args.model, args.think == "on", system_text, user_text, args.seed,
+        # ollama accepts `think` as a bool or, on models that expose a reasoning-effort
+        # control (gpt-oss), as "low"/"medium"/"high". Passing the level through
+        # unchanged lets effort be manipulated directly at fixed prompt and seed.
+        think_arg = True if args.think == "on" else (False if args.think == "off" else args.think)
+        gen = call_ollama(args.model, think_arg, system_text, user_text, args.seed,
                           gen_timeout=args.gen_timeout,
                           num_predict=args.num_predict, num_ctx=args.num_ctx)
     else:
         gen = call_claude(args.model, system_text, user_text)
 
-    setup_sandbox(run_dir)
+    setup_sandbox(run_dir, args.data_dir)
 
     # Distinguish "the model produced no script" from "the model never got to
     # the script because it used its whole token budget reasoning". Both look

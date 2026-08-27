@@ -1,0 +1,206 @@
+We need to produce a self-contained bash script following constraints.
+
+Requirements:
+
+- First line: #!/usr/bin/env bash
+- Second line: set -euo pipefail
+
+- Assume current working directory contains data/raw/ and data/ref/. Reference file chrM.fa is decompressed but not indexed. We must index with bwa and samtools faidx if not already present.
+
+- Write outputs under results/.
+
+- Idempotent: rerunning on a populated results/ directory should exit 0 without redoing work or erroring. So we need to check existence of expected files before doing steps, skip if exist.
+
+- Use only tools listed in TOOL_INVENTORY. Tools available: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. We also need bgzip? It's part of htslib; but not listed. But we can use 'bgzip' from htslib? Not in inventory. However bcftools includes bgzip? Actually bcftools uses bgzip for compression, but the command is 'bgzip'. Is it available? The inventory lists tabix (htslib) 1.21; that likely includes bgzip as part of htslib. But not explicitly listed. Usually bgzip is in htslib. We can use 'bgzip' because it's part of htslib, but not listed. However the instruction says "Use only tools listed in TOOL_INVENTORY". So we cannot use bgzip if not listed. But bcftools has a built-in compression? Actually bcftools view -O z compresses to gz. We can do 'bcftools view -Oz -o results/{sample}.vcf.gz results/{sample}.vcf' and then tabix index. That would avoid using bgzip.
+
+- For variant calling, we use lofreq call-parallel. It outputs VCF. Then compress with bcftools view -Oz.
+
+- Collapsed TSV: need to query INFO/AF from VCF. But LoFreq may not include AF? Let's check typical LoFreq output: It includes INFO fields like AF (allele frequency). So we can use bcftools query.
+
+- Use awk to prepend sample name.
+
+- Ensure idempotent: For each step, test if outputs exist; skip accordingly.
+
+- We need to create results/ directory.
+
+- For reference indexing: bwa index data/ref/chrM.fa. BWA will produce .bwt, .ann, .amb, .pac, .sa files. We can check for existence of one of them e.g., chrM.fa.bwt. If exists skip.
+
+- samtools faidx: produce .fai file. Check if exists.
+
+- For each sample:
+
+  - BAM output: results/{sample}.bam. If exists skip alignment and sorting? But we also need to index bam; if bam exists but bai missing, we should create index. So check for both.
+
+  - Alignment pipeline: bwa mem ... | samtools sort -@ 4 -o results/...bam -. We can run only if bam not exist.
+
+  - Indexing: samtools index -@ 4 results/{sample}.bam . Skip if .bai exists.
+
+  - Variant calling: lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam. Skip if vcf.gz exists? But we need to produce compressed VCF; we can check for results/{sample}.vcf.gz. If not exist, run lofreq and compress.
+
+  - Compression: bcftools view -Oz -o results/{sample}.vcf.gz results/{sample}.vcf. Then tabix index. Skip if .tbi exists.
+
+  - Remove intermediate uncompressed VCF? Not necessary but could keep.
+
+- Collapsed TSV: produce header if not exist; then append per sample lines. But we need to avoid duplicate entries on rerun. So we can check if results/collapsed.tsv exists; if yes, skip entire collapsed step. Or we can regenerate from scratch each time (idempotent). Simpler: If file exists, exit 0. But requirement says "rerunning on a populated results/ directory must exit 0 without redoing work or erroring." So if all outputs exist, script should exit 0. That includes collapsed.tsv. So we can check at start: if all expected files exist, exit 0.
+
+- Let's design logic:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+REF="data/ref/chrM.fa"
+RESULTS_DIR="results"
+
+# Create results dir if not exist
+mkdir -p "$RESULTS_DIR"
+
+# Check if all outputs already present
+ALL_PRESENT=true
+for sample in "${SAMPLES[@]}"; do
+  [[ ! -f "$RESULTS_DIR/${sample}.bam" ]] && ALL_PRESENT=false
+  [[ ! -f "$RESULTS_DIR/${sample}.bam.bai" ]] && ALL_PRESENT=false
+  [[ ! -f "$RESULTS_DIR/${sample}.vcf.gz" ]] && ALL_PRESENT=false
+  [[ ! -f "$RESULTS_DIR/${sample}.vcf.gz.tbi" ]] && ALL_PRESENT=false
+done
+[[ ! -f "$RESULTS_DIR/collapsed.tsv" ]] && ALL_PRESENT=false
+
+if $ALL_PRESENT; then
+  exit 0
+fi
+
+# Reference indexing
+if [[ ! -f "${REF}.bwt" ]]; then
+  bwa index "$REF"
+fi
+
+if [[ ! -f "${REF}.fai" ]]; then
+  samtools faidx "$REF"
+fi
+
+# Per-sample processing
+for sample in "${SAMPLES[@]}"; do
+  BAM="$RESULTS_DIR/${sample}.bam"
+  BAI="$BAM.bai"
+  VCF="$RESULTS_DIR/${sample}.vcf"
+  VCFZ="$VCF.gz"
+  TBZ="$VCFZ.tbi"
+
+  # Alignment and sort if bam missing
+  if [[ ! -f "$BAM" ]]; then
+    bwa mem -t "$THREADS" -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+      "$REF" "data/raw/${sample}_1.fq.gz" "data/raw/${sample}_2.fq.gz" |
+      samtools sort -@ "$THREADS" -o "$BAM" -
+  fi
+
+  # BAM index
+  if [[ ! -f "$BAI" ]]; then
+    samtools index -@ "$THREADS" "$BAM"
+  fi
+
+  # Variant calling if vcf.gz missing
+  if [[ ! -f "$VCFZ" ]]; then
+    lofreq call-parallel --pp-threads "$THREADS" -f "$REF" -o "$VCF" "$BAM"
+
+    # Compress and index
+    bcftools view -Oz -o "$VCFZ" "$VCF"
+    tabix -p vcf "$VCFZ"
+  fi
+done
+
+# Collapsed TSV
+if [[ ! -f "$RESULTS_DIR/collapsed.tsv" ]]; then
+  printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$RESULTS_DIR/collapsed.tsv"
+  for sample in "${SAMPLES[@]}"; do
+    VCFZ="$RESULTS_DIR/${sample}.vcf.gz"
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "$VCFZ" |
+      awk -v s="$sample" 'BEGIN{OFS="\t"}{print s,$0}' >> "$RESULTS_DIR/collapsed.tsv"
+  done
+fi
+
+exit 0
+```
+
+We need to ensure no echo or prints except tool outputs. The script uses printf for header; that's okay? It writes to file, not stdout.
+
+Also we used bcftools view -Oz which compresses. That is fine.
+
+Check that bcftools query will output lines; if VCF has multiple alt alleles, it may produce multiple lines per variant. That's fine.
+
+We need to ensure tabix index extension: .tbi. The script uses tabix -p vcf "$VCFZ" which creates .tbi file.
+
+Also we used 'bwa mem -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"' but need to escape tabs properly. In bash, \t inside double quotes will be literal backslash t? Actually within double quotes, \t is not expanded; we need to use $'\t' or actual tab character. But easier: Use single quotes and escape with $'\t'. For example:
+
+```
+-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"
+```
+
+But inside double quotes, \t is not expanded; but BWA expects literal tab characters. We can use printf to generate the string? But easier: Use $'...' quoting:
+
+```
+-R $'@RG\tID:'"$sample"\tSM:'"$sample"'\tLB:'"$sample"'\tPL:ILLUMINA'
+```
+
+But that's messy.
+
+Alternatively, we can skip read group header; not required for variant calling. The plan includes it but it's optional. We could omit -R to simplify. But the plan says use -R. But requirement doesn't enforce that. But we might keep simple: no -R. That reduces complexity and potential quoting issues. But maybe they expect -R? It's fine to skip; not required.
+
+But we can include -R with proper quoting:
+
+```
+-R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA"
+```
+
+In bash, inside double quotes, \t remains as backslash t. BWA will interpret it? I think BWA expects literal tab characters; but if we pass backslash t, BWA might treat them literally and not parse correctly. So better to use $'...' quoting.
+
+Let's construct:
+
+```
+RG_TAG=$'@RG\tID:'"$sample"\tSM:'"$sample"'\tLB:'"$sample"'\tPL:ILLUMINA'
+bwa mem -t "$THREADS" -R "$RG_TAG" ...
+```
+
+But we need to ensure the variable expands correctly. Let's test mentally:
+
+$'@RG\tID:'"$sample"\tSM:'"$sample"'\tLB:'"$sample"'\tPL:ILLUMINA'
+
+The $'' quoting will interpret \t as tab. Then concatenated with "$sample". So final string contains tabs.
+
+Alternatively, we can use printf to produce the tag:
+
+```
+RG_TAG=$(printf '@RG\tID:%s\tSM:%s\tLB:%s\tPL:ILLUMINA' "$sample" "$sample" "$sample")
+bwa mem -t "$THREADS" -R "$RG_TAG" ...
+```
+
+This is simpler.
+
+Let's use that.
+
+Also we need to ensure the script uses only tools from inventory. We used bcftools, samtools, bwa, lofreq, tabix. All are in inventory.
+
+We also used printf and awk; those are standard shell utilities, allowed.
+
+Now idempotence: If some outputs exist but others missing, script will process accordingly. At start we check if all expected files exist; if yes exit 0. But if some missing, proceed to create them.
+
+Edge case: Suppose BAM exists but BAI missing; script will index. Good.
+
+Suppose VCFZ exists but .tbi missing? That would be weird; but we can handle by checking both.
+
+Also after variant calling, we produce uncompressed VCF file; we might keep it. But if script reruns and vcf.gz exists, we skip variant calling; but the uncompressed VCF may still exist from previous run. That's fine.
+
+Now ensure no stray echo or prints to stdout except tool outputs. We use printf for header writing to file; that's okay. No other output.
+
+We also used 'exit 0' at end.
+
+Also need to set -euo pipefail; we already did.
+
+Check that bcftools query uses %INFO/AF; if AF missing, it will print empty? But fine.
+
+Now check that all paths are relative: data/raw/... etc. Good.
+
+Now final script must be output as plain text with no markdown fences or commentary.
+
+Let's produce final script accordingly.

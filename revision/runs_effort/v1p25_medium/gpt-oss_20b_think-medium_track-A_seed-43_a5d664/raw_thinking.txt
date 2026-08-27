@@ -1,0 +1,238 @@
+We need to produce a bash script following constraints.
+
+Key points:
+
+- Use set -euo pipefail
+
+- Idempotent: check existence and timestamps.
+
+- Tools available: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. We need only some of them.
+
+- Need to index reference if not already indexed. Check for .fai and .amb etc.
+
+- For each sample: check if results/{sample}.bam.bai exists and is newer than inputs? Actually we can check existence of final artifact e.g., {sample}.vcf.gz.tbi maybe. But spec says skip if output exists. We need to ensure that re-running doesn't redo work. So for each step, guard with existence checks.
+
+Simplest: For each sample, if results/{sample}.bam.bai exists and is newer than raw fastq? but we can just check final artifact {sample}.vcf.gz.tbi; if it exists, skip all steps for that sample. That ensures idempotent.
+
+But need to also ensure reference indexing only once. Check presence of .amb or .fai.
+
+Collapse step: if collapsed.tsv exists and newer than any results/{sample}.vcf.gz? We can check by comparing timestamps. Use `if [ ! -s results/collapsed.tsv ] || [[ $(find results/*.vcf.gz -newer results/collapsed.tsv | wc -l) -gt 0 ]]; then ...` But simpler: if collapsed.tsv missing or any .vcf.gz newer than it, rebuild.
+
+Implementation details:
+
+- Use array of samples.
+
+- For each sample: check if results/${sample}.bam.bai exists and is newer than raw fastq? but we can just skip if results/${sample}.bam.bai exists. But what if bam exists but not index? We'll create index anyway. So maybe check for .vcf.gz.tbi existence; if present, assume all done.
+
+- For reference indexing: check if data/ref/chrM.fa.fai exists and data/ref/chrM.fa.amb exists (or any of the BWA index files). If missing, run samtools faidx and bwa index.
+
+- For each sample:
+
+  - Check if results/${sample}.vcf.gz.tbi exists; if yes skip all steps for that sample.
+
+  - Else perform alignment: bwa mem ... > pipe to samtools sort -@4 -o results/${sample}.bam
+
+  - Then samtools index
+
+  - lofreq call-parallel produce .vcf
+
+  - bgzip compress, tabix index, remove uncompressed vcf.
+
+- After all samples processed, collapse step:
+
+  - If collapsed.tsv missing or any results/*.vcf.gz newer than it: rebuild.
+
+  - Use bcftools query with format string. Need to prepend sample name; we can use `bcftools query -f '${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`. But the placeholder `${sample}` will be replaced by actual sample ID? In bcftools query, `%SAMPLE` is used. But they want literal {sample} string? Wait spec: "run `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz` (the `{sample}` literal is prepended via the format string so the sample name is attached per row)." So they want to use literal string {sample} not variable. But we need to replace with actual sample name. We can just echo sample name before each query output: `printf '%s\t' "$sample"`? But spec says use bcftools query with that format string; but bcftools query supports `%SAMPLE` placeholder for sample names, but they want literal {sample}. Actually maybe they intend to use the literal string `{sample}` as a placeholder replaced by bcftools? Wait bcftools query has `%SAMPLE`. But spec says "the `{sample}` literal is prepended via the format string so the sample name is attached per row". That means we can just use `printf '%s\t' "$sample"` before each line. But easier: run bcftools query -f "%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" and then prepend sample name with awk or paste.
+
+Simpler: Use `bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s="$sample" '{print s"\t"$0}'`. That yields sample column first. Then we can cat all.
+
+But spec says use bcftools query with format string including {sample}. But we can still meet requirement by using bcftools query and then adding sample via awk; it's okay? Might be considered deviation but acceptable.
+
+However to strictly follow, we could use `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`. But bcftools will treat `{sample}` as literal string. So output will start with "{sample}". That's not desired. They want sample name inserted. So we need to replace {sample} placeholder ourselves.
+
+Thus we can use `sed "s/{sample}/$sample/g"` after query. That would produce correct column. Let's do that: `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | sed "s/{sample}/$sample/"`. This will replace first occurrence of {sample} with actual sample name. Good.
+
+Now collapse: we can loop over samples, generate each output into a temp file or directly append to collapsed.tsv after header.
+
+Implementation:
+
+```
+tmpfile=$(mktemp)
+for s in "${samples[@]}"; do
+  bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${s}.vcf.gz | sed "s/{sample}/$s/" >> "$tmpfile"
+done
+header="sample\tchrom\tpos\tref\talt\taf"
+printf "%s\n%s" "$header" "$(cat $tmpfile)" > results/collapsed.tsv
+rm -f "$tmpfile"
+```
+
+But we need to check if collapsed.tsv needs rebuild: if missing or any .vcf.gz newer. Use find.
+
+Implementation for collapse:
+
+```
+if [ ! -s results/collapsed.tsv ] || \
+   [[ $(find results/*.vcf.gz -newer results/collapsed.tsv | wc -l) -gt 0 ]]; then
+    # rebuild
+fi
+```
+
+But `-newer` requires file path; we can use `find . -maxdepth 1 -name 'results/*.vcf.gz' -newer results/collapsed.tsv`. But find with pattern? Use `find results -maxdepth 1 -name '*.vcf.gz' -newer results/collapsed.tsv | grep -q .` to test.
+
+Simplify: use a loop over samples and compare timestamps:
+
+```
+rebuild=false
+for s in "${samples[@]}"; do
+  if [ ! -s results/${s}.vcf.gz.tbi ]; then rebuild=true; break; fi
+  if [ "$(stat -c %Y results/${s}.vcf.gz)" -gt "$(stat -c %Y results/collapsed.tsv 2>/dev/null || echo 0)" ]; then rebuild=true; break; fi
+done
+if $rebuild; then ... rebuild collapsed.tsv ...
+fi
+```
+
+But we need to handle case collapsed.tsv missing: if not exist, rebuild.
+
+Simpler: use `if [ ! -s results/collapsed.tsv ] || [[ $(find results/*.vcf.gz -newer results/collapsed.tsv | wc -l) -gt 0 ]]; then ...`. But find pattern may treat wildcard incorrectly. Use:
+
+```
+if [ ! -s results/collapsed.tsv ]; then rebuild=true; else
+   for f in results/*.vcf.gz; do
+      if [ "$f" -nt results/collapsed.tsv ]; then rebuild=true; break; fi
+   done
+fi
+```
+
+Ok.
+
+Now idempotent: For each sample, skip if final artifact exists. We'll check existence of results/${sample}.vcf.gz.tbi. If exists, skip all steps for that sample.
+
+But we also need to ensure that reference indexing is performed only once. Check presence of .amb file or .fai.
+
+Implementation:
+
+```
+if [ ! -s data/ref/chrM.fa.fai ]; then samtools faidx data/ref/chrM.fa; fi
+if [ ! -s data/ref/chrM.fa.amb ]; then bwa index data/ref/chrM.fa; fi
+```
+
+Now per sample steps.
+
+Also need to ensure that we don't produce intermediate files if step fails? But set -e ensures exit on error.
+
+We must not write to stdout except tool outputs. So no echo for progress. Use commands only.
+
+But we might use `printf` for header writing collapsed.tsv; that's okay because it's output to file, not stdout? Actually printf writes to stdout unless redirected. We'll redirect to file: `printf ... > results/collapsed.tsv`. That's fine.
+
+Now script skeleton:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+samples=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+# Create results dir if missing
+mkdir -p results
+
+# Reference indexing
+if [ ! -s data/ref/chrM.fa.fai ]; then
+    samtools faidx data/ref/chrM.fa
+fi
+if [ ! -s data/ref/chrM.fa.amb ]; then
+    bwa index data/ref/chrM.fa
+fi
+
+for s in "${samples[@]}"; do
+    # Skip if final VCF index exists
+    if [ -s "results/${s}.vcf.gz.tbi" ]; then
+        continue
+    fi
+
+    # Alignment and sorting
+    bwa mem -t "$THREADS" \
+        -R "@RG\\tID:${s}\\tSM:${s}\\tLB:${s}\\tPL:ILLUMINA" \
+        data/raw/"${s}"_1.fq.gz data/raw/"${s}"_2.fq.gz |
+        samtools sort -@ "$THREADS" -o "results/${s}.bam"
+
+    # Index BAM
+    samtools index -@ "$THREADS" "results/${s}.bam"
+
+    # Variant calling
+    lofreq call-parallel --pp-threads "$THREADS" \
+        -f data/ref/chrM.fa -o "results/${s}.vcf" "results/${s}.bam"
+
+    # Compress and index VCF
+    bgzip -c "results/${s}.vcf" > "results/${s}.vcf.gz"
+    tabix -p vcf "results/${s}.vcf.gz"
+    rm -f "results/${s}.vcf"
+done
+
+# Collapse step
+rebuild=false
+if [ ! -s results/collapsed.tsv ]; then rebuild=true; else
+    for f in results/*.vcf.gz; do
+        if [ "$f" -nt results/collapsed.tsv ]; then rebuild=true; break; fi
+    done
+fi
+
+if $rebuild; then
+    tmp=$(mktemp)
+    for s in "${samples[@]}"; do
+        bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${s}.vcf.gz" | \
+            sed "s/{sample}/$s/" >> "$tmp"
+    done
+    printf 'sample\tchrom\tpos\tref\talt\taf\n%s' "$(cat "$tmp")" > results/collapsed.tsv
+    rm -f "$tmp"
+fi
+
+exit 0
+```
+
+But we used `bgzip` which is part of bcftools? Actually bgzip is separate but usually available as part of htslib. It's not listed in TOOL_INVENTORY, but bcftools includes bgzip binary? Usually yes: `bgzip` is a separate executable from htslib; but not listed. But we can use `bcftools view -O z`. However spec says "Compress with bgzip (not bcftools view -O z)". So need bgzip. Is it available? Not in TOOL_INVENTORY list, but maybe it's part of samtools or bcftools distribution. Usually bgzip is separate binary from htslib; might be present. But not guaranteed. However we can use `samtools view -O z` to compress VCF? That would produce compressed BCF, not VCF. We need gzipped VCF. The spec explicitly says use bgzip. So assume bgzip exists.
+
+Also we used `tabix`. It's in inventory.
+
+We also used `bcftools query`. Good.
+
+Now check read group string: They require literal backslash-t characters. In bash script, we must ensure that the argument passed to bwa mem contains those two characters. We wrote:
+
+```
+-R "@RG\\tID:${s}\\tSM:${s}\\tLB:${s}\\tPL:ILLUMINA"
+```
+
+In double quotes, `\\t` becomes literal backslash-t? Let's test mentally: In bash, inside double quotes, `\\` is escape for backslash; so `\\t` results in `\t`. So the string passed to bwa will contain \t. Good.
+
+Now we need to ensure that no other quoting issues. The -R argument must be a single string. We used double quotes around entire string. That should work.
+
+Now check if we used any echo or printf for progress; only final header writing uses printf but redirected to file, not stdout. That's fine.
+
+We didn't use any external commands beyond inventory.
+
+Check idempotency: For each sample, skip if .vcf.gz.tbi exists. But what if bam exists but vcf missing? Then we will redo all steps. That's acceptable because final artifact missing triggers re-run. Good.
+
+Now collapse step: We used `printf 'sample\tchrom\tpos\tref\talt\taf\n%s' "$(cat "$tmp")" > results/collapsed.tsv`. That writes header and then content. But we need newline after header; we added \n in format string before %s, but we didn't add newline at end of cat output? The cat output ends with newline per line. So final file will have header line followed by all lines. Good.
+
+But we used `printf 'sample\tchrom\tpos\tref\talt\taf\n%s' "$(cat "$tmp")"`. This expands the content into a single string argument; if there are many lines, might exceed command-line length? But small dataset. Acceptable.
+
+Alternatively use `printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv` then cat >> results/collapsed.tsv. That is simpler and safer. Let's change to that.
+
+```
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+cat "$tmp" >> results/collapsed.tsv
+```
+
+Ok.
+
+Now we need to ensure `bgzip` command available; but not in inventory list. But maybe it's part of bcftools distribution. We'll assume present.
+
+Also we used `samtools sort -@`. Good.
+
+We didn't use any other tools.
+
+Edge: We used `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'` which includes literal {sample}. Then sed replaces. Works.
+
+Now final script ready.
+
+Let's produce final answer with only the script.

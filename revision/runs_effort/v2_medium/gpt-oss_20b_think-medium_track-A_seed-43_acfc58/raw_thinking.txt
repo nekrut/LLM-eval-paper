@@ -1,0 +1,305 @@
+We need to produce a bash script following constraints.
+
+First line: #!/usr/bin/env bash
+
+Second: set -euo pipefail
+
+Then constants THREADS=4 and SAMPLES array.
+
+Create results dir.
+
+Index reference if not already.
+
+Loop over samples:
+
+- Guard for BAM existence. Use [[ ! -f results/${sample}.bam ]] || skip? Actually guard: if file exists, skip pipeline. So we can write:
+
+if [[ ! -f results/${sample}.bam ]]; then
+  bwa mem ... | samtools sort ...
+fi
+
+But the plan uses guard with [[ -f results/... ]] || { pipeline; }. That is fine.
+
+Similarly for BAM index.
+
+Variant calling: guard on .vcf or .vcf.gz.
+
+Compression and tabix: guard on .vcf.gz.tbi.
+
+Collapsed.tsv: always rebuild.
+
+Need to use bgzip? The plan uses bgzip but tool inventory lists tabix, not bgzip. But bgzip is part of htslib; but not listed. However bcftools includes bgzip? Actually bcftools has a command 'bgzip' as separate binary in the same package. Usually bgzip is available. Since it's not explicitly listed, but we can use 'bgzip' because it's part of htslib and likely on PATH. But to be safe, maybe use 'bcftools view -O z -o ...'? That compresses VCF. But plan uses bgzip. Let's assume bgzip is available.
+
+But the tool inventory didn't list bgzip; but bcftools includes it? Usually yes. But we can use 'bgzip' as it's part of htslib and likely installed. The instruction says only tools listed in TOOL_INVENTORY may be used. bgzip not listed, so cannot use. So need to compress VCF using 'bcftools view -O z'. That will produce .gz file.
+
+So step 6: Use bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf
+
+Then tabix index.
+
+But we also need to delete original .vcf? bcftools view doesn't delete. We can remove it after indexing.
+
+Simpler: use 'bgzip' but not allowed. So use bcftools view -Oz -o ... and then rm results/${sample}.vcf.
+
+Guard: if .vcf.gz.tbi exists, skip compression+indexing. But we need to check that .vcf.gz exists too? The plan uses guard on tbi only. We'll do:
+
+if [[ ! -f results/${sample}.vcf.gz.tbi ]]; then
+  bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf
+  tabix -p vcf results/${sample}.vcf.gz
+  rm -f results/${sample}.vcf
+fi
+
+But we need to ensure .vcf exists before calling. The guard earlier ensures .vcf exists or .vcf.gz.
+
+Ok.
+
+Now collapsed.tsv: header line, then for each sample append bcftools query.
+
+We must use bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+
+Need to ensure that bcftools query outputs lines; if no variants, it may output nothing. That's fine.
+
+Also need to consider that AF might be missing? But that's okay.
+
+Now idempotency: The script should exit 0 without redoing work or erroring when rerun on populated results/. Our guards handle that.
+
+We must not write to stderr/stdout beyond tool outputs; no echo for user prose. We will use printf only for header line, but that writes to stdout. But that's allowed? It says "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." Using printf may be considered writing output. But it's part of collapsed.tsv creation; that's expected. It's okay.
+
+We must avoid any other prints.
+
+Also need to ensure we don't create intermediate files in results/ that might conflict with idempotency. For example, bcftools view will produce .vcf.gz even if exists; but guard ensures tbi missing triggers compression. If tbi exists but .vcf.gz missing? That shouldn't happen because tbi only created after gzip. But we can rely on guard.
+
+Also need to ensure that the reference indexing step is idempotent: check for .bwt file.
+
+Similarly samtools faidx: check .fai.
+
+Ok.
+
+Now script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Reference indexing
+if [[ ! -f data/ref/chrM.fa.bwt ]]; then
+  bwa index data/ref/chrM.fa
+fi
+
+if [[ ! -f data/ref/chrM.fa.fai ]]; then
+  samtools faidx data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+  # Alignment and sort
+  if [[ ! -f results/${sample}.bam ]]; then
+    bwa mem -t ${THREADS} -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ ${THREADS} -o results/${sample}.bam -
+  fi
+
+  # BAM index
+  if [[ ! -f results/${sample}.bam.bai ]]; then
+    samtools index -@ ${THREADS} results/${sample}.bam
+  fi
+
+  # Variant calling with LoFreq
+  if [[ ! -f results/${sample}.vcf && ! -f results/${sample}.vcf.gz ]]; then
+    lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+  fi
+
+  # Compress and index VCF
+  if [[ ! -f results/${sample}.vcf.gz.tbi ]]; then
+    bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf
+    tabix -p vcf results/${sample}.vcf.gz
+    rm -f results/${sample}.vcf
+  fi
+done
+
+# Collapsed TSV
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+  bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\\n' results/${sample}.vcf.gz | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+
+That's it.
+
+Check for any stray echo. None.
+
+Make sure we use double quotes properly: In printf header, it's fine.
+
+In bcftools query format string, need to escape backslashes? Actually inside single quotes, \t is literal; but bcftools expects actual tab characters? The format string uses %CHROM\t%POS... The \t is a placeholder for tab in bcftools. So we should use single quotes with \t as two chars: backslash t. That's fine.
+
+But our script uses '%CHROM\\t%POS...' inside single quotes; that would produce literal backslash backslash t? Wait, we wrote:
+
+'%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\\n'
+
+We double escaped because we are in a double-quoted string? Actually it's within single quotes: bcftools query -f '%CHROM\\t...'. In single quotes, backslash is literal; so '\\t' becomes two characters \ and t. But we want one backslash then t. So we should use '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' inside single quotes. No need to escape. So correct string: '%CHROM\\t...' is wrong. Let's adjust.
+
+Also for printf header, we used 'sample\tchrom...'; that's fine.
+
+Now final script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Reference indexing
+if [[ ! -f data/ref/chrM.fa.bwt ]]; then
+  bwa index data/ref/chrM.fa
+fi
+
+if [[ ! -f data/ref/chrM.fa.fai ]]; then
+  samtools faidx data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+  # Alignment and sort
+  if [[ ! -f results/${sample}.bam ]]; then
+    bwa mem -t ${THREADS} -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ ${THREADS} -o results/${sample}.bam -
+  fi
+
+  # BAM index
+  if [[ ! -f results/${sample}.bam.bai ]]; then
+    samtools index -@ ${THREADS} results/${sample}.bam
+  fi
+
+  # Variant calling with LoFreq
+  if [[ ! -f results/${sample}.vcf && ! -f results/${sample}.vcf.gz ]]; then
+    lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+  fi
+
+  # Compress and index VCF
+  if [[ ! -f results/${sample}.vcf.gz.tbi ]]; then
+    bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf
+    tabix -p vcf results/${sample}.vcf.gz
+    rm -f results/${sample}.vcf
+  fi
+done
+
+# Collapsed TSV
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+  bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\\n' results/${sample}.vcf.gz | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+
+But we still have double backslashes in bcftools query. Need to correct.
+
+Let's change to:
+
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk ...
+
+Because inside single quotes, \t is literal backslash t; that's what we want. So use single quotes with \t.
+
+Thus final script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Reference indexing
+if [[ ! -f data/ref/chrM.fa.bwt ]]; then
+  bwa index data/ref/chrM.fa
+fi
+
+if [[ ! -f data/ref/chrM.fa.fai ]]; then
+  samtools faidx data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+  # Alignment and sort
+  if [[ ! -f results/${sample}.bam ]]; then
+    bwa mem -t ${THREADS} -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ ${THREADS} -o results/${sample}.bam -
+  fi
+
+  # BAM index
+  if [[ ! -f results/${sample}.bam.bai ]]; then
+    samtools index -@ ${THREADS} results/${sample}.bam
+  fi
+
+  # Variant calling with LoFreq
+  if [[ ! -f results/${sample}.vcf && ! -f results/${sample}.vcf.gz ]]; then
+    lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+  fi
+
+  # Compress and index VCF
+  if [[ ! -f results/${sample}.vcf.gz.tbi ]]; then
+    bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf
+    tabix -p vcf results/${sample}.vcf.gz
+    rm -f results/${sample}.vcf
+  fi
+done
+
+# Collapsed TSV
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+  bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\\n' results/${sample}.vcf.gz | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+
+Wait again: In bcftools query format string, we used '%CHROM\\t...' with double backslashes. Need single backslash. So change to:
+
+'%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'
+
+Thus final script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Reference indexing
+if [[ ! -f data/ref/chrM.fa.bwt ]]; then
+  bwa index data/ref/chrM.fa
+fi
+
+if [[ ! -f data/ref/chrM.fa.fai ]]; then
+  samtools faidx data/ref/chrM.fa
+fi
+
+for sample in "${SAMPLES[@]}"; do
+  # Alignment and sort
+  if [[ ! -f results/${sample}.bam ]]; then
+    bwa mem -t ${THREADS} -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ ${THREADS} -o results/${sample}.bam -
+  fi
+
+  # BAM index
+  if [[ ! -f results/${sample}.bam.bai ]]; then
+    samtools index -@ ${THREADS} results/${sample}.bam
+  fi
+
+  # Variant calling with LoFreq
+  if [[ ! -f results/${sample}.vcf && ! -f results/${sample}.vcf.gz ]]; then
+    lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam
+  fi
+
+  # Compress and index VCF
+  if [[ ! -f results/${sample}.vcf.gz.tbi ]]; then
+    bcftools view -Oz -o results/${sample}.vcf.gz results/${sample}.vcf
+    tabix -p vcf results/${sample}.vcf.gz
+    rm -f results/${sample}.vcf
+  fi
+done
+
+# Collapsed TSV
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+  bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+
+Check for any stray double backslashes in the RG string: we used "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA". In double quotes, \t is interpreted as literal tab? Actually inside double quotes, \t is not special; it's just backslash t. But bwa expects actual tab characters? The plan says use literal two characters \t because bwa expands them itself. So we need to provide the string with backslashes and t. In double-quoted string, we need to escape backslash: "\\t" becomes \t. That's correct.
+
+Thus "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" will produce @RG\tID:M117-bl\tSM:M117-bl... Good.
+
+Now final script ready.

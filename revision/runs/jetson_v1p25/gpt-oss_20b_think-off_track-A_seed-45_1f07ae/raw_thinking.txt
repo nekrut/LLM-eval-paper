@@ -1,0 +1,393 @@
+We need to produce a Bash script that follows plan.
+
+Constraints: only tools listed; use set -euo pipefail; idempotent; no echo for user-facing prose; no extra output beyond tool natural outputs.
+
+Need to create results/ directory if missing.
+
+Reference indexing: check existence of .amb etc. For bwa index, need to check presence of .bwt? Usually all files. We'll check for chrM.fa.bwt maybe. But safer: check for chrM.fa.bwt; if not exist run both commands.
+
+For samtools faidx: check for .fai file.
+
+Per-sample alignment: need to skip if results/{sample}.bam exists and is newer than inputs? We can use `if [ ! -s results/${sample}.bam ] || [[ ... ]]`. But easier: we can use `if [ ! -e results/${sample}.bam ]; then ... fi` but that doesn't check timestamps. The requirement says "skip if the output already exists" maybe enough. But to be safe, we might skip if bam exists and is newer than raw fastq? Not necessary.
+
+But for collapsed.tsv: need to rebuild only if any input VCF is newer than TSV. So we can use `if [ ! -e results/collapsed.tsv ] || [[ $(find results/*.vcf.gz -newer results/collapsed.tsv | wc -l) -gt 0 ]]; then ... fi`.
+
+But find may produce many lines; easier: use `touch`? We'll compute.
+
+Simplify: we can check if collapsed.tsv exists and all vcf.gz are older than it. Use `if [ ! -e results/collapsed.tsv ] || [[ $(find results/*.vcf.gz -newer results/collapsed.tsv | wc -l) -gt 0 ]]; then ... fi`.
+
+Ok.
+
+Also need to compress VCF with bgzip; but tool list doesn't include bgzip? Wait bcftools includes bgzip as part of package. But not listed explicitly. We can use `bgzip` command (should be available). It's part of htslib. We'll assume it's on PATH.
+
+We also need to index with tabix -p vcf.
+
+For collapse step: we run bcftools query for each sample and combine.
+
+Implementation details:
+
+- Use array samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+- THREADS=4
+
+- For reference indexing: check if data/ref/chrM.fa.bwt exists; if not, run samtools faidx and bwa index.
+
+- For each sample:
+
+  - If results/${sample}.bam does not exist or is older than raw fastqs? We'll just skip if bam exists. But we also need to ensure that if bam exists but vcf missing, we still produce vcf. So we can check each step individually: e.g., if results/${sample}.bam.bai doesn't exist then index; if results/${sample}.vcf.gz.tbi missing then call lofreq etc.
+
+But easier: just run steps with existence checks:
+
+- Alignment: if results/${sample}.bam not exists, run alignment and sort. If bam exists but .bai missing, run samtools index.
+
+- Variant calling: if results/${sample}.vcf.gz.tbi missing, run lofreq call-parallel then bgzip etc.
+
+But we also need to ensure that if vcf.gz exists but tbi missing, we still create tbi.
+
+Ok.
+
+Implementation:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+# Create results dir
+mkdir -p results
+
+# Reference indexing
+ref="data/ref/chrM.fa"
+if [ ! -f "${ref}.bwt" ]; then
+    samtools faidx "$ref"
+    bwa index "$ref"
+fi
+
+for sample in "${samples[@]}"; do
+    fq1="data/raw/${sample}_1.fq.gz"
+    fq2="data/raw/${sample}_2.fq.gz"
+    bam="results/${sample}.bam"
+
+    # Alignment if not present
+    if [ ! -f "$bam" ]; then
+        bwa mem -t "$THREADS" \
+            -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+            "$ref" "$fq1" "$fq2" | samtools sort -@ "$THREADS" -o "$bam"
+    fi
+
+    # Index BAM if not present
+    bai="${bam}.bai"
+    if [ ! -f "$bai" ]; then
+        samtools index -@ "$THREADS" "$bam"
+    fi
+
+    vcf="results/${sample}.vcf.gz"
+    tbi="${vcf}.tbi"
+
+    # Variant calling if not present
+    if [ ! -f "$tbi" ]; then
+        tmp_vcf="results/${sample}.vcf"
+        lofreq call-parallel --pp-threads "$THREADS" -f "$ref" -o "$tmp_vcf" "$bam"
+        bgzip -c "$tmp_vcf" > "$vcf"
+        tabix -p vcf "$vcf"
+        rm -f "$tmp_vcf"
+    fi
+done
+
+# Collapse step
+collapsed="results/collapsed.tsv"
+
+need_rebuild=false
+if [ ! -f "$collapsed" ]; then
+    need_rebuild=true
+else
+    for sample in "${samples[@]}"; do
+        if [ "$(find results/${sample}.vcf.gz -newer "$collapsed")" ]; then
+            need_rebuild=true
+            break
+        fi
+    done
+fi
+
+if $need_rebuild; then
+    header="sample\tchrom\tpos\tref\talt\taf"
+    printf "%s\n" "$header" > "$collapsed"
+    for sample in "${samples[@]}"; do
+        bcftools query -f "${sample}\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\\n" "results/${sample}.vcf.gz" >> "$collapsed"
+    done
+fi
+
+exit 0
+```
+
+But we used `find results/${sample}.vcf.gz -newer "$collapsed"`; find returns nothing if not newer. But we need to test if any file is newer. We can use:
+
+```
+if [ "$(find results/*.vcf.gz -newer "$collapsed" | wc -l)" -gt 0 ]; then
+    need_rebuild=true
+fi
+```
+
+But we used per sample find; simpler: after loop, check.
+
+Also we used `printf` for header; that's fine (tool natural output). But requirement says "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." Using printf is okay? It's a tool. Might be considered writing to stdout but it's part of script, not user-facing? The instruction: "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." So we can use printf to produce header; that's fine.
+
+But we used `printf "%s\n" "$header" > "$collapsed"` which writes to file. That's okay.
+
+We also used `bgzip -c`. bgzip is part of htslib, should be available.
+
+Also we used `tabix -p vcf`.
+
+Now idempotency: if all outputs exist and are newer than inputs, script will exit 0 without doing anything. Our checks may still run some steps if outputs missing or older. For collapsed.tsv, we check if any vcf.gz newer; but we didn't check for bam etc. But that's okay.
+
+But we need to ensure that if results/ is fully populated, script exits 0 quickly. Our loops will skip each step because existence checks pass. So fine.
+
+Edge: The alignment step uses `bwa mem -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`. We need to ensure that the backslashes are preserved as literal \t. In bash, double quotes will interpret escape sequences? Actually inside double quotes, backslash before t is not special; only certain escapes like \n, \r, etc. But `\t` is not a recognized escape in Bash; it remains literally backslash-t. So our string is fine.
+
+But we used `-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`. That will produce literal \t? Wait inside double quotes, `\\` becomes a single backslash; then t remains t. So the resulting string is `@RG\tID:M117-bl\tSM:M117-bl\tLB:M117-bl\tPL:ILLUMINA`. Good.
+
+Now we used `samtools sort -@ "$THREADS" -o "$bam"`; but need to pipe from bwa mem output. We did that.
+
+But we didn't specify input file for samtools sort; it's reading from stdin, which is fine.
+
+Now variant calling: lofreq call-parallel writes uncompressed VCF. We then compress with bgzip -c > vcf.gz. Then tabix index. Remove tmp_vcf.
+
+Potential issue: if tbi exists but vcf.gz missing? But we check only tbi existence; if tbi exists but vcf.gz missing, script will skip variant calling and leave broken state. But scenario unlikely because tbi created after vcf.gz. So fine.
+
+Now collapsed.tsv: We used `bcftools query -f "${sample}\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\\n"`. The format string uses backslash to escape tab? Actually inside double quotes, `\t` is literal \t. But we want actual tab in output; bcftools query expects `%sample\t...`? Wait the plan says: "bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'". They used single quotes and braces. In our script, we need to produce same format string. We can use single quotes around format string to avoid shell interpretation. But we also need variable substitution for sample name. So we can do:
+
+```
+bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" ...
+```
+
+But inside double quotes, `\t` is literal backslash-t; but bcftools expects actual tab? Actually bcftools query format string uses \t to represent a tab. So we need to provide literal backslash-t. In double quotes, `\t` remains as backslash-t because it's not recognized escape. Good.
+
+But we also used `%INFO/AF\n`. The newline is represented by \n; again not recognized escape in Bash? Actually \n is recognized in $'...' but not in double quotes. So it will remain literal backslash-n, which bcftools interprets as newline. Good.
+
+Thus our format string works.
+
+But we used `printf "%s\n" "$header"` to write header line; that's fine.
+
+Now we need to ensure script uses only tools from inventory: we used bgzip (not listed but part of htslib). But not in list. The list includes tabix, samtools, bcftools, lofreq, bwa, etc. bgzip is part of htslib and usually installed with samtools/bcftools; maybe available as `bgzip`. It's likely present. If not, we could use `bcftools view -O z` but they said to use bgzip. But bcftools view -O z also uses bgzip internally. But they explicitly say "Compress with bgzip (not bcftools view -O z)". So bgzip must be available.
+
+Ok.
+
+Now idempotency: script will exit 0 after loops if nothing done. Good.
+
+We need to ensure no stray echo or prints except header writing and bcftools query output etc. We used printf for header; that's fine.
+
+But we also used `printf "%s\n" "$header"` which writes to stdout? Actually we redirect > collapsed.tsv, so it's not printed to console. So okay.
+
+Now we need to ensure script uses only tools from inventory: we used bgzip and tabix (tabix is in list). Good.
+
+We didn't use any other commands like find; but find is part of coreutils, allowed. But maybe they consider it fine.
+
+But we used `find results/*.vcf.gz -newer "$collapsed" | wc -l`. That's okay.
+
+However, we used `if [ "$(find results/${sample}.vcf.gz -newer "$collapsed")" ]; then` which may produce output; but find returns nothing if not newer. The test will be true if string non-empty. That works.
+
+But we also used `if [ ! -f "$tbi" ]; then ... fi`. Good.
+
+Now we need to ensure script uses only tools from inventory and core utilities (bash, find, printf). That's fine.
+
+Edge: In collapsed.tsv rebuild check, we used variable need_rebuild; but we didn't initialize it before use. We set `need_rebuild=false` earlier? Actually we defined after loops: `collapsed="results/collapsed.tsv"` then `need_rebuild=false`. Good.
+
+But we used `if [ ! -f "$collapsed" ]; then need_rebuild=true; else ... fi`. That sets variable accordingly.
+
+Now inside loop, we used `[ "$(find results/${sample}.vcf.gz -newer "$collapsed")" ]` but find may output nothing if not newer. The test will be false. Good.
+
+But we didn't break after setting true? We set need_rebuild=true and break; good.
+
+Now final rebuild: `if $need_rebuild; then ... fi`. That uses variable as command; but need to use `[ "$need_rebuild" = true ]` or just `if $need_rebuild; then`. Since need_rebuild is string "true"/"false", using it as a command will attempt to execute "true" or "false". In bash, "true" and "false" are commands that exit 0/1. So it's fine.
+
+Now we used `printf "%s\n" "$header" > "$collapsed"`; but header contains tabs; that's fine.
+
+Now bcftools query: We need to ensure the format string uses literal backslash-t and \n. In double quotes, they remain as such. Good.
+
+But we also used `${sample}\t%CHROM\t...` inside double quotes; sample variable will be substituted; then `\t` remains as backslash-t. So final string is e.g., "M117-bl\t%CHROM\t%POS..." which bcftools interprets correctly.
+
+Now we need to ensure that the script uses only tools from inventory and core utilities; we used find, printf, wc, etc. That's fine.
+
+Now we should check for potential missing dependencies: `bgzip` may not be in PATH but part of htslib; but it's usually installed with samtools/bcftools. We'll assume present.
+
+Also we need to ensure that the script uses `tabix -p vcf`. Good.
+
+Now final script lines:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+ref="data/ref/chrM.fa"
+if [ ! -f "${ref}.bwt" ]; then
+    samtools faidx "$ref"
+    bwa index "$ref"
+fi
+
+for sample in "${samples[@]}"; do
+    fq1="data/raw/${sample}_1.fq.gz"
+    fq2="data/raw/${sample}_2.fq.gz"
+    bam="results/${sample}.bam"
+
+    if [ ! -f "$bam" ]; then
+        bwa mem -t "$THREADS" \
+            -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+            "$ref" "$fq1" "$fq2" | samtools sort -@ "$THREADS" -o "$bam"
+    fi
+
+    bai="${bam}.bai"
+    if [ ! -f "$bai" ]; then
+        samtools index -@ "$THREADS" "$bam"
+    fi
+
+    vcf="results/${sample}.vcf.gz"
+    tbi="${vcf}.tbi"
+
+    if [ ! -f "$tbi" ]; then
+        tmp_vcf="results/${sample}.vcf"
+        lofreq call-parallel --pp-threads "$THREADS" -f "$ref" -o "$tmp_vcf" "$bam"
+        bgzip -c "$tmp_vcf" > "$vcf"
+        tabix -p vcf "$vcf"
+        rm -f "$tmp_vcf"
+    fi
+done
+
+collapsed="results/collapsed.tsv"
+need_rebuild=false
+if [ ! -f "$collapsed" ]; then
+    need_rebuild=true
+else
+    for sample in "${samples[@]}"; do
+        if [ "$(find results/${sample}.vcf.gz -newer "$collapsed")" ]; then
+            need_rebuild=true
+            break
+        fi
+    done
+fi
+
+if $need_rebuild; then
+    header="sample\tchrom\tpos\tref\talt\taf"
+    printf "%s\n" "$header" > "$collapsed"
+    for sample in "${samples[@]}"; do
+        bcftools query -f "${sample}\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\\n" "results/${sample}.vcf.gz" >> "$collapsed"
+    done
+fi
+
+exit 0
+```
+
+Check for missing semicolons or syntax errors.
+
+- In the `if [ "$(find results/${sample}.vcf.gz -newer "$collapsed")" ]; then` line, we need to escape `$sample` variable inside double quotes? It's fine. But find command may produce output; but if no newer file, it outputs nothing and test fails. Good.
+
+But we used `$(find results/${sample}.vcf.gz -newer "$collapsed")`. If find returns nothing, the string is empty; test will be false. Good.
+
+However, find might return multiple lines? But only one file path; but if there are multiple vcf files newer than collapsed, we may still get output from each; but we break after first found. That's fine.
+
+But we used `if [ "$(find results/${sample}.vcf.gz -newer "$collapsed")" ]; then` which will treat the string as non-empty if any file is newer. Good.
+
+Now we need to ensure that find command uses correct syntax: `-newer FILE`. That works.
+
+Now we also used `bgzip -c "$tmp_vcf" > "$vcf"`; but bgzip may not support -c? It does. Good.
+
+Now we used `tabix -p vcf "$vcf"`; good.
+
+Now we need to ensure that the script uses only tools from inventory: we used find, printf, wc (not used). But find is coreutils; allowed.
+
+Now we should check for any stray spaces or missing quotes.
+
+Let's rewrite final script carefully:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+ref="data/ref/chrM.fa"
+if [ ! -f "${ref}.bwt" ]; then
+    samtools faidx "$ref"
+    bwa index "$ref"
+fi
+
+for sample in "${samples[@]}"; do
+    fq1="data/raw/${sample}_1.fq.gz"
+    fq2="data/raw/${sample}_2.fq.gz"
+    bam="results/${sample}.bam"
+
+    if [ ! -f "$bam" ]; then
+        bwa mem -t "$THREADS" \
+            -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+            "$ref" "$fq1" "$fq2" | samtools sort -@ "$THREADS" -o "$bam"
+    fi
+
+    bai="${bam}.bai"
+    if [ ! -f "$bai" ]; then
+        samtools index -@ "$THREADS" "$bam"
+    fi
+
+    vcf="results/${sample}.vcf.gz"
+    tbi="${vcf}.tbi"
+
+    if [ ! -f "$tbi" ]; then
+        tmp_vcf="results/${sample}.vcf"
+        lofreq call-parallel --pp-threads "$THREADS" -f "$ref" -o "$tmp_vcf" "$bam"
+        bgzip -c "$tmp_vcf" > "$vcf"
+        tabix -p vcf "$vcf"
+        rm -f "$tmp_vcf"
+    fi
+done
+
+collapsed="results/collapsed.tsv"
+need_rebuild=false
+if [ ! -f "$collapsed" ]; then
+    need_rebuild=true
+else
+    for sample in "${samples[@]}"; do
+        if [ "$(find results/${sample}.vcf.gz -newer "$collapsed")" ]; then
+            need_rebuild=true
+            break
+        fi
+    done
+fi
+
+if $need_rebuild; then
+    header="sample\tchrom\tpos\tref\talt\taf"
+    printf "%s\n" "$header" > "$collapsed"
+    for sample in "${samples[@]}"; do
+        bcftools query -f "${sample}\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\\n" "results/${sample}.vcf.gz" >> "$collapsed"
+    done
+fi
+
+exit 0
+```
+
+Check for missing backslashes: In the format string we used `${sample}\\t%CHROM...` inside double quotes; that will produce literal backslash-t. Good.
+
+Now check for quoting of `-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`; good.
+
+Now ensure no stray spaces after backslashes.
+
+Also we used `bwa mem -t "$THREADS" \` line break with backslash. Good.
+
+Now final script ready.
+
+But we need to double-check that the collapsed.tsv header uses tabs, not spaces. We used `header="sample\tchrom\tpos\tref\talt\taf"`; that's fine.
+
+Now ensure bcftools query output lines have newline at end; format string ends with \n which is literal backslash-n; bcftools interprets as newline. Good.
+
+Now we need to ensure that the script uses only tools from inventory: We used `bgzip` and `tabix`. They are part of htslib, but not explicitly listed. But they might be available. The instruction says "Use only tools listed in TOOL_INVENTORY." It lists tabix but not bgzip. However, bgzip is part of samtools/bcftools distribution; maybe considered part of inventory? Not sure. To avoid risk, we could compress with `samtools view -O z` or `bcftools view -O z`. But instruction says "Compress with bgzip (not bcftools view -O z)". So they expect bgzip to be available. It's likely present.
+
+Now we used `find`, which is coreutils; not in inventory but allowed as standard tool? The instructions didn't forbid using other tools, only that we must use only those listed for main tasks. Using find and printf is fine.
+
+Now final script ready.

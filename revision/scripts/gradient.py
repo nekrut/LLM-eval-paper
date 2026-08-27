@@ -117,20 +117,81 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
 
 
 def load(arm: str) -> list[dict]:
-    p = LOGS / f"matrix_jetson_think{arm}.jsonl"
+    """arm is 'off', 'on', or 'frontier'.
+
+    'frontier' reads the Anthropic reference gradient. It goes through the same
+    column() mapping as the local arms, which is the whole point: reporting the
+    frontier row without collapsing Track B is the error that put "0.63 to 1.00
+    at Track B" and "saturates at v1g" into the first version of the manuscript.
+    Collapsed, Track B is 0.74-0.87 and saturation is at v1.
+    """
+    name = "matrix_jetson.jsonl" if arm == "frontier" else f"matrix_jetson_think{arm}.jsonl"
+    p = LOGS / name
     if not p.exists():
         raise SystemExit(f"no log at {p}")
     return [json.loads(l) for l in open(p)]
 
 
+def cellkey(r: dict) -> tuple[str, str]:
+    """(model, column) for a log record, honouring the Track-B collapse rule."""
+    cell = r["cell"]
+    track = "B" if "_track-B" in cell else "A"
+    # Local cells are <model>_think-<on|off>_track-<X>_seed-<n>; frontier API
+    # cells are <model>_track-<X>_seed-<n> with no think segment.
+    model = cell.split("_think")[0].split("_track-")[0]
+    return model, column(r["plan"], track)
+
+
+def delta_mode(truncation: str) -> int:
+    """Per-plan reasoning delta (on minus off) over the models present in BOTH
+    arms, under an explicit truncation convention (Q9/Q10).
+
+      --truncation zero : cells with no M3 score 0 and are retained.  This is
+                          the convention the manuscript states.
+      --truncation drop : cells with no M3 are excluded.  This is what the rest
+                          of this script does, and it moves the v1 delta by
+                          0.06, which is why the convention has to be named.
+    """
+    def grid(arm):
+        g = collections.defaultdict(list)
+        for r in load(arm):
+            s = r.get("score") or {}
+            if "M3" in s:
+                g[cellkey(r)].append(s["M3"])
+            elif truncation == "zero":
+                g[cellkey(r)].append(0.0)
+        return g
+
+    off, on = grid("off"), grid("on")
+    models = sorted({k[0] for k in off} & {k[0] for k in on})
+    print(f"reasoning delta (on minus off), truncation={truncation}, "
+          f"{len(models)} models in both arms")
+    print(f"{'column':>8} {'off':>8} {'on':>8} {'delta':>8}   n_off  n_on")
+    for c in COLS:
+        vo = [x for m in models for x in off[(m, c)]]
+        vn = [x for m in models for x in on[(m, c)]]
+        if not vo or not vn:
+            continue
+        mo, mn = st.mean(vo), st.mean(vn)
+        print(f"{c:>8} {mo:8.3f} {mn:8.3f} {mn - mo:+8.3f}   {len(vo):5d} {len(vn):5d}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arm", choices=["off", "on"], default="off")
+    ap.add_argument("--arm", choices=["off", "on", "frontier"], default="off")
+    ap.add_argument("--delta", action="store_true",
+                    help="print the per-plan reasoning delta (on minus off) instead")
+    ap.add_argument("--truncation", choices=["zero", "drop"], default="zero",
+                    help="how --delta treats cells with no M3 (see delta_mode docstring)")
     ap.add_argument("--metric", default="M3", choices=["M1", "M3"])
     ap.add_argument("--ci", action="store_true", help="append 95%% CI")
     ap.add_argument("--ci-method", choices=["exact","wilson"], default="exact",
                     help="exact = Clopper-Pearson (matches R3.8); wilson = score interval")
     args = ap.parse_args()
+
+    if args.delta:
+        return delta_mode(args.truncation)
 
     agg = collections.defaultdict(list)
     skipped = 0
@@ -139,9 +200,7 @@ def main() -> int:
         if args.metric not in s:
             skipped += 1
             continue
-        cell = r["cell"]
-        track = "B" if "_track-B" in cell else "A"
-        agg[(cell.split("_think")[0], column(r["plan"], track))].append(s[args.metric])
+        agg[cellkey(r)].append(s[args.metric])
 
     models = sorted({k[0] for k in agg})
     width = 17 if args.ci else 8

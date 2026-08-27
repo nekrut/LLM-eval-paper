@@ -1,0 +1,195 @@
+We need to produce a bash script following constraints.
+
+Let's craft script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+Define THREADS=4 and sample list.
+
+Create results dir if not exist.
+
+Reference indexing: check existence of chrM.fa.fai, .amb etc. Use samtools faidx; bwa index.
+
+Per-sample loop: for each sample in list:
+
+Check if results/${sample}.bam.bai exists and newer than inputs? We can use -nt to compare file modification times. But we need to skip entire pipeline if all outputs exist and are newer than inputs. Simpler: check existence of final vcf.gz.tbi; if present, skip.
+
+But also need to ensure that if any output missing, run steps.
+
+Simpler: For each sample, perform steps but guard each step with existence checks:
+
+- If results/${sample}.bam exists? Actually we need sorted BAM. But we can check for .bam.bai maybe. Let's just check final vcf.gz.tbi; if present skip all.
+
+But we also need to ensure that if some intermediate missing but final present, still skip? The requirement: idempotent: rerunning on a populated results/ directory must exit 0 without redoing work or erroring. So if all outputs exist and are newer than inputs, no work. But if any output missing, run pipeline.
+
+Simpler: For each sample, check if results/${sample}.vcf.gz.tbi exists; if yes skip to next sample. That ensures final artifact present. If not, we need to produce it. We can just run entire pipeline from scratch for that sample. That's fine.
+
+But also need to ensure reference indexing only once. We'll guard with existence of chrM.fa.fai and .amb etc.
+
+Now variant calling: lofreq call-parallel outputs results/{sample}.vcf; then compress with bgzip (which is part of bcftools? Actually bgzip is separate but usually part of htslib). Not in TOOL_INVENTORY list. But we can use bcftools view -O z to compress, but instruction says use bgzip not bcftools view -O z. Is bgzip available? It's part of htslib; maybe present as 'bgzip' command. It is likely on PATH. The inventory didn't list it explicitly, but it's usually installed with samtools/htslib. We'll assume bgzip exists.
+
+But we can also use bcftools view -O z to compress; but instruction says not to. So use bgzip.
+
+So after lofreq call-parallel produce .vcf, then:
+
+bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz
+tabix -p vcf results/${sample}.vcf.gz
+rm results/${sample}.v
+
+But need to ensure bgzip is available. We'll assume.
+
+Now collapse step: Use bcftools query for each sample, then cat all outputs into temp file and add header.
+
+We must rebuild collapsed.tsv only if any input VCF newer than TSV. So we can check with -nt.
+
+Implementation:
+
+if [ ! -f results/collapsed.tsv ] || \
+   (find results/*.vcf.gz -newer results/collapsed.tsv | grep . > /dev/null); then
+    # rebuild
+fi
+
+But need to ensure that if collapsed.tsv missing, rebuild.
+
+We'll use find or loop.
+
+Simplify: Use a variable rebuild=0; for each sample check if results/${sample}.vcf.gz newer than collapsed.tsv. But collapsed.tsv may not exist yet. So we can set condition accordingly.
+
+Implementation:
+
+if [ ! -f results/collapsed.tsv ]; then
+    rebuild=true
+else
+    for s in "${SAMPLES[@]}"; do
+        if [ "$(stat -c %Y results/${s}.vcf.gz)" -gt "$(stat -c %Y results/collapsed.tsv)" ]; then
+            rebuild=true; break
+        fi
+    done
+fi
+
+If rebuild true, run collapse.
+
+Now idempotency: After all loops, exit 0.
+
+Also need to ensure no echo prints. Use only tool outputs.
+
+We must not use any absolute paths. All relative.
+
+Let's craft script.
+
+Edge cases: The read group string with literal backslash-t characters. We need to pass as -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA". In bash, we can write:
+
+-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"
+
+Because we need literal backslash-t. So we escape the backslashes.
+
+But careful: The command line will interpret \ as escape in double quotes? In double quotes, backslash can escape certain characters; but to preserve literal backslash, we need to escape it with another backslash. So we use \\t inside double quotes. That results in actual string "\t" passed to bwa. Good.
+
+Now implement.
+
+Also ensure that we don't produce any output except tool outputs. But commands like samtools index may print progress? They might print to stderr. That's fine.
+
+We must not use echo for user-facing prose; but we can use echo for debugging? Not allowed. So no echo.
+
+But we need to create directories etc. That will not produce output.
+
+Now script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+# Create results dir
+mkdir -p results
+
+# Reference indexing
+REF="data/ref/chrM.fa"
+if [ ! -f "${REF}.fai" ]; then
+    samtools faidx "$REF"
+fi
+# bwa index files: .amb .ann .bwt .pac .sa
+if [ ! -f "${REF}.amb" ] || [ ! -f "${REF}.ann" ] || [ ! -f "${REF}.bwt" ] || [ ! -f "${REF}.pac" ] || [ ! -f "${REF}.sa" ]; then
+    bwa index "$REF"
+fi
+
+# Per-sample processing
+for sample in "${SAMPLES[@]}"; do
+    out_bam="results/${sample}.bam"
+    out_bai="results/${sample}.bam.bai"
+    out_vcf="results/${sample}.vcf.gz"
+
+    # Skip if final VCF already exists and is newer than inputs? We'll just skip if vcf.gz.tbi exists.
+    if [ -f "${out_vcf}.tbi" ]; then
+        continue
+    fi
+
+    fq1="data/raw/${sample}_1.fq.gz"
+    fq2="data/raw/${sample}_2.fq.gz"
+
+    # Alignment and sorting
+    bwa mem -t "$THREADS" -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" "$REF" "$fq1" "$fq2" | \
+        samtools sort -@ "$THREADS" -o "$out_bam"
+
+    # Index BAM
+    samtools index -@ "$THREADS" "$out_bam"
+
+    # Variant calling
+    lofreq call-parallel --pp-threads "$THREADS" -f "$REF" -o "${sample}.vcf" "$out_bam"
+    # Compress VCF
+    bgzip -c "${sample}.vcf" > "$out_vcf"
+    tabix -p vcf "$out_vcf"
+    rm "${sample}.vcf"
+done
+
+# Collapse step
+collapsed="results/collapsed.tsv"
+
+rebuild=false
+if [ ! -f "$collapsed" ]; then
+    rebuild=true
+else
+    for sample in "${SAMPLES[@]}"; do
+        if [ "$(stat -c %Y results/${sample}.vcf.gz)" -gt "$(stat -c %Y "$collapsed")" ]; then
+            rebuild=true
+            break
+        fi
+    done
+fi
+
+if $rebuild; then
+    # Temporary file
+    tmp=$(mktemp)
+    for sample in "${SAMPLES[@]}"; do
+        bcftools query -f "${sample}\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\\n" "results/${sample}.vcf.gz" >> "$tmp"
+    done
+    printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed"
+    cat "$tmp" >> "$collapsed"
+    rm "$tmp"
+fi
+
+exit 0
+
+But we used bcftools query format string with literal backslash? We need to pass sample name as literal. The format string: '{sample}\t%CHROM...' but we want the sample name inserted literally, not variable expansion. In bash, we can use single quotes to avoid interpolation, but we need to include \t. Use single quotes and escape backslashes? Actually inside single quotes, backslash is literal; so we can write:
+
+bcftools query -f '${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' file
+
+But ${sample} will be expanded by shell because it's within single quotes? No, single quotes prevent variable expansion. So we need to use double quotes but escape backslashes: bcftools query -f "${sample}\\t%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\\n" file
+
+But that will expand ${sample} and produce literal \t. Good.
+
+So modify accordingly.
+
+Also we used 'bgzip' command; ensure it's available. We'll assume.
+
+Now check for any missing tools: We used samtools, bwa, lofreq, bgzip, tabix, bcftools query. All in inventory.
+
+We also used printf to write header; that's fine (printf is built-in). But we might want to avoid echo. It's okay.
+
+Also we used 'stat -c %Y' which may not be portable across all shells? On Linux it's fine. Use 'stat -c %Y'.
+
+Now ensure no stray spaces or lines causing errors.
+
+Let's produce final script accordingly.

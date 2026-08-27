@@ -1,0 +1,377 @@
+We need to produce a bash script following constraints.
+
+Key points:
+
+- Use only tools listed: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java. We will use bwa, samtools, lofreq, bgzip (not in list? Wait bgzip is part of htslib; but not listed explicitly. But we can use bcftools view -O z to compress. The plan says "Compress with bgzip". But bgzip may not be available. However bcftools view -O z will produce gzipped VCF. That uses bgzip internally. So we can use bcftools view -O z -o results/{sample}.vcf.gz results/{sample}.vcf. That is allowed because bcftools is in inventory.
+
+- Use tabix for indexing.
+
+- Idempotency: check existence and modification times. We can use `if [[ ! -s file ]]` or `[[ ! -e file || (some condition) ]]`. For each step, we need to skip if output exists and newer than inputs. We'll implement simple checks:
+
+For reference indexing: check for .amb file? Actually bwa index produces multiple files; easiest is check for chrM.fa.bwt or .amb. Use `if [[ ! -f data/ref/chrM.fa.bwt ]]; then ... fi`. For samtools faidx, check for .fai.
+
+For each sample:
+
+- BAM: results/${sample}.bam exists? If yes and newer than raw fastqs? We can skip if file exists and modification time > both input fastq files. Use `if [[ -s results/${sample}.bam && $(stat -c %Y results/${sample}.bam) -ge $(stat -c %Y data/raw/${sample}_1.fq.gz) && $(stat -c %Y results/${sample}.bam) -ge $(stat -c %Y data/raw/${sample}_2.fq.gz) ]]; then skip; fi`. But we also need to ensure index exists. We'll handle each step separately.
+
+Simpler: For each output, check if file exists and is newer than all inputs. Use a function `is_newer` that compares timestamps.
+
+But we can just use `if [[ ! -f results/${sample}.bam ]]; then ... fi`. But if the BAM exists but older than fastqs, we might want to re-run. The requirement: "skip if results/{sample}.vcf.gz.tbi already exists and is newer than its inputs". So for each step we need to check that output is newer than all relevant inputs.
+
+We'll implement a helper function `is_newer`:
+
+```
+is_newer() {
+  local out=$1
+  shift
+  local inputs=("$@")
+  [[ -f $out ]] || return 1
+  local out_mtime=$(stat -c %Y "$out")
+  for inp in "${inputs[@]}"; do
+    if [[ ! -f $inp ]]; then
+      return 1
+    fi
+    local inp_mtime=$(stat -c %Y "$inp")
+    if (( inp_mtime > out_mtime )); then
+      return 1
+    fi
+  done
+  return 0
+}
+```
+
+Then for each step, we can do:
+
+```
+if ! is_newer results/${sample}.bam data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz; then
+   # run alignment and sort
+fi
+```
+
+But note that the BAM output depends on raw fastqs only. For index: `results/${sample}.bam.bai` depends on BAM.
+
+For VCF: depends on BAM and reference file? The reference is static, but we can ignore.
+
+For compressed VCF: depends on uncompressed VCF.
+
+For collapsed.tsv: depends on all sample .vcf.gz files.
+
+Implement steps accordingly.
+
+Also need to ensure that the script uses `set -euo pipefail`.
+
+We also must not use echo for user-facing prose. But we might use echo for debugging? Not allowed. So no echo.
+
+But we can still output nothing; tools will produce their own messages.
+
+We should avoid writing to stdout/stderr beyond tool outputs. So no echo.
+
+Also need to ensure that the script is idempotent: if all outputs exist and are newer than inputs, exit 0 without doing anything.
+
+Implementation plan:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+samples=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+# create results dir
+mkdir -p results
+
+# reference indexing
+if [[ ! -f data/ref/chrM.fa.bwt ]]; then
+  samtools faidx data/ref/chrM.fa
+  bwa index data/ref/chrM.fa
+fi
+
+# function to check newer
+is_newer() { ... }
+
+for sample in "${samples[@]}"; do
+  raw1=data/raw/${sample}_1.fq.gz
+  raw2=data/raw/${sample}_2.fq.gz
+  bam=results/${sample}.bam
+  bai=results/${sample}.bam.bai
+  vcf_uncompressed=results/${sample}.vcf
+  vcf_gz=results/${sample}.vcf.gz
+  vcf_tbi=results/${sample}.vcf.gz.tbi
+
+  # alignment and sort
+  if ! is_newer "$bam" "$raw1" "$raw2"; then
+    bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | \
+      samtools sort -@ $THREADS -o "$bam"
+  fi
+
+  # index BAM
+  if ! is_newer "$bai" "$bam"; then
+    samtools index -@ $THREADS "$bam"
+  fi
+
+  # variant calling
+  if ! is_newer "$vcf_uncompressed" "$bam" data/ref/chrM.fa; then
+    lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -o "$vcf_uncompressed" "$bam"
+  fi
+
+  # compress VCF
+  if ! is_newer "$vcf_gz" "$vcf_uncompressed"; then
+    bcftools view -O z -o "$vcf_gz" "$vcf_uncompressed"
+    rm -f "$vcf_uncompressed"
+  fi
+
+  # index compressed VCF
+  if ! is_newer "$vcf_tbi" "$vcf_gz"; then
+    tabix -p vcf "$vcf_gz"
+  fi
+done
+
+# collapsed.tsv
+collapsed=results/collapsed.tsv
+tmpfile=$(mktemp)
+for sample in "${samples[@]}"; do
+  bcftools query -f '${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz >> "$tmpfile"
+done
+
+# check if need to rebuild collapsed.tsv
+if ! is_newer "$collapsed" "${samples[@]/#/results/}"*.vcf.gz; then
+  # create header and concatenate
+  printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed"
+  cat "$tmpfile" >> "$collapsed"
+fi
+
+rm -f "$tmpfile"
+
+exit 0
+```
+
+But we need to ensure that the `is_newer` function works for multiple inputs. We also need to handle pattern expansion for collapsed.tsv check: we can pass all vcf_gz files as arguments.
+
+We must be careful with quoting and expansions.
+
+Also note that bcftools query format string uses single quotes; inside we have `${sample}` variable, but we want literal ${sample} inserted by shell. So we need to use double quotes around the format string so that shell expands sample variable. But then we need to escape `$` for INFO/AF? Actually `%INFO/AF` is part of bcftools query syntax; no need to escape. So:
+
+```
+bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz
+```
+
+But we also need to ensure that the format string is passed correctly: bcftools expects a single argument; we can use double quotes.
+
+Also note that `bcftools query` will output lines for each variant. Good.
+
+Now, about idempotency: For collapsed.tsv, we check if it exists and newer than all vcf_gz files. But we also need to consider that the header may be older? We just rebuild if any input is newer. So:
+
+```
+if ! is_newer "$collapsed" "${samples[@]/#/results/}"*.vcf.gz; then
+  ...
+fi
+```
+
+But `${samples[@]/#/results/}` expands each sample name with prefix results/. Then we add *.vcf.gz? Actually we need to list all vcf_gz files. We can build an array of vcf_gz paths:
+
+```
+vcf_files=()
+for s in "${samples[@]}"; do
+  vcf_files+=("results/${s}.vcf.gz")
+done
+```
+
+Then check.
+
+But easier: just use `if ! is_newer "$collapsed" results/*.vcf.gz; then ... fi`. That will include all .vcf.gz files, but also maybe other ones? There are only four. So fine.
+
+Now we need to ensure that the script uses no echo for user-facing prose. We used printf for header in collapsed.tsv; that's okay because it's part of output file, not console. But `printf` writes to stdout by default; we redirect to file. That's fine.
+
+But we also used `printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed"`. That prints to file, not console. Good.
+
+Now check for potential issues:
+
+- The `is_newer` function uses `stat -c %Y`. On some systems, `%Y` may not be available; but typical Linux has it. We can use `stat --format=%Y`.
+
+- For the reference indexing step: we check if `.bwt` exists. But if index partially exists? It's okay.
+
+- For alignment step: we need to ensure that bwa mem reads from fastqs and writes SAM to stdout, piped into samtools sort. The read group string must contain literal backslash-t characters. We used `-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`. That passes a string with actual backslashes? Wait we need to pass the two characters backslash and t, not an actual tab. In bash, inside double quotes, `\\t` becomes literal backslash followed by t? Let's test mentally:
+
+- In double quotes, `\\t` -> first backslash escapes second backslash, resulting in a single backslash; then `t`. So the string is `\t`. Good.
+
+But we also have `@RG\\tID:${sample}\\tSM...`. The `@RG` part: we need to include literal backslash-t. We wrote `-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`. That will produce string: `@RG\tID:M117-bl\tSM:M117-bl\tLB:M117-bl\tPL:ILLUMINA` with literal backslash-t. Good.
+
+But we need to ensure that the double quotes around the whole argument are correct. We used single quotes? Actually we used double quotes for the entire argument, but inside we have `\\t`. That's fine.
+
+Now check that we didn't inadvertently use `$'\t'` or echo -e. No.
+
+- For variant calling: lofreq call-parallel uses `--pp-threads 4`. Good.
+
+- For compression: bcftools view -O z -o results/${sample}.vcf.gz results/${sample}.vcf
+
+- For indexing: tabix -p vcf results/${sample}.vcf.gz
+
+Now, we need to ensure that the script uses only tools listed. We used `samtools`, `bwa`, `lofreq`, `bcftools`, `tabix`. All are in inventory.
+
+We also used `stat` and `mkdir`, which are standard utilities; allowed.
+
+We used `printf` and `cat`; fine.
+
+Now, we need to ensure that the script doesn't produce any output beyond tool outputs. We use `printf` but redirect to file, not console. So no output to stdout. But `printf` may still write to stderr if error? Not relevant.
+
+But we also used `rm -f "$tmpfile"`. That writes nothing.
+
+Now, idempotency: The script will skip steps if outputs exist and newer than inputs. For collapsed.tsv, we check if it's newer than all .vcf.gz files; but we didn't consider that the header may be older? But we rebuild only if any input is newer. That's fine.
+
+But what about the case where collapsed.tsv exists but some sample's vcf_gz is newer? Then `is_newer` will return 1 because one input is newer, so we rebuild. Good.
+
+Now, we need to ensure that the script exits 0 after finishing. We have exit 0 at end.
+
+Potential issues: The `is_newer` function uses `[[ -f $out ]] || return 1`. That means if output doesn't exist, it returns 1 (not newer). So we will run step. Good.
+
+But for collapsed.tsv, we call `if ! is_newer "$collapsed" results/*.vcf.gz; then ... fi`. If collapsed doesn't exist, is_newer returns 1, so condition true and rebuild. Good.
+
+Now, we need to ensure that the script uses `set -euo pipefail` which will exit on errors.
+
+Potential pitfalls: The `bcftools query` command may produce output with newlines; we redirect to tmpfile. That file may be large but fine.
+
+We also used `printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed"`. This writes header.
+
+Now, we need to ensure that the script uses only tools listed. We used `stat`, which is not in inventory but it's a standard utility; allowed? The instructions say "Use only tools listed in TOOL_INVENTORY. Do not invoke conda, pip, apt, curl, wget, or any package manager." It doesn't forbid using other system utilities like stat, mkdir, rm, cat, printf. Those are fine.
+
+Now, we need to ensure that the script uses no absolute paths. We used relative paths only.
+
+Now, we need to ensure that the script is idempotent: if all outputs exist and newer than inputs, it will skip everything and exit 0. Let's check:
+
+- For reference indexing: we check if .bwt exists; if yes, skip. Good.
+
+- For each sample alignment: we check if bam exists and newer than raw fastqs. If yes, skip. But what about the case where BAM exists but older? Then we will re-run alignment. That's fine.
+
+- For index: similar.
+
+- For VCF: same.
+
+- For compressed VCF: same.
+
+- For collapsed.tsv: same.
+
+Now, potential issue: The `is_newer` function uses `stat -c %Y`. On some systems, `%Y` may not be available; but typical Linux has it. We'll assume it's fine.
+
+Also, we need to ensure that the script is portable across linux-aarch64 environment.
+
+Now, check for quoting issues:
+
+- In the alignment step: `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`
+
+This passes the read group string correctly.
+
+- In bcftools query: `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> "$tmpfile"`
+
+But we need to escape newline? We used \n inside double quotes; that's fine.
+
+Now, ensure that the script uses `bcftools view -O z -o "$vcf_gz" "$vcf_uncompressed"` and then rm uncompressed. Good.
+
+Now, check for potential missing dependencies: bcftools may need to be installed; it's in inventory.
+
+Now, we should also consider that the script might produce warnings from tools like samtools sort about "no header". But that's fine.
+
+Now, final step: Provide the script as output only.
+
+Let's write the script carefully with proper indentation and quoting. Ensure no stray spaces or missing semicolons.
+
+We need to ensure that the `is_newer` function uses correct syntax:
+
+```
+is_newer() {
+  local out=$1
+  shift
+  [[ -f $out ]] || return 1
+  local out_mtime=$(stat -c %Y "$out")
+  for inp in "$@"; do
+    [[ -f $inp ]] || return 1
+    local inp_mtime=$(stat -c %Y "$inp")
+    if (( inp_mtime > out_mtime )); then
+      return 1
+    fi
+  done
+  return 0
+}
+```
+
+Now, we need to ensure that the script uses `set -euo pipefail` at top.
+
+Also, we should create results dir: `mkdir -p results`.
+
+Now, reference indexing:
+
+```
+if [[ ! -f data/ref/chrM.fa.bwt ]]; then
+  samtools faidx data/ref/chrM.fa
+  bwa index data/ref/chrM.fa
+fi
+```
+
+But if .bwt exists but .amb missing? Unlikely. But fine.
+
+Now, for each sample:
+
+```
+for sample in "${samples[@]}"; do
+  raw1=data/raw/${sample}_1.fq.gz
+  raw2=data/raw/${sample}_2.fq.gz
+  bam=results/${sample}.bam
+  bai=results/${sample}.bam.bai
+  vcf_uncompressed=results/${sample}.vcf
+  vcf_gz=results/${sample}.vcf.gz
+  vcf_tbi=results/${sample}.vcf.gz.tbi
+
+  if ! is_newer "$bam" "$raw1" "$raw2"; then
+    bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | \
+      samtools sort -@ $THREADS -o "$bam"
+  fi
+
+  if ! is_newer "$bai" "$bam"; then
+    samtools index -@ $THREADS "$bam"
+  fi
+
+  if ! is_newer "$vcf_uncompressed" "$bam" data/ref/chrM.fa; then
+    lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -o "$vcf_uncompressed" "$bam"
+  fi
+
+  if ! is_newer "$vcf_gz" "$vcf_uncompressed"; then
+    bcftools view -O z -o "$vcf_gz" "$vcf_uncompressed"
+    rm -f "$vcf_uncompressed"
+  fi
+
+  if ! is_newer "$vcf_tbi" "$vcf_gz"; then
+    tabix -p vcf "$vcf_gz"
+  fi
+done
+```
+
+Now, collapsed.tsv:
+
+```
+collapsed=results/collapsed.tsv
+tmpfile=$(mktemp)
+
+for sample in "${samples[@]}"; do
+  bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz >> "$tmpfile"
+done
+
+if ! is_newer "$collapsed" results/*.vcf.gz; then
+  printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$collapsed"
+  cat "$tmpfile" >> "$collapsed"
+fi
+
+rm -f "$tmpfile"
+
+exit 0
+```
+
+But we need to ensure that `results/*.vcf.gz` expands correctly. It will include all .vcf.gz files in results directory, which includes the four sample ones. Good.
+
+Now, potential issue: The `is_newer` function uses `stat -c %Y`. On some systems, `%Y` may not be supported; but we assume it's fine.
+
+Also, we need to ensure that `bcftools query` writes alt field properly; if multiple ALT alleles, it will output each allele separated by commas? But that's fine.
+
+Now, final script. Let's produce the script exactly as required: no markdown fences, just the script.
+
+Check for any stray spaces or missing quotes.
+
+Let's write the final script now.

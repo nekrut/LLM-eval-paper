@@ -1,0 +1,291 @@
+We need to produce a bash script that follows constraints.
+
+Key points:
+
+- Shebang line: #!/usr/bin/env bash
+- set -euo pipefail
+
+- Use only tools listed: bwa samtools bcftools tabix lofreq SnpSift snpEff fastqc seqkit snakemake shellcheck java. But we don't need all.
+
+- We must not use echo for user-facing prose, but can use echo for debugging? They say "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." So we should avoid echo unless necessary. We'll just rely on tool outputs.
+
+- Idempotent: check existence of output files before generating. For each sample, we need to produce .bam, .bai, .vcf.gz, .tbi. Also collapsed.tsv.
+
+- We must skip steps if outputs exist and are newer than inputs. Use test -nt or compare timestamps.
+
+Simplify: For each step, check if target exists and is newer than all relevant inputs; if so skip.
+
+We need to index reference once: check for chrM.fa.fai and .amb etc.
+
+For bam generation: output results/${sample}.bam. Input: data/raw/{sample}_1.fq.gz and _2.fq.gz. Also reference? bwa mem uses reference file path, but we don't need to check its timestamp; if reference changes maybe re-run but not needed.
+
+We can use a function to run command only if target missing or older than inputs.
+
+Simplify: For each sample:
+
+- If results/${sample}.bam exists and newer than data/raw/{sample}_1.fq.gz and _2.fq.gz, skip alignment. But we also need to check .bai? We'll index after bam creation; but if bam exists but bai missing or older, we should run indexing.
+
+Better: For each step, check target existence and timestamp relative to inputs.
+
+Implementation:
+
+Define array samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+THREADS=4
+
+Create results dir if not exist.
+
+Reference indexing:
+
+- If data/ref/chrM.fa.fai exists, skip samtools faidx. But we need to check that .fai is newer than chrM.fa? Usually index creation ensures timestamp later; but we can just test existence.
+
+- For bwa index: check for any of the index files (.amb) exist; if yes skip.
+
+Now per sample:
+
+1. Alignment step: target results/${sample}.bam
+
+Inputs: data/raw/${sample}_1.fq.gz, _2.fq.gz, reference file path? We'll ignore.
+
+Check if bam exists and newer than both fastqs. If so skip. Else run bwa mem -t 4 ... | samtools sort -@ 4 -o results/${sample}.bam
+
+We need to ensure that we don't produce .bai until after bam is created; but if bam exists but bai missing, indexing will happen later.
+
+2. Indexing: target results/${sample}.bam.bai
+
+Inputs: results/${sample}.bam
+
+Check existence and timestamp.
+
+3. Variant calling: output results/${sample}.vcf (intermediate). But final we want .vcf.gz; we can produce .vcf first then compress.
+
+We need to check if .vcf.gz exists and newer than bam? Actually variant calling depends on bam. So if .vcf.gz exists and is newer than bam, skip. But we also need to ensure that intermediate .vcf may be removed after compression. We'll just run lofreq call-parallel only if .vcf.gz missing or older than bam.
+
+But we can't check .vcf.gz timestamp relative to bam because we compress later; but we can check .vcf.gz existence and newer than bam. If yes skip entire variant calling + compression steps? But we need to ensure that .vcf.gz exists; if not, run all steps.
+
+Simplify: For each sample:
+
+- If results/${sample}.vcf.gz exists and is newer than results/${sample}.bam, skip variant calling and compression.
+
+Else:
+
+- Run lofreq call-parallel ... > results/${sample}.vcf
+
+- Compress with bgzip -c results/${sample}.vcf > results/${sample}.vcf.gz
+
+- tabix index
+
+- rm results/${sample}.vcf
+
+But we need to ensure that if .vcf.gz exists but .tbi missing or older, we should reindex. So maybe separate steps: check for .vcf.gz and .tbi.
+
+Simpler: We'll run variant calling only if .vcf.gz missing or older than bam. Then compress and index; after compression, if .tbi missing or older than .gz, run tabix.
+
+But we can just always run tabix after compression; but if .tbi exists and newer than .gz, skip.
+
+Ok.
+
+4. Collapsed.tsv: target results/collapsed.tsv
+
+Inputs: all results/${sample}.vcf.gz files.
+
+Check existence and timestamp relative to each input.
+
+If any vcf.gz newer than collapsed.tsv or collapsed.tsv missing, rebuild:
+
+- For each sample, run bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz
+
+- Concatenate outputs into a temp file; then add header line.
+
+We need to ensure that we don't use echo for user-facing prose. But adding header can be done with printf or cat <<EOF? That would produce output to stdout, but we are writing to file. We can use cat > results/collapsed.tsv <<'EOF' ... But that's still a command; it's fine.
+
+But we must not write to stderr/stdout beyond tool outputs. The script's own writes will be considered user-facing prose if they print anything. So we should avoid any echo or printf that prints to stdout. We can redirect output to file using cat > file <<EOF, but that will still produce the content into file; no console output.
+
+But we need to ensure no stray outputs appear on console. The cat command will not produce output unless there's an error. So it's fine.
+
+We must also avoid echo for debugging.
+
+Ok.
+
+Also we should use `set -euo pipefail` ensures script exits if any command fails.
+
+Now implement:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+samples=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+# create results dir
+mkdir -p results
+
+# reference indexing
+ref="data/ref/chrM.fa"
+if [ ! -f "${ref}.fai" ]; then
+    samtools faidx "$ref"
+fi
+# bwa index: check for .amb file
+if [ ! -f "${ref}.amb" ]; then
+    bwa index "$ref"
+fi
+
+# per-sample processing loop
+for sample in "${samples[@]}"; do
+    fq1="data/raw/${sample}_1.fq.gz"
+    fq2="data/raw/${sample}_2.fq.gz"
+    bam="results/${sample}.bam"
+    bai="results/${sample}.bam.bai"
+    vcf="results/${sample}.vcf"
+    vcfz="${vcf}.gz"
+    tbi="${vcfz}.tbi"
+
+    # Alignment
+    if [ ! -f "$bam" ] || ( [ "$fq1" -nt "$bam" ] || [ "$fq2" -nt "$bam" ] ); then
+        bwa mem -t "$THREADS" -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+            "$ref" "$fq1" "$fq2" | samtools sort -@ "$THREADS" -o "$bam"
+    fi
+
+    # Index BAM
+    if [ ! -f "$bai" ] || [ "$bam" -nt "$bai" ]; then
+        samtools index -@ "$THREADS" "$bam"
+    fi
+
+    # Variant calling
+    need_call=false
+    if [ ! -f "$vcfz" ] || [ "$bam" -nt "$vcfz" ]; then
+        need_call=true
+    fi
+    if $need_call; then
+        lofreq call-parallel --pp-threads "$THREADS" --verbose \
+            --ref "$ref" --out "$vcf" \
+            --sig --bonf \
+            "$bam"
+        bgzip -c "$vcf" > "$vcfz"
+        rm -f "$vcf"
+    fi
+
+    # Index VCF
+    if [ ! -f "$tbi" ] || [ "$vcfz" -nt "$tbi" ]; then
+        tabix -p vcf "$vcfz"
+    fi
+done
+
+# Collapse TSV
+collapsed="results/collapsed.tsv"
+need_collapse=false
+if [ ! -f "$collapsed" ]; then
+    need_collapse=true
+else
+    for sample in "${samples[@]}"; do
+        if [ "results/${sample}.vcf.gz" -nt "$collapsed" ]; then
+            need_collapse=true
+            break
+        fi
+    done
+fi
+
+if $need_collapse; then
+    tmp=$(mktemp)
+    # header
+    printf 'sample\tchrom\tpos\tref\talt\taf\n' > "$tmp"
+    for sample in "${samples[@]}"; do
+        bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' "results/${sample}.vcf.gz" >> "$tmp"
+    done
+    mv "$tmp" "$collapsed"
+fi
+
+# End of script
+
+We need to ensure no stray outputs. The printf writes header to tmp file; that's fine.
+
+But we used `printf` which prints to stdout? Actually printf writes to stdout by default, but we redirect > "$tmp". So no console output.
+
+Also bcftools query will produce output to stdout; we append >> "$tmp".
+
+All good.
+
+We must ensure that the script uses only tools listed. We used samtools, bwa, lofreq, bgzip (bgzip is part of tabix? Actually bgzip is part of htslib and should be available as `bgzip` command). But not in TOOL_INVENTORY list. Wait: The inventory lists tabix but not bgzip. However bgzip is usually installed with samtools or tabix; but not listed explicitly. We might need to use bcftools view -O z? They said "Compress with bgzip (not bcftools view -O z)". But bgzip may not be available. The inventory lists tabix, which includes bgzip as part of htslib. Usually bgzip is a separate binary but often installed along with samtools/htslib. It might be present. But to be safe, we could use `samtools view -O z`? They said "not bcftools view -O z". But they didn't forbid using samtools view -O z. However they specifically say compress with bgzip (not bcftools view -O z). So we should use bgzip.
+
+But is bgzip in inventory? Not explicitly, but maybe it's part of tabix or htslib; but not listed. The instruction says "Use only tools listed in TOOL_INVENTORY." So bgzip might be considered part of the inventory because it's a tool from htslib. But they didn't list it. However we can use `samtools view -O z`? They said not bcftools view -O z, but maybe samtools view -O z is acceptable. But they explicitly say compress with bgzip (not bcftools view -O z). So we must use bgzip.
+
+But if bgzip isn't in inventory, script would fail. But likely bgzip is available because tabix and htslib provide it. The inventory didn't list but maybe it's okay. We'll assume bgzip exists.
+
+Also we used `printf` which prints to stdout; but we redirect > "$tmp". So no console output.
+
+We also used `cat <<EOF`? No, we used printf.
+
+Now check for any stray echo or print statements: none.
+
+Check that we didn't use $'\t' etc. We used literal backslash-t in the -R string: "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA". That will produce a string with two characters \ and t? Wait, we need to pass literally backslash-t to bwa mem; but inside double quotes, `\\t` becomes literal backslash followed by t? Actually in double quotes, `\\t` expands to `\t`. Because backslash escapes the next character. So `\\t` results in a single backslash and 't'? Let's test: In bash, echo -e "a\\tb" prints "a\tb"? Wait:
+
+$ echo "a\\tb"
+a\tb
+
+Yes, because \\ becomes \; then t is literal. So we get backslash-t.
+
+But we need to ensure that the string passed to bwa mem contains `\t` not actual tab. Using double quotes with `\\t` yields a single backslash and 't', which is what we want. Good.
+
+Now check for any missing dependencies: We used `bgzip`. If not available, script fails. But likely present.
+
+Also we used `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`. The format string uses single quotes; inside there is \t which will be interpreted by bcftools as tab? Actually bcftools query expects format string with % placeholders and literal characters. It interprets `\t` as a tab? I think it does: In bcftools query, you can use `%CHROM\t%POS`. The backslash-t is recognized as tab. So we need to provide that string exactly. We used single quotes; inside there is \t which will be passed literally. Good.
+
+Now check for idempotency: For each step, we skip if target exists and newer than inputs. That ensures no redoing.
+
+Potential issue: The bam file may exist but older than fastqs; we run alignment again. That's fine.
+
+For variant calling: We check if vcf.gz missing or older than bam. But we also need to consider that .tbi might be missing or older; but we handle indexing separately.
+
+But what if vcf.gz exists and newer than bam, but tbi is missing? Then we skip variant calling but later index step will run because tbi missing. Good.
+
+Now collapsed.tsv: We check if any vcf.gz newer than collapsed.tsv; if so rebuild. That ensures idempotency.
+
+Edge case: If collapsed.tsv exists but some sample's vcf.gz older, no rebuild. Good.
+
+Now we need to ensure that the script uses only tools listed. We used `printf`, `cat`? Actually we didn't use cat. We used printf and bcftools query etc. That's fine.
+
+We also used `mktemp`. mktemp is a standard utility; not in inventory but likely available. But it's part of coreutils, which should be present. The instruction only restricts tools to those listed; but using core utilities like mktemp is okay.
+
+Now we need to ensure that the script doesn't produce any output beyond tool outputs. Our script uses `printf` and bcftools query etc. Those commands produce output to stdout (which we redirect). So no console output.
+
+But there might be some warnings from tools printed to stderr; that's allowed.
+
+Now check for potential quoting issues: In the -R string, we used double quotes with backslashes. That should work.
+
+Let's test mentally:
+
+bwa mem -t 4 -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" "$ref" "$fq1" "$fq2"
+
+The shell will interpret the string: @RG\tID:M117-bl\tSM:M117-bl\tLB:M117-bl\tPL:ILLUMINA. Good.
+
+Now we need to ensure that `bwa mem` output is piped into samtools sort -@ 4 -o $bam. That should produce sorted BAM.
+
+Now indexing: samtools index -@ 4 $bam
+
+Variant calling: lofreq call-parallel --pp-threads 4 --verbose --ref "$ref" --out "$vcf" --sig --bonf "$bam"
+
+We used `--sig` and `--bonf`. They are optional but okay.
+
+Now compress: bgzip -c "$vcf" > "$vcfz". That writes compressed file. Then rm $vcf.
+
+Index VCF: tabix -p vcf "$vcfz".
+
+Collapse: we create tmp, write header with printf to tmp, then loop over samples and append bcftools query output to tmp. Then mv tmp collapsed.tsv.
+
+All good.
+
+Now ensure that the script uses `set -euo pipefail`. That ensures pipeline failures propagate.
+
+Potential issue: In alignment step, if bam exists but older than fastqs, we run bwa mem again; but we didn't remove old bam before writing new one. But samtools sort will overwrite existing file with -o option? It writes to output path; if file exists, it may be overwritten. That's fine.
+
+Now check for concurrency: We use THREADS=4 for all steps. Good.
+
+Now final script must not have any stray spaces or lines that produce output.
+
+We need to ensure no trailing spaces.
+
+Let's write the script accordingly.
+
+Also we might want to set `IFS=$'\n\t'`? Not necessary.
+
+Now produce final answer: just the script.

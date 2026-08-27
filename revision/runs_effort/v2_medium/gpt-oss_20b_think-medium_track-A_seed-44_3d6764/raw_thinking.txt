@@ -1,0 +1,127 @@
+We need to produce a bash script following constraints.
+
+Key points:
+
+- Shebang line: #!/usr/bin/env bash
+- set -euo pipefail
+
+- Use THREADS=4 and SAMPLES array.
+
+- Create results dir.
+
+- For each sample, guard steps.
+
+- Reference indexing: bwa index data/ref/chrM.fa if not already .bwt exists. Also samtools faidx.
+
+- Alignment pipeline: bwa mem with RG string using \t escapes inside double quotes. Use -R "@RG\tID:{sample}\tSM:{sample}\tLB:{sample}\tPL:ILLUMINA". Then pipe to samtools sort -@ 4 -o results/{sample}.bam -. Guard with [[ -f results/... ]] || { ... }.
+
+- Index BAM: guard.
+
+- Variant calling: lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/{sample}.vcf results/{sample}.bam. Guard check both .vcf and .vcf.gz.
+
+- Compression: bgzip -f results/{sample}.vcf ; tabix -p vcf results/{sample}.vcf.gz. Guard on .tbi.
+
+- Collapsed.tsv: always rebuild. Use printf header > results/collapsed.tsv then loop over samples, bcftools query etc.
+
+Edge cases: need to ensure bgzip is available; but tool inventory includes tabix but not bgzip? Actually bgzip is part of htslib and usually installed with samtools or tabix. But not listed explicitly. However we can use "bgzip" as it's part of samtools distribution. Should be on PATH.
+
+Also need to ensure bcftools query available; yes bcftools in inventory.
+
+We must avoid echo for user-facing prose, but printing header is fine via printf.
+
+Need to guard against missing input files? Not required.
+
+Make sure we use correct quoting: In the alignment step, we need to embed \t inside double quotes. Use -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA". That will be passed as a single argument with literal backslash t? Wait BWA expects actual tab characters in header; but the instruction says use literal two characters \t inside double-quoted string. Actually BWA expands \t itself? The plan says "Use the literal two characters `\t` (backslash + t) inside the double-quoted string. Do NOT use printf, echo -e, $'\t', or a real tab. `bwa` expands `\t` itself; a real tab corrupts the SAM header." So we should pass the string with backslashes: "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA". Wait, inside double quotes, \t is interpreted by shell as tab unless escaped. Actually in bash, within double quotes, \t is not special; only certain escapes like \$, \", \\ and \` are recognized? Let's recall: In double quotes, backslash retains its literal meaning except when followed by $, `, ", or newline. So \t remains two characters \ and t. Good. So we can just write "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA". That will pass the string with literal backslashes to BWA.
+
+Thus alignment command:
+
+bwa mem -t 4 -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz | samtools sort -@ 4 -o results/${sample}.bam -
+
+Guard:
+
+[[ -f results/${sample}.bam ]] || { bwa mem ... | samtools sort ... ; }
+
+But we need to ensure the guard covers both steps. Use braces.
+
+Also need to index BAM: [[ -f results/${sample}.bam.bai ]] || samtools index -@ 4 results/${sample}.bam
+
+Variant calling: [[ -f results/${sample}.vcf.gz.tbi ]] || { ... } but we also need to check .vcf existence. The plan says guard on either .vcf or .vcf.gz. But we can just guard on .tbi; if not present, run lofreq and compress.
+
+But we must ensure that if .vcf exists but .vcf.gz.tbi missing, we still recompress? Might be simpler: guard on .vcf.gz.tbi. If missing, run the whole pipeline: lofreq call-parallel ... ; bgzip -f; tabix.
+
+However if .vcf.gz.tbi exists but .vcf is missing (unlikely), we skip calling. That's fine.
+
+But we also need to ensure that if .vcf.gz.tbi exists but .vcf.gz missing? That can't happen because tbi requires gz file. So guard on .tbi is enough.
+
+Thus:
+
+[[ -f results/${sample}.vcf.gz.tbi ]] || { lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -o results/${sample}.vcf results/${sample}.bam ; bgzip -f results/${sample}.vcf ; tabix -p vcf results/${sample}.vcf.gz ; }
+
+But we need to ensure that bgzip and tabix are run only if .vcf exists. But they will be after lofreq.
+
+Ok.
+
+Now collapsed.tsv: header line > results/collapsed.tsv; then loop over samples:
+
+bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz | awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+
+We need to ensure bcftools query output lines have newline at end. The format string includes \n, which bcftools interprets as newline.
+
+Edge: AF may be missing? But fine.
+
+Now idempotency: If all outputs exist, script exits 0. Our loops guard each step; collapsed.tsv will always rebuild but that's okay.
+
+We must not use echo for user-facing prose. We are using printf only for header line. That's allowed.
+
+Also we need to ensure no stray spaces or tabs causing issues.
+
+Let's craft the script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=("M117-bl" "M117-ch" "M117C1-bl" "M117C1-ch")
+
+mkdir -p results
+
+# Reference indexing
+[[ -f data/ref/chrM.fa.bwt ]] || bwa index data/ref/chrM.fa
+[[ -f data/ref/chrM.fa.fai ]] || samtools faidx data/ref/chrM.fa
+
+for sample in "${SAMPLES[@]}"; do
+    # Alignment and sort
+    [[ -f results/${sample}.bam ]] || {
+        bwa mem -t ${THREADS} -R "@RG\tID:${sample}\tSM:${sample}\tLB:${sample}\tPL:ILLUMINA" \
+            data/ref/chrM.fa data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz |
+            samtools sort -@ ${THREADS} -o results/${sample}.bam -
+    }
+
+    # BAM index
+    [[ -f results/${sample}.bam.bai ]] || samtools index -@ ${THREADS} results/${sample}.bam
+
+    # Variant calling, compression, indexing
+    [[ -f results/${sample}.vcf.gz.tbi ]] || {
+        lofreq call-parallel --pp-threads ${THREADS} -f data/ref/chrM.fa \
+            -o results/${sample}.vcf results/${sample}.bam
+        bgzip -f results/${sample}.vcf
+        tabix -p vcf results/${sample}.vcf.gz
+    }
+done
+
+# Collapsed TSV
+printf 'sample\tchrom\tpos\tref\talt\taf\n' > results/collapsed.tsv
+for sample in "${SAMPLES[@]}"; do
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/${sample}.vcf.gz |
+        awk -v s=${sample} 'BEGIN{OFS="\t"}{print s,$0}' >> results/collapsed.tsv
+done
+
+That should satisfy constraints.
+
+Check for any missing tools: bgzip is part of samtools; but not listed explicitly. But we can use "bgzip" as it's part of htslib and likely available. If not, we could use "samtools view -b" etc. But plan uses bgzip. We'll assume it's present.
+
+Also need to ensure that bcftools query output includes alt values maybe multiple; but fine.
+
+Edge: The AF field may be missing for reference positions? But okay.
+
+Now produce final script.

@@ -1,0 +1,196 @@
+We need to produce a bash script that follows plan. Must be idempotent: skip steps if outputs exist and newer than inputs.
+
+We have tools: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java.
+
+But we only need to use those needed. We must not use bgzip? Wait bgzip is part of htslib; but tool list includes tabix (htslib). bgzip is usually in samtools or htslib. But not listed explicitly. However bcftools has view -O z, but plan says use bgzip. But we can use bcftools +bgzip? Actually bcftools view -O z will compress; but plan specifically says "Compress with bgzip (not bcftools view -O z)". But tool list doesn't include bgzip. However bgzip is part of samtools or htslib, but not listed. We could use `samtools view -b`? No. Maybe we can use `bgzip` from samtools? Usually bgzip is a separate binary in samtools package. It might be available on PATH as `bgzip`. But not listed. The tool inventory lists only tools; maybe bgzip is part of samtools but still accessible. We cannot guarantee. Safer to use `bcftools view -O z`? But plan says not. However the instruction "Use only tools listed in TOOL_INVENTORY" means we can only call those names. If bgzip isn't listed, can't use it. So we must compress with bcftools view -O z. But plan explicitly says not to use that; but maybe it's okay because tool list overrides? The instructions: "Use only tools listed in TOOL_INVENTORY." So we cannot invoke bgzip if not listed. But bcftools is listed, so we can use bcftools view -Oz. That conflicts with plan. However the plan says "Compress with bgzip (not `bcftools view -O z`)". Maybe they purposely want us to use bgzip. But tool list doesn't include it; but maybe bgzip is part of samtools and thus available as a binary? The inventory lists only tools on PATH, not all sub-binaries. So we cannot rely on bgzip being present. We could call `samtools view -b`? That outputs BAM. Not correct.
+
+We might need to use `bgzip` from samtools; but it's not listed. But maybe the environment includes it anyway because it's part of samtools distribution. The inventory lists only top-level tools, but bgzip might still be accessible. But instruction "Use only tools listed" could mean we should not call any other executables. So using bgzip may violate. However plan is explicit; maybe they expect us to use `bgzip`. Let's assume bgzip is available.
+
+But safer: Use `bcftools view -O z` and rename file accordingly. But that would conflict with plan but still produce same output. The collapsed.tsv step uses bcftools query on .vcf.gz, so compressed format must be vcf.gz. So either method works.
+
+Let's use `bgzip`. We'll call it; if not present script will fail. But maybe it's okay.
+
+Now idempotency: For each sample, we need to check existence of final outputs (.bam.bai, .vcf.gz.tbi). But also ensure that if inputs newer than output, redo. We can use `if [[ ! -s results/${sample}.bam.bai || $(stat -c %Y data/raw/${sample}_1.fq.gz) -gt $(stat -c %Y results/${sample}.bam.bai) ... ]]` but easier: we can use `touch -d`? Actually we can rely on `make` style: if output exists and newer than inputs, skip. Use `if [[ ! -f results/${sample}.bam.bai || $(( $(stat -c %Y data/raw/${sample}_1.fq.gz) > $(stat -c %Y results/${sample}.bam.bai) )) ]]; then ... fi`. But we need to check all relevant inputs: reference index, raw reads. For simplicity, we can just skip if output exists and newer than both raw files and reference index. Use `[[ ! -f $out || $(( $(stat -c %Y data/raw/${sample}_1.fq.gz) > $(stat -c %Y $out) )) ]]`. But also need to check reference index: `samtools faidx` creates .fai; bwa index creates .amb etc. We can skip alignment if bam.bai exists and newer than raw reads and reference index files.
+
+Simplify: For each step, we can use `if [[ ! -f $output || $(find inputs -newer $output) ]]; then ... fi`. Use find to check any input newer. But need to list inputs. We can create array of inputs. Use `inputs=(data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz)` plus reference index files.
+
+But easier: we can rely on `samtools sort -@ 4 -o results/${sample}.bam` will overwrite if older; but we want to skip. So we need guard.
+
+Let's implement functions:
+
+- ensure_ref_index: check for chrM.fa.fai and .amb etc. If missing, run indexing commands.
+
+- align_sample: if bam.bai exists and newer than raw reads and reference index, skip. else run alignment pipeline.
+
+- call_variants: similar guard on vcf.gz.tbi.
+
+- collapse: guard based on any vcf.gz newer than collapsed.tsv.
+
+Implement idempotency with `if [[ ! -f $output || $(find ${inputs[@]} -newer $output) ]]; then ... fi`.
+
+But find requires list of files; we can use array and loop to check. Use a function `is_newer()`. But simpler: use `[[ ! -f $output ]]` or `[[ $(stat -c %Y ${inputs[*]}) -gt $(stat -c %Y $output) ]]` but that fails if multiple inputs.
+
+We can use `if [[ ! -f $output || $(find "${inputs[@]}" -newer "$output" | grep .) ]]; then ... fi`. But find returns list; we just need to check non-empty. Use `if [[ ! -f $output || $(find "${inputs[@]}" -newer "$output") ]]; then`.
+
+But find may output nothing; test with `-n "$(find ...)"`? We can use `if [[ ! -f $output || $(find "${inputs[@]}" -newer "$output" | wc -l) -gt 0 ]]`. But we can't pipe into wc inside double brackets easily. Use `if [[ ! -f $output || $(find "${inputs[@]}" -newer "$output") ]]; then` might treat non-empty string as true.
+
+Let's implement:
+
+```
+needs_run() {
+    local out=$1
+    shift
+    if [[ ! -f $out ]]; then return 0; fi
+    for inp in "$@"; do
+        if [[ $(stat -c %Y "$inp") -gt $(stat -c %Y "$out") ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+```
+
+Then use `if needs_run $output ${inputs[@]}; then ... fi`.
+
+Now implement steps.
+
+Also need to create results/ directory if missing.
+
+We must not output anything except tool outputs. So no echo.
+
+Let's craft script:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p results
+
+# function to check if need to run
+needs_run() {
+    local out=$1; shift
+    if [[ ! -f $out ]]; then return 0; fi
+    for inp in "$@"; do
+        if [[ ! -f $inp ]]; then continue; fi
+        if [[ $(stat -c %Y "$inp") -gt $(stat -c %Y "$out") ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# reference indexing
+REF=data/ref/chrM.fa
+FAI=$REF.fai
+AMB=${REF}.amb
+if needs_run $FAI $REF; then
+    samtools faidx "$REF"
+fi
+if needs_run $AMB $REF; then
+    bwa index "$REF"
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    BAM=results/${sample}.bam
+    BAI=${BAM}.bai
+    VCF=results/${sample}.vcf
+    VCFZ=results/${sample}.vcf.gz
+    TBIVCFZ=results/${sample}.vcf.gz.tbi
+
+    # alignment and sorting
+    if needs_run "$BAI" data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz $FAI; then
+        bwa mem -t "$THREADS" -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+            "$REF" data/raw/${sample}_1.fq.gz data/raw/${sample}_2.fq.gz |
+            samtools sort -@ "$THREADS" -o "$BAM"
+        samtools index -@ "$THREADS" "$BAM"
+    fi
+
+    # variant calling
+    if needs_run "$VCFZ" "$BAI"; then
+        lofreq call-parallel --pp-threads "$THREADS" -f "$REF" -o "$VCF" "$BAM"
+        bgzip -c "$VCF" > "$VCFZ"
+        tabix -p vcf "$VCFZ"
+        rm -f "$VCF"
+    fi
+done
+
+# collapse table
+COLLAPSED=results/collapsed.tsv
+if needs_run "$COLLAPSED" $(for s in "${SAMPLES[@]}"; do echo results/${s}.vcf.gz; done); then
+    {
+        printf 'sample\tchrom\tpos\tref\talt\taf\n'
+        for s in "${SAMPLES[@]}"; do
+            bcftools query -f '%CHROM\\t%POS\\t%REF\\t%ALT\\t%INFO/AF\\n' results/${s}.vcf.gz |
+                awk -v samp="$s" '{print samp"\t"$0}'
+        done
+    } > "$COLLAPSED"
+fi
+
+exit 0
+```
+
+But we used `bgzip` which may not be allowed. If bgzip not available, script fails. Could use `samtools view -b`? No.
+
+We can compress with `bcftools view -O z`. But plan says not to. However maybe acceptable. Let's modify to use bcftools view -Oz. That uses only listed tools. We'll produce .vcf.gz and index. So:
+
+```
+bcftools view -O z -o "$VCFZ" "$VCF"
+tabix -p vcf "$VCFZ"
+rm -f "$VCF"
+```
+
+But bcftools view will also compress; we need to ensure output is gzipped. Yes.
+
+Let's adjust accordingly.
+
+Also collapse step uses bcftools query on .vcf.gz, which works.
+
+Now idempotency for collapsed.tsv: we used needs_run with list of vcf.gz files. But our function expects out and inputs. We passed $(for s in ...; do echo results/${s}.vcf.gz; done). That expands to a string with newlines? Actually command substitution will produce newline separated, but when passed as argument it becomes one string containing newlines, not separate arguments. So we need to pass array.
+
+Simpler: compute inputs array:
+
+```
+inputs=()
+for s in "${SAMPLES[@]}"; do
+    inputs+=("results/${s}.vcf.gz")
+done
+if needs_run "$COLLAPSED" "${inputs[@]}"; then ...
+fi
+```
+
+Let's implement that.
+
+Also for alignment step, we used needs_run on BAI and raw reads and FAI. But if BAM exists but BAI missing? We skip because BAI missing triggers run. Good.
+
+But we also need to ensure that if BAM exists but older than raw reads or reference index, we redo. Our needs_run will check BAI's timestamp vs inputs; but BAI may be newer than BAM? Actually BAI is created after sorting. If BAM older, BAI might still be newer because it was created later. But we compare to BAI only. So if BAM older but BAI newer, our test passes (since BAI exists and newer than raw reads). That would skip re-aligning even though BAM outdated. But we want to redo if BAM is older than inputs. We should check BAM instead of BAI? Actually final output for alignment step is BAI; but we need to ensure that BAM also up-to-date. So maybe use BAM as output file for needs_run, not BAI. Then after sorting produce BAI. But we still need to index if BAI missing or older than BAM.
+
+Simpler: treat BAM as primary output of alignment and sorting. After that, always run samtools index if BAI missing or older than BAM. So we can separate steps:
+
+- Align & sort -> produce BAM.
+- Index -> produce BAI.
+
+So implement:
+
+```
+if needs_run "$BAM" data/raw/... $FAI; then
+    bwa mem ... | samtools sort -@ "$THREADS" -o "$BAM"
+fi
+
+# index
+if needs_run "$BAI" "$BAM"; then
+    samtools index -@ "$THREADS" "$BAM"
+fi
+```
+
+Now variant calling uses BAM as input; we check VCFZ vs BAM.
+
+Ok.
+
+Also need to ensure that reference indexing step: we used needs_run for FAI and AMB. But we also need to create all index files (.amb .ann .bwt .pac .sa). We can just check one of them, e.g., $AMB. If missing or older than REF, run both commands.
+
+Now final script.
+
+Let's produce final answer.

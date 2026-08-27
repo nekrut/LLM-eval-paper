@@ -1,0 +1,165 @@
+We need to produce a bash script that follows plan. Must be idempotent: skip steps if outputs exist and newer than inputs. Use set -euo pipefail. Tools available: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java.
+
+We need to use bgzip; but not listed in TOOL_INVENTORY. But bcftools can compress? Actually plan says compress with bgzip (not bcftools view -O z). Is bgzip available? Not listed. We could use bcftools +bgzip? Wait bcftools has 'view -O z' which uses bgzip internally. But plan explicitly says not to use that; but maybe we can still use bcftools view -O z? The plan says "Compress with bgzip (not `bcftools view -O z`)". So we must use bgzip command. Is bgzip in inventory? Not listed. But tabix is part of htslib, which includes bgzip binary. Usually bgzip is installed along with tabix. Since tabix is available, bgzip should be too. We'll assume bgzip exists.
+
+Also need to index VCF with tabix -p vcf.
+
+Need to create results/ directory if missing.
+
+Idempotency: For each sample, check existence of .bam.bai and maybe .vcf.gz.tbi etc. But we also need to ensure that if inputs are newer than outputs, re-run. So use `if [[ ! -s file || $(find input -newer file) ]]; then ...`. Use `-nt` operator? In bash: `[ "$input" -nt "$output" ]` works for single file; but we have multiple inputs. We can check if any input newer than output using `[[ $input1 -nt $output ]] || [[ $input2 -nt $output ]]`. For many, maybe use `if [ ! -f $output ] || find inputs -newer $output | grep . ; then ...`.
+
+Simplify: Use `if [[ ! -s $output ]] || [[ $(find ${inputs} -type f -newermt "$(stat -c %y $output)") ]]; then ...`. But easier: use `[[ ! -f $output ]] || [[ $input1 -nt $output ]]` etc.
+
+For reference indexing, check if .amb exists? Actually bwa index produces .amb .ann .bwt .pac .sa. We can check for .amb file existence.
+
+samtools faidx produce .fai; check that.
+
+Now per-sample steps:
+
+- Alignment: output results/${sample}.bam. Input fastqs. If bam exists and newer than both fastq files, skip.
+
+- Indexing: if .bai exists and newer than .bam, skip.
+
+- Variant calling: output uncompressed vcf? Actually we will produce intermediate .vcf then compress to .vcf.gz. We can check if .vcf.gz.tbi exists; if so, skip entire variant calling step. But need to ensure that if bam is newer than vcf.gz.tbi, re-run.
+
+- For collapse: check if collapsed.tsv exists and newer than all .vcf.gz files.
+
+Also we may want to create a log? Not required.
+
+We must not use echo for user-facing prose; but can use echo for debugging? The instruction says "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." So we should avoid echo. But script may produce output from commands, that's fine.
+
+Also need to ensure that the read group string uses literal backslash-t characters. We can embed them as \t in a single-quoted string? Wait they want two characters backslash and t inside the argument. In bash, if we write "-R '@RG\tID:$sample\tSM:$sample\tLB:$sample\tPL:ILLUMINA'", then the shell will interpret \t as tab unless quoted with single quotes or double quotes? Actually in double quotes, \t is not special; only certain escapes like \n, \r, etc. In bash, inside double quotes, backslash can escape some characters but \t remains literal \t. So we can use double quotes. But they said "The `\t` must remain the two characters backslash and `t` — bwa parses them itself." So using double quotes is fine.
+
+But need to ensure that $sample expands; so we need to use double quotes around entire string, but inside we have \t which remains literal. Example: -R "@RG\tID:$sample\tSM:$sample\tLB:$sample\tPL:ILLUMINA". This will produce the correct argument.
+
+Now implement script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+samples=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+# create results dir
+mkdir -p results
+
+# reference indexing
+ref="data/ref/chrM.fa"
+if [[ ! -f "${ref}.amb" || ! -f "${ref}.ann" || ! -f "${ref}.bwt" || ! -f "${ref}.pac" || ! -f "${ref}.sa" ]]; then
+    bwa index "$ref"
+fi
+
+if [[ ! -f "${ref}.fai" ]]; then
+    samtools faidx "$ref"
+fi
+
+# per-sample loop
+for sample in "${samples[@]}"; do
+    fastq1="data/raw/${sample}_1.fq.gz"
+    fastq2="data/raw/${sample}_2.fq.gz"
+    bam="results/${sample}.bam"
+    bai="results/${sample}.bam.bai"
+    vcf_uncompressed="results/${sample}.vcf"
+    vcf_gz="results/${sample}.vcf.gz"
+    tbi="results/${sample}.vcf.gz.tbi"
+
+    # alignment
+    if [[ ! -s "$bam" || $fastq1 -nt "$bam" || $fastq2 -nt "$bam" ]]; then
+        bwa mem -t "$THREADS" -R "@RG\tID:$sample\tSM:$sample\tLB:$sample\tPL:ILLUMINA" \
+            "$ref" "$fastq1" "$fastq2" | samtools sort -@ "$THREADS" -o "$bam"
+    fi
+
+    # index bam
+    if [[ ! -s "$bai" || $bam -nt "$bai" ]]; then
+        samtools index -@ "$THREADS" "$bam"
+    fi
+
+    # variant calling
+    if [[ ! -s "$tbi" || $bam -nt "$tbi" ]]; then
+        lofreq call-parallel --pp-threads "$THREADS" -f "$ref" -b "$bam" > "$vcf_uncompressed"
+        bgzip -c "$vcf_uncompressed" > "$vcf_gz"
+        tabix -p vcf "$vcf_gz"
+        rm -f "$vcf_uncompressed"
+    fi
+done
+
+# collapse step
+collapsed="results/collapsed.tsv"
+need_collapse=0
+for sample in "${samples[@]}"; do
+    vcf_gz="results/${sample}.vcf.gz"
+    if [[ ! -s "$collapsed" || $vcf_gz -nt "$collapsed" ]]; then
+        need_collapse=1
+        break
+    fi
+done
+
+if (( need_collapse )); then
+    # header
+    printf "sample\tchrom\tpos\tref\talt\taf\n"
+    for sample in "${samples[@]}"; do
+        vcf_gz="results/${sample}.vcf.gz"
+        bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$vcf_gz"
+    done > "$collapsed.tmp" && mv "$collapsed.tmp" "$collapsed"
+fi
+
+exit 0
+
+Need to ensure that bgzip is available. Use `bgzip -c`. If not, we could use `samtools view -O z` but plan says not.
+
+Also need to check if bcftools query outputs alt as comma separated? That's fine.
+
+We also need to ensure that the script uses only tools in inventory: bwa, samtools, lofreq, bgzip (likely present), tabix, bcftools. All good.
+
+Now idempotency: For each step we check existence and newer. But for variant calling we check tbi existence; if bam newer than tbi, re-run. That will regenerate vcf.gz etc. Good.
+
+For collapse, we check any vcf_gz newer than collapsed.tsv. We set need_collapse accordingly.
+
+Edge case: If collapsed.tsv exists but some vcf_gz is newer, we rebuild. Good.
+
+Now ensure no stray echo. We used printf for header; that's okay as tool output? It's not user-facing prose? It prints header line to stdout of script; but final output file will be overwritten by redirect. But the header printed before bcftools query lines will also go to collapsed.tsv.tmp because we use `printf ...` then bcftools outputs appended to same file? Wait we used:
+
+printf "sample\tchrom\tpos\tref\talt\taf\n"
+for sample in ...; do
+    bcftools query ...
+done > "$collapsed.tmp" && mv ...
+
+But the printf output is not redirected, so it will go to stdout of script. That would be printed to console, which might violate rule. We should redirect header into file too.
+
+Better: use `printf` and pipe into cat? Actually we can create tmp file with header then append bcftools outputs.
+
+Simpler: Use a here-doc to write header into temp file, then append bcftools output.
+
+Implementation:
+
+tmpfile=$(mktemp)
+printf "sample\tchrom\tpos\tref\talt\taf\n" > "$tmpfile"
+for sample in ...; do
+    vcf_gz="results/${sample}.vcf.gz"
+    bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$vcf_gz" >> "$tmpfile"
+done
+mv "$tmpfile" "$collapsed"
+
+This avoids printing to stdout.
+
+Also we need to ensure that tmpfile is removed if script exits early; but not necessary.
+
+Now final script. Ensure no stray echo or printf to console. Use printf only for header into file, not to console.
+
+Let's craft final script accordingly.
+
+Check idempotency: For each sample, bam creation uses `if [[ ! -s "$bam" || $fastq1 -nt "$bam" || $fastq2 -nt "$bam" ]]; then ...`. That will skip if bam exists and newer than both fastqs. Good.
+
+Bai indexing: check if bai missing or bam newer than bai.
+
+Variant calling: check tbi missing or bam newer than tbi. But what about vcf_gz? If tbi older but vcf_gz newer? Actually tbi is derived from vcf_gz, so if vcf_gz newer than tbi, we need to re-run. Our condition uses bam -nt tbi; but if vcf_gz newer due to previous run, but bam unchanged, then tbi may be older but we won't re-run. But that scenario only occurs if we manually modify vcf_gz? Not likely. So fine.
+
+But maybe better: check if any of the outputs (.vcf.gz or .tbi) missing or bam newer than them. We'll just use tbi and bam.
+
+Now collapse step: need to rebuild if any vcf_gz newer than collapsed.tsv. Good.
+
+Edge: If collapsed.tsv exists but some sample's vcf_gz is missing? But that shouldn't happen because per-sample steps produce it. So fine.
+
+Now final script.
+
+Let's write the script accordingly.

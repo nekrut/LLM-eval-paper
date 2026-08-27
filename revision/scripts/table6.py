@@ -102,23 +102,26 @@ def main() -> int:
             print(f"WARNING: no data for {name}")
             continue
         med = st.median(xs)
-        if disp == "iqr":
-            lo, hi = percentile(xs, 0.25), percentile(xs, 0.75)
-            bracket = f"[{lo:,.0f}–{hi:,.0f}] (IQR)"
-            assert lo <= med <= hi, f"{name}: median {med} outside IQR [{lo}, {hi}]"
-        else:
-            bracket = f"[{min(xs):,.0f}–{max(xs):,.0f}] (full)"
-        rows.append((name, mem, med, bracket, len(xs)))
+        lo, hi = percentile(xs, 0.25), percentile(xs, 0.75)
+        mn, mx = min(xs), max(xs)
+        # The first version of Table 15 hand-entered a "full range" column that
+        # this generator never emitted, and four of its five rows were wrong.
+        # Both columns are now emitted here, with the ordering asserted.
+        assert mn <= lo <= med <= hi <= mx, (
+            f"{name}: min {mn} <= Q1 {lo} <= median {med} <= Q3 {hi} <= max {mx} violated")
+        bracket = f"[{lo:,.0f}–{hi:,.0f}] (IQR)"
+        full = f"[{mn:,.0f}–{mx:,.0f}]"
+        rows.append((name, mem, med, bracket, full, len(xs)))
 
     if args.markdown:
-        print("| Platform | VRAM/UMA | Median wall time (s) | Range (s) | n |")
-        print("|---|---|---:|---:|---:|")
-        for name, mem, med, bracket, n in rows:
-            print(f"| {name.replace('2x', '2×')} | {mem} | {med:,.0f} | {bracket} | {n} |")
+        print("| Platform | n | Median generation (s) | IQR | Full range |")
+        print("|---|---:|---:|---|---|")
+        for name, mem, med, bracket, full, n in rows:
+            print(f"| {name.replace('2x', '2×')} | {n} | {med:,.0f} | {bracket.replace(' (IQR)','')} | {full} |")
     else:
-        print(f"{'platform':<24}{'n':>4}{'median':>9}   dispersion")
-        for name, mem, med, bracket, n in rows:
-            print(f"{name:<24}{n:>4}{med:>9,.0f}   {bracket}")
+        print(f"{'platform':<24}{'n':>4}{'median':>9}   IQR             full range")
+        for name, mem, med, bracket, full, n in rows:
+            print(f"{name:<24}{n:>4}{med:>9,.0f}   {bracket:<16}{full}")
     return 0
 
 

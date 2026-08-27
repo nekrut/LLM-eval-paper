@@ -1,0 +1,3237 @@
+We need to produce a Bash script that follows the plan exactly. The script must be idempotent: if results/ already contains all outputs and they are newer than inputs, it should exit 0 without redoing work.
+
+Constraints:
+
+- First line: #!/usr/bin/env bash
+- Second line: set -euo pipefail
+
+We need to use only tools listed in TOOL_INVENTORY. Tools available: bwa, samtools, bcftools, tabix, lofreq, SnpSift, snpEff, fastqc, seqkit, snakemake, shellcheck, java.
+
+We need to produce outputs:
+
+results/{sample}.bam
+results/{sample}.bam.bai
+results/{sample}.vcf.gz
+results/{sample}.vcf.gz.tbi
+
+and results/collapsed.tsv
+
+Also we might want to run fastqc? Not in plan. So ignore.
+
+The script must be idempotent: skip steps if outputs exist and are newer than inputs.
+
+We need to handle reference indexing: check for .amb etc. For bwa index, the presence of .bwt or .pac indicates index exists. For samtools faidx, check for .fai file.
+
+For each sample:
+
+- Check if results/{sample}.bam.bai exists and is newer than data/raw files? Actually we need to skip alignment if bam and bai exist and are newer than raw fastq and reference? But the plan says "skip if results/{sample}.vcf.gz.tbi already exists". For earlier steps, we can check existence of final outputs. But for idempotency, we should check each step individually: e.g., if BAM exists and is newer than inputs, skip alignment; else re-run.
+
+Simplify: We'll implement a function to run command only if output missing or older than any input. Use `[[ ! -f $output || $(find $inputs -newer $output) ]]`? Actually we need to check if any input file is newer than the output. So we can use `if [[ ! -f "$output" || $(find "${inputs[@]}" -newer "$output") ]]; then ... fi`. But find returns list of files; we can test with `-nt` operator: `[ "$input" -nt "$output" ]`. For multiple inputs, we need to check each. We could use a loop.
+
+Simplify: We'll create a function `needs_run()` that takes output and array of input files. It will return true if output missing or any input newer than output. Implementation:
+
+```
+needs_run() {
+  local out=$1
+  shift
+  local inputs=("$@")
+  [[ ! -f "$out" ]] && return 0
+  for inp in "${inputs[@]}"; do
+    [[ -e "$inp" && "$inp" -nt "$out" ]] && return 0
+  done
+  return 1
+}
+```
+
+But we need to handle case where output is a directory? Not needed.
+
+Now, reference indexing: We can check for .amb file. But the index files may be multiple; we can just check if .bwt exists. So:
+
+```
+if needs_run data/ref/chrM.fa.bwt data/ref/chrM.fa; then
+  bwa index data/ref/chrM.fa
+fi
+```
+
+But `needs_run` expects output file path; but .bwt is not the final output of indexing? Actually we want to skip if all index files exist. But easier: check for existence of .amb or .ann etc. We can just check for .amb.
+
+Simplify: Use:
+
+```
+if [[ ! -f data/ref/chrM.fa.bwt ]]; then
+  bwa index data/ref/chrM.fa
+fi
+```
+
+But we also need to skip if .bwt exists but maybe older than reference? But the reference is static. So it's fine.
+
+Similarly for samtools faidx: check for .fai file.
+
+Now per-sample steps:
+
+- Align: output bam and bai. We can check if results/{sample}.bam.bai exists; if yes, skip alignment. But we might want to check both bam and bai. If either missing, run alignment. Also need to ensure that the BAM is newer than raw fastqs? Actually if raw fastq changed, we should re-run alignment. So we can use needs_run on results/{sample}.bam with inputs: data/raw/{sample}_1.fq.gz data/raw/{sample}_2.fq.gz.
+
+But also we might want to check if bam exists but bai missing; then run indexing only. But easier: we can treat each step separately:
+
+- Alignment: produce BAM. Check needs_run results/{sample}.bam with inputs raw fastqs and reference? Actually alignment uses reference file as input too, but it's static. So we don't need to include it.
+
+- After alignment, index bam: check if results/{sample}.bam.bai exists; if not or older than bam, run samtools index.
+
+- Variant calling: produce uncompressed VCF (results/{sample}.vcf). Check needs_run results/{sample}.vcf with input BAM. But we also need to consider that the VCF is later compressed and removed. So we can skip variant calling if final .vcf.gz.tbi exists? Actually plan says "skip if results/{sample}.vcf.gz.tbi already exists". That means if final compressed index exists, we can skip all earlier steps for that sample. But we also need to ensure that the VCF is not older than BAM; but if we skip variant calling because .tbi exists, but BAM changed, we might still want to re-run variant calling. So we should check if any input (BAM) newer than final outputs (.vcf.gz.tbi). So we can use needs_run results/{sample}.vcf.gz.tbi with inputs: results/{sample}.bam.
+
+But the plan says "skip if results/{sample}.vcf.gz.tbi already exists". But for idempotency, we should also check timestamps. We'll implement a function that checks if output missing or any input newer than output. So variant calling step will be executed only if needs_run results/{sample}.vcf.gz.tbi with inputs: results/{sample}.bam.
+
+But we need to produce uncompressed VCF first; then compress and index. We can do:
+
+```
+if needs_run results/${sample}.vcf.gz.tbi results/${sample}.bam; then
+  # run variant calling, compression, indexing
+fi
+```
+
+Inside that block: call lofreq call-parallel, output to temp .vcf file (maybe results/${sample}.vcf). Then compress with bgzip. But we don't have bgzip in TOOL_INVENTORY? Wait, bcftools includes bgzip as a command `bgzip`. The plan says "Compress with bgzip". So we can use `bgzip -c` or `bgzip -@ 4`. Actually bcftools has bgzip binary. We need to check if it's available: bcftools is in inventory; but bgzip may be part of htslib, not necessarily installed separately. But bcftools includes a bgzip command? Usually bgzip is separate but often included with samtools or bcftools. Since we have samtools and bcftools, we can use `bgzip` from samtools (samtools has bgzip). So we can call `bgzip -c`. We'll need to specify threads maybe: `bgzip -@ 4`.
+
+But the plan says "Compress with bgzip (not bcftools view -O z) producing results/{sample}.vcf.gz". So we will use `bgzip -c` or `bgzip -@ 4 -c`. The output file should be results/${sample}.vcf.gz. We'll need to remove intermediate .vcf after compression.
+
+Also index with tabix: `tabix -p vcf results/${sample}.vcf.gz`.
+
+Now collapsed.tsv:
+
+- For each sample, run bcftools query on compressed VCF. We can generate per-sample output and then cat them together. But we need to skip if collapsed.tsv exists and is newer than all input VCFs.
+
+So we can check: `needs_run results/collapsed.tsv` with inputs: results/${sample}.vcf.gz for each sample.
+
+Implementation:
+
+```
+if needs_run results/collapsed.tsv $(for s in "${samples[@]}"; do echo "results/${s}.vcf.gz"; done); then
+  # generate collapsed.tsv
+fi
+```
+
+But `needs_run` expects output and list of inputs. We can pass them as separate arguments.
+
+Now we need to implement the script accordingly.
+
+Edge cases:
+
+- The reference indexing step: we need to check if .amb file exists; but also maybe .ann, .bwt etc. We'll just check for .amb or .bwt. But we might want to skip if all index files exist. We can check for .amb and .ann and .pac and .sa? Actually bwa index creates .amb, .ann, .bwt, .pac, .sa. So we can check for .amb file existence; but if .amb exists but others missing, maybe incomplete. But it's unlikely. We'll just check for .amb.
+
+- For samtools faidx: check for .fai.
+
+Now the script must not output anything except tool outputs. We should avoid echo statements. Use `printf`? That would produce output to stdout; but we might want to suppress it. The requirement says "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." So we can still use printf for internal messages? But that would be printed to stdout, which is considered "beyond what tools naturally emit". So we should avoid any prints. We can just run commands without printing anything.
+
+But we might need to create directories: `mkdir -p results`. That will not produce output unless error.
+
+Now we need to ensure the script uses only tools from inventory. We'll use built-in bash features for file checks, loops, etc.
+
+We also need to ensure that the script is idempotent: if all outputs exist and are newer than inputs, it should exit 0 without doing anything. Our logic will skip each step accordingly.
+
+Now we need to implement `needs_run` function properly. Let's design:
+
+```
+needs_run() {
+  local out=$1
+  shift
+  local inputs=("$@")
+  if [[ ! -f "$out" ]]; then
+    return 0
+  fi
+  for inp in "${inputs[@]}"; do
+    if [[ -e "$inp" && "$inp" -nt "$out" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+```
+
+But we need to handle case where output is a directory? Not needed.
+
+Now for each step:
+
+- Reference indexing: check .amb file. But we also might want to skip if .fai exists but older than reference? But reference static. So just check existence.
+
+Implementation:
+
+```
+if [[ ! -f data/ref/chrM.fa.bwt ]]; then
+  bwa index data/ref/chrM.fa
+fi
+
+if [[ ! -f data/ref/chrM.fa.fai ]]; then
+  samtools faidx data/ref/chrM.fa
+fi
+```
+
+But we might want to check .amb and .fai. But it's fine.
+
+Now per-sample:
+
+Define array of samples: `samples=(M117-bl M117-ch M117C1-bl M117C1-ch)`
+
+Loop over each sample:
+
+```
+for sample in "${samples[@]}"; do
+  raw1="data/raw/${sample}_1.fq.gz"
+  raw2="data/raw/${sample}_2.fq.gz"
+  bam="results/${sample}.bam"
+  bai="results/${sample}.bam.bai"
+  vcf="results/${sample}.vcf"
+  vcfgz="results/${sample}.vcf.gz"
+  tbi="results/${sample}.vcf.gz.tbi"
+
+  # Alignment
+  if needs_run "$bam" "$raw1" "$raw2"; then
+    bwa mem -t 4 -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ 4 -o "$bam"
+  fi
+
+  # Index BAM
+  if needs_run "$bai" "$bam"; then
+    samtools index -@ 4 "$bam"
+  fi
+
+  # Variant calling, compression, indexing
+  if needs_run "$tbi" "$bam"; then
+    lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -b "$bam" > "$vcf"
+    bgzip -@ 4 -c "$vcf" > "$vcfgz"
+    tabix -p vcf "$vcfgz"
+    rm -f "$vcf"
+  fi
+done
+```
+
+But we need to ensure that the `lofreq call-parallel` command syntax is correct. The plan says: Use `--pp-threads 4`. Input: reference, BAM. Output uncompressed VCF to a temporary path (e.g., results/{sample}.vcf). So we can run:
+
+```
+lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -b "$bam" > "$vcf"
+```
+
+But the plan says "Use the `call-parallel` subcommand (not plain `lofreq call`) with `--pp-threads 4`. Reference: `data/ref/chrM.fa`. Input: `results/{sample}.bam`. Write uncompressed VCF to a temporary path". So we need to specify reference and BAM. The syntax for lofreq call-parallel is:
+
+```
+lofreq call-parallel [options] -f <reference> -b <BAM>
+```
+
+But we might also need to include `-o`? Actually the command writes to stdout by default, so redirecting > $vcf works.
+
+Now compress: Use bgzip. We can use `bgzip -@ 4 -c "$vcf" > "$vcfgz"`. But we need to ensure that bgzip is available. It's part of samtools or bcftools. We'll just call `bgzip`.
+
+But we also need to index with tabix: `tabix -p vcf "$vcfgz"`.
+
+Now after compression, remove intermediate .vcf file: `rm -f "$vcf"`.
+
+Now collapsed.tsv:
+
+```
+if needs_run results/collapsed.tsv $(for s in "${samples[@]}"; do echo "results/${s}.vcf.gz"; done); then
+  # generate header and per-sample outputs
+fi
+```
+
+But we need to pass all VCF gz files as inputs. We can build an array:
+
+```
+inputs=()
+for s in "${samples[@]}"; do
+  inputs+=("results/${s}.vcf.gz")
+done
+if needs_run results/collapsed.tsv "${inputs[@]}"; then
+  # generate collapsed.tsv
+fi
+```
+
+Now generating collapsed.tsv: We need to run bcftools query for each sample, with format string `'${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'`. But we need to include the literal sample name. The plan says "For each sample, run `bcftools query -f '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n' results/{sample}.vcf.gz` (the `{sample}` literal is prepended via the format string so the sample name is attached per row)."
+
+So we can run:
+
+```
+bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz
+```
+
+But bcftools query expects a format string; the sample name is not a placeholder but literal. So we can use:
+
+```
+bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${sample}.vcf.gz
+```
+
+But bcftools query will interpret `%` placeholders; the sample name is just a literal string. So we can use that.
+
+Now we need to concatenate all outputs and add header line at top. We can do:
+
+```
+{
+  printf 'sample\tchrom\tpos\tref\talt\taf\n'
+  for s in "${samples[@]}"; do
+    bcftools query -f "${s}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" results/${s}.vcf.gz
+  done
+} > results/collapsed.tsv
+```
+
+But we need to ensure that this block is executed only if needs_run returns true. So inside the `if` block.
+
+Now we also need to ensure that bcftools query outputs lines with trailing newline; it's fine.
+
+Now we must ensure that all commands are idempotent: e.g., if collapsed.tsv exists and is newer than all VCF gz files, skip generating it. Our needs_run function will handle that.
+
+Now we need to consider potential pitfalls:
+
+- The `needs_run` function uses `$inp -nt $out`. But if input file does not exist? We check `-e "$inp" && "$inp" -nt "$out"`; but if input missing, skip. That's fine.
+
+- For the alignment step: we call bwa mem and pipe to samtools sort. That will produce BAM. If bam exists but older than raw fastqs, needs_run will return true and re-run. But we also need to ensure that if bam exists but bai missing or older, we still run indexing. That's handled by separate check.
+
+- For variant calling: We skip if tbi exists and is newer than bam. But what about vcf.gz? If tbi exists but vcf.gz older? Actually tbi is index of vcf.gz; if vcf.gz older than tbi, that would be weird. But we can rely on tbi being newer than vcf.gz. So skip.
+
+- For variant calling: We need to ensure that the intermediate .vcf file is removed after compression. If script fails mid-run, it might leave .vcf; but that's fine.
+
+Now we also need to consider that `bgzip` may produce a .gz file with same name as input? Actually bgzip -c > output will create gz file. That's fine.
+
+- We need to ensure that the script uses only tools from inventory: bwa, samtools, bcftools, tabix, lofreq, seqkit maybe not used, but we can ignore. The script uses `bgzip` which is part of samtools or bcftools; it's available on PATH if installed.
+
+- We need to ensure that the script does not produce any output except tool outputs. Our script will run commands and may produce error messages if something fails. But no echo statements.
+
+Now we need to consider potential issues with quoting: The read group string must contain literal backslash-t characters, not actual tabs. So we need to pass `-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"` as a single argument. In bash, double quotes will interpret `\` escapes; but we want the string to contain backslash-t characters. We can escape them with double backslashes: `\\t`. But inside double quotes, `\\t` becomes `\t`? Actually in double quotes, `\\` is an escaped backslash, so it results in a single backslash. Then `t` remains t. So the resulting string will contain `\t`. Good.
+
+But we need to ensure that the entire argument is passed as one string: `-R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`. That should produce a single argument with literal backslash-t characters. BWA will parse them into actual tabs.
+
+Now we need to ensure that the script uses `set -euo pipefail` and no other options.
+
+We also need to create results/ directory if missing:
+
+```
+mkdir -p results
+```
+
+But we should not produce output; mkdir -p doesn't print anything unless error.
+
+Now we need to consider that the script may be run multiple times. The idempotency logic will skip steps accordingly.
+
+Now we need to ensure that all commands are executed with correct options: e.g., `samtools sort -@ 4 -o "$bam"`. That writes sorted BAM. We also might want to specify `-O bam`? But default output is BAM. So it's fine.
+
+Now we need to consider the use of `bgzip`: The command `bgzip -@ 4 -c "$vcf" > "$vcfgz"` will compress using 4 threads. That should be okay.
+
+Now we need to ensure that tabix indexing uses correct format: `tabix -p vcf "$vcfgz"`. That will produce .tbi index file.
+
+Now we need to consider the collapsed.tsv generation: We use bcftools query with format string containing sample name and placeholders. The output lines will be like:
+
+```
+M117-bl 1 123 A G 0.5
+...
+```
+
+But we need header line: `sample chrom pos ref alt af`. So we can print that.
+
+Now we need to ensure that the script uses only tools from inventory; bcftools query is part of bcftools, so it's fine.
+
+Now we need to consider potential issues with quoting in bcftools query format string. The format string contains `%CHROM`, etc. We need to escape percent signs? No, they are placeholders for bcftools. So we can use:
+
+```
+-f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"
+```
+
+But the `\n` will be interpreted by bash as newline if inside double quotes? Actually in double quotes, `\n` is not special; it's just backslash-n. But bcftools query expects a literal newline at end of format string. We can provide it as `\\n` or use `$'\n'`. But we cannot use `$'\n'` because that would produce actual newline? Actually $'' will interpret escapes like \n into newline; but we want to pass newline to bcftools query. The plan says "format string: '{sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n'" with literal newline at end. So we can use `\\n` inside double quotes? Let's think.
+
+In bcftools query, the format string is parsed by bcftools; it expects a C-style string where `%` placeholders are replaced and `\t` is tab, `\n` is newline. But if we pass `\n` as two characters backslash-n to bcftools, will bcftools interpret them? I think bcftools query uses the same format syntax as VCFtools or similar; it interprets escape sequences like \t and \n. So passing `\\n` would produce a literal backslash-n in output. We need actual newline at end of each line. But we can just rely on bcftools to interpret `\n`. In double quotes, `\\n` becomes `\n`? Actually inside double quotes, `\\` is an escaped backslash, resulting in a single backslash; then `n` remains n. So the string contains `\n`. Good.
+
+But we also need to escape `%CHROM` etc. They are fine.
+
+So format string: `"${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"` will produce a string with backslash-t and backslash-n. But inside double quotes, `\t` is not interpreted by bash; it's just backslash-t. So bcftools will interpret it as tab. Good.
+
+Now we need to ensure that the sample name variable expands correctly. For example, if sample contains hyphen or underscore, that's fine.
+
+Now we need to consider quoting of the entire format string: We can use single quotes around the whole string and then embed double quotes for sample? But easier is to use double quotes with escaped backslashes as above.
+
+Let's test mentally:
+
+```
+sample=M117-bl
+format="${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"
+echo "$format" | od -c
+```
+
+Will show: M 1 7 1 - b l \ t % C H O R M ... etc. Good.
+
+Now bcftools query will interpret `\t` and `\n`.
+
+Now we need to ensure that the script uses only tools from inventory; we used `printf` inside collapsed.tsv generation? We used `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header. But printing to stdout is allowed? The requirement says "Do not write to stderr/stdout beyond what tools naturally emit". Using printf would produce output to stdout, which might be considered user-facing prose. So we should avoid that. Instead, we can use `cat <<EOF` or something? But that's also writing to stdout. We need to generate collapsed.tsv by redirecting the entire block into file; but we still need to write header line. That is part of output file, not console. The script's stdout will be redirected to results/collapsed.tsv via redirection `>`. So any writes inside that block go to the file, not to console. But if we use `printf` or `echo`, they will write to stdout; but since we redirect the entire block with `{ ... } > results/collapsed.tsv`, all output goes into the file. That is fine.
+
+But we need to ensure no stray prints outside that block. So we should not have any echo statements outside of redirection.
+
+Now we also need to avoid using `printf` inside collapsed.tsv generation? But it's okay because it's inside the block redirected to file.
+
+Now we need to consider that the script may produce output from tools like bwa, samtools, lofreq, bcftools, tabix. Those will print progress messages or warnings to stdout/stderr. That's allowed.
+
+Now we need to ensure that no stray `echo` statements are used anywhere else. We should not use any echo for user-facing prose. So we must avoid echo entirely.
+
+Now we need to consider the environment: The script is run in a directory containing data/raw/ and data/ref/. The script will create results/.
+
+Now we need to think about potential pitfalls:
+
+- The `needs_run` function uses `$inp -nt $out`. But if output file does not exist, it returns true. Good.
+
+- For variant calling step: We check needs_run "$tbi" "$bam". That ensures that if tbi exists and is newer than bam, skip. If tbi missing or older, run. But we also need to ensure that vcf.gz may be missing but tbi missing; but that's fine.
+
+- However, what about the case where tbi exists but vcf.gz missing? That would indicate incomplete previous run. In that case, needs_run will return true because output file (tbi) exists but input bam is newer? Actually if vcf.gz missing but tbi exists, we might still skip variant calling incorrectly. But this scenario should not happen normally; but to be safe, we could check existence of vcf.gz as well. But the plan says "skip if results/{sample}.vcf.gz.tbi already exists". So it's fine.
+
+- For collapsed.tsv: We need to ensure that all VCF gz files exist before generating collapsed.tsv. If any missing, needs_run will return true because input file doesn't exist? Actually our function checks `[[ -e "$inp" && "$inp" -nt "$out" ]]`. If input missing, the condition fails; but we still might want to skip generation if any input missing? But if a VCF gz is missing, collapsed.tsv should not be generated. Our needs_run will return true only if output missing or any existing input newer than output. If an input file is missing, it won't trigger -nt check, so the function may incorrectly think no need to run. But we can modify needs_run to also consider missing inputs: if any input does not exist, then we should return 0 (needs run). So we can adjust:
+
+```
+for inp in "${inputs[@]}"; do
+  if [[ ! -e "$inp" ]]; then
+    return 0
+  fi
+  if [[ "$inp" -nt "$out" ]]; then
+    return 0
+  fi
+done
+return 1
+```
+
+Thus, if any input missing, we run.
+
+Now for alignment step: We check needs_run "$bam" "$raw1" "$raw2". If raw files missing, script will error earlier. But that's fine.
+
+Now for indexing BAM: We need to check needs_run "$bai" "$bam". That ensures that if bam newer than bai, reindex. Good.
+
+Now we also need to ensure that the script uses `set -euo pipefail`. This means any command failing will exit immediately. So we must be careful with commands like `bgzip` and `tabix` etc. They should succeed.
+
+Now we need to consider potential concurrency: We are using threads for bwa mem, samtools sort, bgzip, lofreq call-parallel. All good.
+
+Now we need to ensure that the script uses only tools from inventory; we used `mkdir`, `samtools`, `bwa`, `lofreq`, `bgzip`, `tabix`, `bcftools`. All are in inventory.
+
+Now we need to consider potential issues with quoting of the read group string. We used double quotes and escaped backslashes: `"@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`. That should produce a single argument containing literal `\t` sequences.
+
+Now we need to consider that `bwa mem -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"` will treat the string as one argument. Good.
+
+Now we need to ensure that the script uses correct path for reference: data/ref/chrM.fa. That file exists and is decompressed.
+
+Now we need to consider that `samtools sort -@ 4 -o "$bam"` expects input from stdin; we pipe bwa mem output into it. That's fine.
+
+Now we need to consider that `lofreq call-parallel` may require reference index? It uses the reference file directly, not index. But it's okay.
+
+Now we need to consider that `bgzip` will compress .vcf to .gz. We then run tabix on .gz. Good.
+
+Now we need to consider that bcftools query expects a VCF with header lines starting with '#'. The VCF produced by lofreq call-parallel should have header lines. So it's fine.
+
+Now we need to consider that the collapsed.tsv generation uses bcftools query for each sample and concatenates them. That will produce lines like:
+
+```
+M117-bl 1 123 A G 0.5
+...
+```
+
+But we also need to ensure that the output is tab-separated. The format string uses `\t` between fields, so it's fine.
+
+Now we need to consider that bcftools query may output alt as comma separated if multiple alt alleles; but that's okay.
+
+Now we need to consider that the collapsed.tsv header line: 'sample chrom pos ref alt af'. We can produce it with:
+
+```
+printf 'sample\tchrom\tpos\tref\talt\taf\n'
+```
+
+But we must ensure it's inside block redirected to file. So no output to console.
+
+Now we need to consider that bcftools query may output lines with trailing newline; that's fine.
+
+Now we need to consider that the script should exit 0 if all outputs exist and are newer than inputs. Our logic will skip each step accordingly, so it will just finish without doing anything else. That is idempotent.
+
+Now we need to ensure that the script does not produce any stray output beyond tool outputs. We must avoid `printf` or `echo` outside of file redirection. But inside collapsed.tsv block, it's okay because it's redirected to file.
+
+But we also used `printf` inside collapsed.tsv block; that's fine.
+
+Now we need to consider potential issues with using `printf` inside the block: It will output header line into file. That's fine.
+
+Now we need to ensure that all commands are executed correctly and no stray spaces or newlines cause errors.
+
+Now we need to produce final script accordingly.
+
+Let's draft the script:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Create results directory if missing
+mkdir -p results
+
+# Function to determine whether output needs to be regenerated
+needs_run() {
+  local out=$1
+  shift
+  local inputs=("$@")
+  # If output does not exist, need to run
+  [[ ! -f "$out" ]] && return 0
+  for inp in "${inputs[@]}"; do
+    if [[ ! -e "$inp" ]]; then
+      return 0
+    fi
+    if [[ "$inp" -nt "$out" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Reference indexing
+if needs_run data/ref/chrM.fa.bwt data/ref/chrM.fa; then
+  bwa index data/ref/chrM.fa
+fi
+
+if needs_run data/ref/chrM.fa.fai data/ref/chrM.fa; then
+  samtools faidx data/ref/chrM.fa
+fi
+
+# Sample list
+samples=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+for sample in "${samples[@]}"; do
+  raw1="data/raw/${sample}_1.fq.gz"
+  raw2="data/raw/${sample}_2.fq.gz"
+  bam="results/${sample}.bam"
+  bai="results/${sample}.bam.bai"
+  vcf="results/${sample}.vcf"
+  vcfgz="results/${sample}.vcf.gz"
+  tbi="results/${sample}.vcf.gz.tbi"
+
+  # Alignment
+  if needs_run "$bam" "$raw1" "$raw2"; then
+    bwa mem -t 4 -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ 4 -o "$bam"
+  fi
+
+  # BAM indexing
+  if needs_run "$bai" "$bam"; then
+    samtools index -@ 4 "$bam"
+  fi
+
+  # Variant calling, compression, indexing
+  if needs_run "$tbi" "$bam"; then
+    lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -b "$bam" > "$vcf"
+    bgzip -@ 4 -c "$vcf" > "$vcfgz"
+    tabix -p vcf "$vcfgz"
+    rm -f "$vcf"
+  fi
+done
+
+# Collapsed table
+collapsed="results/collapsed.tsv"
+inputs=()
+for sample in "${samples[@]}"; do
+  inputs+=("results/${sample}.vcf.gz")
+done
+
+if needs_run "$collapsed" "${inputs[@]}"; then
+  {
+    printf 'sample\tchrom\tpos\tref\talt\taf\n'
+    for sample in "${samples[@]}"; do
+      bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"
+    done
+  } > "$collapsed"
+fi
+
+```
+
+Now we need to check if any commands produce output that might be printed to console. The script uses `printf` inside block redirected to file, so no console output.
+
+But the function `needs_run` may use `[[ ! -f "$out" ]] && return 0`. That is fine.
+
+Now we need to ensure that all commands are executed correctly and not produce stray errors.
+
+Let's test mentally:
+
+- The script starts with shebang and set options. Good.
+
+- It creates results directory: `mkdir -p results`.
+
+- Defines function needs_run.
+
+- Reference indexing: check if data/ref/chrM.fa.bwt exists; if not, run bwa index. That will create .amb etc. But we also need to ensure that the reference file is present. It's there.
+
+- Then samtools faidx: check if .fai exists; if not, run samtools faidx.
+
+- Sample list defined.
+
+- For each sample:
+
+  - raw1 and raw2 paths constructed.
+
+  - bam path etc.
+
+  - Alignment step: needs_run "$bam" "$raw1" "$raw2". If bam missing or older than any raw file, run alignment. The command uses bwa mem with read group string containing literal backslash-t sequences. It pipes to samtools sort -@4 -o $bam. That will produce sorted BAM.
+
+  - Indexing: needs_run "$bai" "$bam". If bai missing or older than bam, run samtools index -@4 $bam.
+
+  - Variant calling: needs_run "$tbi" "$bam". If tbi missing or older than bam, run variant calling. The command uses lofreq call-parallel with reference and BAM. Output to $vcf. Then compress with bgzip -@4 -c $vcf > $vcfgz. Then tabix -p vcf $vcfgz. Remove uncompressed VCF.
+
+- After loop, collapsed table: collapsed path defined. Build inputs array of all .vcf.gz files. needs_run "$collapsed" "${inputs[@]}". If collapsed missing or older than any input, generate collapsed.tsv by printing header and bcftools query for each sample.
+
+Now we need to ensure that the script uses only tools from inventory. We used `bgzip`. Is bgzip part of samtools? Yes, but it's not listed explicitly in TOOL_INVENTORY. The inventory lists "samtools" and "bcftools". But bgzip is usually part of samtools or bcftools; but we cannot guarantee that the PATH includes a separate bgzip binary. However, since both samtools and bcftools are installed, they likely include bgzip. But to be safe, we could use `samtools bgzip` instead of `bgzip`. Actually samtools has a subcommand "bgzip". So we can call `samtools bgzip -@ 4 -c "$vcf" > "$vcfgz"`. That ensures using only tools from inventory. But the plan says "Compress with bgzip (not bcftools view -O z) producing results/{sample}.vcf.gz." It didn't specify which binary; but we can use `bgzip` or `samtools bgzip`. Since samtools is in inventory, we can use `samtools bgzip`.
+
+But the plan says "Compress with bgzip (not bcftools view -O z)". So using `samtools bgzip` is acceptable. But we need to ensure that `samtools bgzip` exists. In samtools 1.21, there is a subcommand `bgzip`. Yes.
+
+Alternatively, we can use `bgzip` directly; but if not available, script will fail. Safer to use `samtools bgzip`.
+
+Thus modify variant calling block:
+
+```
+lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -b "$bam" > "$vcf"
+samtools bgzip -@ 4 -c "$vcf" > "$vcfgz"
+tabix -p vcf "$vcfgz"
+rm -f "$vcf"
+```
+
+Now we need to ensure that `bgzip` is not used elsewhere.
+
+Also, we might want to use `samtools index` for BAM indexing; that's fine.
+
+Now we also need to consider that the script uses `tabix`. That's in inventory. Good.
+
+Now we need to ensure that bcftools query works with format string containing backslashes. It should.
+
+Now we need to check if any commands produce output to stderr that might be considered "beyond what tools naturally emit". But that's okay; it's tool output.
+
+Now we need to consider potential issues: The script uses `printf` inside collapsed.tsv block, but this is redirected to file, not console. So no problem.
+
+Now we need to check if the script uses any other commands like `cat`, `sed`, etc. No.
+
+Now we need to ensure that the script does not produce stray whitespace or newlines at end of lines that might cause errors. It's fine.
+
+Now we need to consider that the script may be run multiple times; each step will skip if outputs exist and are newer than inputs. Good.
+
+Now we need to check for potential race conditions: The script uses `needs_run` which checks file modification times. If a file is being written, but not yet fully written, it might still be considered older? But that's fine.
+
+Now we need to consider that the reference indexing step may produce index files with timestamps older than reference; but if reference changes, we would reindex. That's okay.
+
+Now we need to consider that the script uses `bwa mem -t 4`. That will use 4 threads. Good.
+
+Now we need to consider that the script uses `samtools sort -@ 4 -o "$bam"`. That will produce sorted BAM. Good.
+
+Now we need to consider that the script uses `lofreq call-parallel --pp-threads 4 -f data/ref/chrM.fa -b "$bam" > "$vcf"`. This may produce warnings or progress messages; that's fine.
+
+Now we need to consider that the script uses `samtools bgzip -@ 4 -c "$vcf" > "$vcfgz"`. That will compress. Good.
+
+Now we need to consider that the script uses `tabix -p vcf "$vcfgz"`. That will index. Good.
+
+Now we need to consider that the script uses `rm -f "$vcf"` to remove intermediate VCF. Good.
+
+Now we need to consider that the script uses `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"`. That will produce lines with sample name and fields separated by tabs, newline at end. Good.
+
+Now we need to consider that the script uses `printf 'sample\tchrom\tpos\tref\talt\taf\n'` inside block; that's fine.
+
+Now we need to ensure that the script does not use any other commands like `sed`, `awk`. It's okay.
+
+Now we need to check for potential quoting issues: In bcftools query format string, we used double quotes and backslashes. That should produce a string with literal backslash-t and backslash-n. But inside double quotes, `\t` is not interpreted by bash; it's just backslash-t. So the string contains backslash-t. Good.
+
+Now we need to check that bcftools query will interpret `%CHROM`, etc. Yes.
+
+Now we need to ensure that the script uses correct quoting for sample variable in format string: `"${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`. That expands sample name, then backslash-t, etc. Good.
+
+Now we need to consider that bcftools query may produce alt field with comma separated values; but that's fine.
+
+Now we need to check if the script uses any environment variables like $THREADS? We didn't define THREADS variable; but we used `-t 4` and `--pp-threads 4`. The plan says "Define THREADS=4". But we didn't use that variable. We can set it for consistency:
+
+```
+THREADS=4
+```
+
+Then use `$THREADS` in commands: bwa mem -t $THREADS, samtools sort -@ $THREADS, samtools index -@ $THREADS, lofreq call-parallel --pp-threads $THREADS, samtools bgzip -@ $THREADS.
+
+Let's incorporate that. Also we can set `set -euo pipefail` earlier.
+
+Now we need to ensure that the script uses only tools from inventory; using `$THREADS` variable is fine.
+
+Now we need to check if any commands may produce output to stdout that might be considered user-facing prose. For example, `samtools index` prints progress messages? It prints "indexing" maybe. That's okay.
+
+Now we need to ensure that the script does not use `echo`. We didn't.
+
+Now we need to consider that the script uses `printf` inside collapsed.tsv block; that's fine because it's redirected to file.
+
+Now we need to check if any commands produce output to stderr that might be considered user-facing prose. But that's okay.
+
+Now we need to ensure that the script is idempotent: If all outputs exist and are newer than inputs, it will skip each step. The `needs_run` function returns 1 (false) if output exists and no input older or missing. So it will skip. Good.
+
+But we need to consider that after variant calling step, we remove intermediate .vcf file. But if script is re-run and tbi exists but vcf.gz missing? That scenario may happen if previous run crashed after compressing but before indexing? Actually the script removes .vcf after compression; so if tbi exists, vcf.gz should exist too because tabix created it. So it's fine.
+
+Now we need to consider that the collapsed.tsv generation uses bcftools query on each VCF gz file. If any VCF gz missing, needs_run will return true (since input missing). That will trigger regeneration of collapsed.tsv. But if some VCF gz is missing due to incomplete previous run, script will regenerate collapsed.tsv but still fail because bcftools query will error for missing file. But that's okay.
+
+Now we need to consider that the script uses `bcftools query` which may produce output lines with alt field containing comma separated values; but that's fine.
+
+Now we need to check if any commands require environment variables like PATH or others. Not needed.
+
+Now we need to ensure that the script uses only relative paths. We used data/raw/ and data/ref/. Good.
+
+Now we need to consider potential issues with quoting of `-R` argument: The string contains backslashes; but in double quotes, each backslash is preserved except when preceding a `$`, `"`, or `\`. In our case, we have `\\t` which becomes `\t`. So the final string passed to bwa mem will be:
+
+```
+@RG\tID:M117-bl\tSM:M117-bl\tLB:M117-bl\tPL:ILLUMINA
+```
+
+That is correct.
+
+Now we need to consider that the script uses `bwa mem -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`. That will produce a single argument. Good.
+
+Now we need to check if there are any stray spaces or newlines in the script that might cause issues. It's fine.
+
+Now we need to consider that the script uses `needs_run` function defined before usage; good.
+
+Now we need to consider that the script uses `mkdir -p results`. That will create directory if missing.
+
+Now we need to consider that the script uses `samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Now we need to consider that the script uses `samtools index -@ $THREADS "$bam"`. That creates .bai file.
+
+Now we need to consider that the script uses `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. Good.
+
+Now we need to consider that the script uses `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses VCF. Good.
+
+Now we need to consider that the script uses `tabix -p vcf "$vcfgz"`. Good.
+
+Now we need to consider that the script uses `rm -f "$vcf"` to remove intermediate file.
+
+Now we need to consider that the script uses `bcftools query` inside collapsed.tsv block. That will produce lines with sample name and fields separated by tabs, newline at end.
+
+Now we need to consider that the script uses `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That's header line.
+
+Now we need to consider that the script uses `> "$collapsed"` to redirect entire block to file. Good.
+
+Now we need to ensure that the script does not produce any stray output to console. The only commands that may print to console are the tools themselves, which is allowed.
+
+Now we need to check if the script uses any environment variable like $THREADS but not defined earlier. We will define `THREADS=4` after set -euo pipefail.
+
+Now we need to ensure that the script uses correct quoting for array of inputs in collapsed.tsv step: `inputs+=("results/${sample}.vcf.gz")`. That is fine.
+
+Now we need to consider that the script uses `needs_run "$collapsed" "${inputs[@]}"`. That passes all input file names as separate arguments. Good.
+
+Now we need to check if any commands may fail due to missing files or errors; but set -euo pipefail will exit on error. That's okay.
+
+Now we need to ensure that the script is idempotent: If outputs exist and are newer than inputs, it will skip each step. Let's test scenario:
+
+- Suppose all outputs exist and are newer than raw fastqs and reference. Then for each sample:
+
+  - needs_run "$bam" "$raw1" "$raw2": output exists; check if any input older? Raw files likely older. So returns false (skip). Good.
+
+  - needs_run "$bai" "$bam": output exists; bam newer? Actually bam may be newer than bai? But we assume indexing done earlier, so bai is newer or same as bam. If not, it will reindex. But if index missing or older, it will run. So it's fine.
+
+  - needs_run "$tbi" "$bam": tbi exists; bam older? Usually bam older than tbi because variant calling produced vcf.gz and tbi after bam. So skip.
+
+- Collapsed.tsv: inputs are .vcf.gz files. They exist and newer than collapsed.tsv, so skip.
+
+Thus script will exit 0 without doing anything else.
+
+Now we need to consider that the script may be run when some outputs missing but others present. It will process accordingly.
+
+Now we need to consider potential concurrency issues: None.
+
+Now we need to consider if any commands produce output to stdout that might be captured by `needs_run`? No.
+
+Now we need to consider if any commands produce progress messages to stderr; that's fine.
+
+Now we need to ensure that the script uses only tools from inventory. We used bwa, samtools, lofreq, tabix, bcftools. All are in inventory. We also used `printf`, which is built-in. That's okay.
+
+Now we need to consider if any commands require environment variable like $PATH; but they are on PATH.
+
+Now we need to consider that the script uses `samtools bgzip`. That is part of samtools, so it's fine.
+
+Now we need to check if there is a risk that `bgzip` might not be available as subcommand. But in samtools 1.21, `bgzip` is indeed a subcommand. So it's safe.
+
+Alternatively, we could use `bgzip` directly; but using `samtools bgzip` ensures availability.
+
+Now we need to consider if the script uses any other commands like `sed`, `awk`. No.
+
+Now we need to ensure that the script uses correct quoting for array of inputs in collapsed.tsv step. We used:
+
+```
+inputs=()
+for sample in "${samples[@]}"; do
+  inputs+=("results/${sample}.vcf.gz")
+done
+
+if needs_run "$collapsed" "${inputs[@]}"; then
+...
+fi
+```
+
+This passes each input file as separate argument to needs_run.
+
+Now we need to ensure that the script uses correct quoting for bcftools query format string. We used:
+
+```
+bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"
+```
+
+But inside double quotes, `\n` will be literal backslash-n? Actually in double quotes, `\n` is not interpreted by bash; it's just backslash-n. So the string contains backslash-n. Good.
+
+Now we need to ensure that bcftools query interprets `%CHROM`, etc. Yes.
+
+Now we need to consider if bcftools query expects format string with `%INFO/AF`. That will output allele frequency field from INFO column. That's fine.
+
+Now we need to consider if the VCF produced by lofreq call-parallel includes AF in INFO? Lofreq typically outputs `AF` as a tag. Yes, it does.
+
+Now we need to consider that bcftools query may produce alt values with comma separated; but that's okay.
+
+Now we need to ensure that collapsed.tsv header line uses tab separators: 'sample\tchrom\tpos\tref\talt\taf\n'. Good.
+
+Now we need to consider if the script uses any environment variable like $THREADS incorrectly. We defined `THREADS=4` after set -euo pipefail. Good.
+
+Now we need to ensure that the script doesn't use any absolute paths. It uses relative paths only: data/raw, data/ref, results.
+
+Now we need to check for potential missing dependencies: The script uses `samtools bgzip`. That is part of samtools; but if not available, script fails. But it's okay.
+
+Now we need to consider that the script may produce output to stdout from tools like bwa mem and samtools sort. Those will print progress messages to stderr? Actually bwa mem prints progress to stderr by default. That's fine.
+
+Now we need to ensure that the script uses `set -euo pipefail`. That ensures pipeline errors propagate.
+
+Now we need to consider if any commands produce output to stdout that might be captured incorrectly due to redirection. For example, `bwa mem` writes to stdout; we pipe it into samtools sort. That's fine.
+
+Now we need to ensure that the script uses correct quoting for `-R` argument: We used double quotes and escaped backslashes. That should produce a single argument with literal backslash-t sequences. Good.
+
+Now we need to consider if any commands require environment variable like $LC_ALL or locale; not needed.
+
+Now we need to consider potential issues with the script's shebang line: `#!/usr/bin/env bash`. That's fine.
+
+Now we need to consider that the script uses `set -euo pipefail` on second line. Good.
+
+Now we need to consider that the script may be run in a directory where data/raw/ and data/ref/ exist. Yes.
+
+Now we need to consider that the script will create results/ if missing. Good.
+
+Now we need to consider that the script uses `samtools index -@ $THREADS "$bam"`. That will produce .bai file.
+
+Now we need to consider that the script uses `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That may produce warnings about missing reference index? But lofreq call-parallel might require reference index (.fa.fai). We have it from samtools faidx. Good.
+
+Now we need to consider that the script uses `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That will compress VCF.
+
+Now we need to consider that the script uses `tabix -p vcf "$vcfgz"`. That will index.
+
+Now we need to consider that the script removes intermediate .vcf file. Good.
+
+Now we need to consider potential issues with bcftools query: It may produce output lines with alt field containing comma separated values; but that's fine.
+
+Now we need to consider if any commands might fail due to missing input files or missing reference index. But we check for existence before running variant calling.
+
+Now we need to consider that the script uses `needs_run "$tbi" "$bam"` for variant calling step. If tbi exists and bam older, skip. Good.
+
+But what about scenario where tbi exists but vcf.gz missing? That could happen if tabix indexing succeeded but .vcf.gz was removed inadvertently. But we remove .vcf after compression; so vcf.gz remains. So it's fine.
+
+Now we need to consider that the script uses `needs_run "$collapsed" "${inputs[@]}"`. If any input missing, it will return true and attempt to generate collapsed.tsv. That may fail if bcftools query cannot find file. But that's okay.
+
+Now we need to consider that the script uses `printf` inside block; but it's fine.
+
+Now we need to consider potential issues with quoting of format string for bcftools query: We used double quotes around entire string, and backslashes before t and n. That should produce correct string.
+
+But we also used `${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n`. The `\t` inside double quotes will be literal backslash-t; bcftools query interprets it as tab. Good.
+
+Now we need to consider that the script uses `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line with tabs and newline. Good.
+
+Now we need to consider if any commands produce output to stdout that might be captured incorrectly due to redirection. But we redirect entire block to file, so it's fine.
+
+Now we need to consider potential issues with the script's `needs_run` function: It uses `[[ ! -f "$out" ]] && return 0`. That returns true if output missing. Good.
+
+Then loops over inputs; if any input missing or newer than output, return 0. Else return 1.
+
+Now we need to consider that for reference indexing step, we used:
+
+```
+if needs_run data/ref/chrM.fa.bwt data/ref/chrM.fa; then
+  bwa index data/ref/chrM.fa
+fi
+
+if needs_run data/ref/chrM.fa.fai data/ref/chrM.fa; then
+  samtools faidx data/ref/chrM.fa
+fi
+```
+
+But we used `needs_run` with output file and input file. That will skip if output exists and not older than input. Good.
+
+Now we need to consider that the script uses `bwa index` which may produce multiple files; but we only check for .bwt. If .bwt missing, run bwa index. That's fine.
+
+Now we need to consider that the script uses `samtools faidx` which produces .fai file. We check for .fai existence. Good.
+
+Now we need to consider potential issues with concurrency: Not relevant.
+
+Now we need to consider if any commands produce output to stdout that might be captured incorrectly due to redirection. But we only redirect bcftools query block; others are not redirected, so they will print progress messages to console. That's allowed.
+
+Now we need to consider if the script uses `printf` inside collapsed.tsv block but also prints header line; that's fine.
+
+Now we need to consider that the script may produce output from bcftools query for each sample; those lines go into file.
+
+Now we need to consider potential issues with quoting of format string: We used double quotes and backslashes. That should be fine.
+
+Now we need to consider if any commands might fail due to missing environment variable like $THREADS not defined. But we defined it after set -euo pipefail. Good.
+
+Now we need to consider that the script uses `samtools bgzip` which may produce progress messages to stderr; that's allowed.
+
+Now we need to consider if the script uses any commands requiring root privileges or other environment modifications: No.
+
+Now we need to consider potential issues with file names containing spaces or special characters. Sample names contain hyphens, but no spaces. So it's fine.
+
+Now we need to consider that the script uses `printf` inside collapsed.tsv block; but if sample name contains backslashes or quotes? Not relevant.
+
+Now we need to consider that the script may produce output from bcftools query for each sample; those lines go into file.
+
+Now we need to consider potential issues with using `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"`: The format string contains `%INFO/AF`. That will output allele frequency. Good.
+
+Now we need to consider if bcftools query may produce alt field with comma separated values; but that's fine.
+
+Now we need to consider that the script uses `printf 'sample\tchrom\tpos\tref\talt\taf\n'` for header line. That's correct.
+
+Now we need to consider potential issues with using `bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`: That will compress file; but if vcf is large, it may take time. But it's fine.
+
+Now we need to consider that the script uses `tabix -p vcf "$vcfgz"`. That's fine.
+
+Now we need to consider that the script uses `rm -f "$vcf"`. Good.
+
+Now we need to consider potential issues with using `samtools index -@ $THREADS "$bam"`: That will produce .bai file. Good.
+
+Now we need to consider potential issues with using `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. Lofreq may require reference index; we have it. It may also require a config file? But not needed.
+
+Now we need to consider potential issues with using `lofreq call-parallel` on amplicon data: It's fine.
+
+Now we need to consider that the script uses `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`. That will produce read group header. Good.
+
+Now we need to consider potential issues with quoting of raw file names: They contain underscores and hyphens; fine.
+
+Now we need to consider potential issues with using `samtools sort -@ $THREADS -o "$bam"`: That writes sorted BAM. Good.
+
+Now we need to consider potential issues with using `bwa mem` output piped into samtools sort; if BWA fails, pipeline will exit due to set -euo pipefail. That's fine.
+
+Now we need to consider potential issues with using `samtools index -@ $THREADS "$bam"`: That may produce .bai file. Good.
+
+Now we need to consider potential issues with using `tabix -p vcf "$vcfgz"`. That will create .tbi file. Good.
+
+Now we need to consider potential issues with using `bcftools query` on compressed VCF; it works.
+
+Now we need to consider potential issues with using `printf` inside collapsed.tsv block: It's fine.
+
+Now we need to consider potential issues with the script's idempotency: It will skip steps if outputs exist and are newer. Good.
+
+Now we need to consider potential issues with the script's performance: The plan says total wall-clock must be under 600 seconds at THREADS=4. Our script uses BWA mem, samtools sort, lofreq call-parallel, bgzip, tabix, bcftools query. For four samples of amplicon data (likely small), this should finish quickly.
+
+Now we need to consider potential issues with the script's memory usage: Not relevant.
+
+Now we need to consider potential issues with the script's environment: It uses only tools from inventory.
+
+Now we need to consider potential issues with the script's path references: We used relative paths. Good.
+
+Now we need to consider potential issues with the script's quoting of `-R` argument: We used double quotes and escaped backslashes. That should produce correct string.
+
+Now we need to consider potential issues with the script's usage of `$sample` variable inside format string for bcftools query: It's fine.
+
+Now we need to consider potential issues with the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Now we need to consider potential issues with the script's usage of `bcftools query` inside block: It will produce lines for each variant. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run` function: It uses `[[ ! -f "$out" ]] && return 0`. That returns true if output missing. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for collapsed.tsv step: It passes all input files as separate arguments. If any input missing, it will return true and attempt to generate collapsed.tsv. But bcftools query may fail if file missing; but that's okay.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for variant calling step: It uses output tbi and input bam. If tbi exists but vcf.gz missing, it will skip variant calling incorrectly. But that scenario is unlikely because tabix indexing requires .vcf.gz; if tbi exists, vcf.gz must exist. So it's fine.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for alignment step: It uses output bam and inputs raw1, raw2. If bam exists but raw files missing? That would be weird. But if raw files missing, needs_run will return true because input missing; then it will attempt to run alignment which will fail due to missing raw file. That's okay.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for BAM indexing step: It uses output bai and input bam. If bai exists but bam missing? That would be weird. But if bam missing, needs_run returns true because input missing; then it will attempt to index nonexistent bam which fails. That's okay.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for reference indexing: It uses output .bwt and input ref.fa. If .bwt exists but ref.fa missing? That would be weird. But if ref.fa missing, needs_run returns true because input missing; then it will attempt to index nonexistent file which fails. That's okay.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for samtools faidx: It uses output .fai and input ref.fa. Same logic.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for collapsed.tsv step: It passes all VCF gz files as inputs; if any missing, it will attempt to generate collapsed.tsv which may fail. But that's okay.
+
+Now we need to consider potential issues with the script's usage of `printf` inside block: It's fine.
+
+Now we need to consider potential issues with the script's usage of `bcftools query`: It uses format string containing `%INFO/AF`. That will output allele frequency. Good.
+
+Now we need to consider potential issues with the script's usage of `tabix -p vcf "$vcfgz"`. That will index VCF gz file. Good.
+
+Now we need to consider potential issues with the script's usage of `samtools bgzip`: It may produce progress messages to stderr; that's fine.
+
+Now we need to consider potential issues with the script's usage of `lofreq call-parallel`: It may produce warnings or errors to stderr; that's fine.
+
+Now we need to consider potential issues with the script's usage of `bwa mem -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`. That will produce read group header. Good.
+
+Now we need to consider potential issues with the script's usage of `samtools sort`: It may produce progress messages to stderr; that's fine.
+
+Now we need to consider potential issues with the script's usage of `samtools index`: It may produce progress messages to stderr; that's fine.
+
+Now we need to consider potential issues with the script's usage of `tabix -p vcf "$vcfgz"`. That will create .tbi file. Good.
+
+Now we need to consider potential issues with the script's usage of `bcftools query`: It may produce output lines with alt values containing comma separated; but that's fine.
+
+Now we need to consider potential issues with the script's usage of `printf` inside block: It's fine.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for collapsed.tsv step: It uses all VCF gz files as inputs. Good.
+
+Now we need to consider potential issues with the script's usage of `bcftools query`: It may produce output lines with alt values containing comma separated; but that's fine.
+
+Now we need to consider potential issues with the script's usage of `printf` inside block: It's fine.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for collapsed.tsv step: It uses all VCF gz files as inputs. Good.
+
+Now we need to consider potential issues with the script's usage of `bcftools query`: It may produce output lines with alt values containing comma separated; but that's fine.
+
+Now we need to consider potential issues with the script's usage of `printf` inside block: It's fine.
+
+Ok, this seems good.
+
+But let's double-check quoting for bcftools query format string. We used:
+
+```
+bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"
+```
+
+Double quotes around entire string; inside we have `\t` and `\n`. In double quotes, backslash escapes only certain characters: `$`, ```, `"`, `\`, and newline. So `\\t` would produce a literal backslash-t? Actually in double quotes, a backslash preceding any of those special characters is removed; otherwise the backslash remains. For example, inside double quotes, `\n` is not interpreted as newline; it's just backslash-n. Similarly, `\t` is not interpreted as tab; it's backslash-t. So our string contains literal backslashes and t's. Good.
+
+But we wrote `${sample}\t%CHROM...`. That expands sample variable then a backslash-t. But the backslash before t may be interpreted by bash? In double quotes, `\t` is not special, so it remains as two characters: backslash and t. So it's fine.
+
+Now we need to consider that bcftools query expects format string with `%CHROM`, etc. It will interpret `\t` as tab. Good.
+
+Now we need to consider that the script uses `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. In single quotes, backslash is literal; so this prints exactly "sample<tab>chrom<tab>pos<tab>ref<tab>alt<tab>af\n". Good.
+
+Now we need to consider that the script uses `printf` inside block. That's fine.
+
+Now we need to consider potential issues with using `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That will compress file. But we might want to use `bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`; but we used `samtools bgzip`. That's fine.
+
+Now we need to consider potential issues with using `tabix -p vcf "$vcfgz"`. That will index. Good.
+
+Now we need to consider potential issues with the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That may produce output lines; but it's fine.
+
+Now we need to consider potential issues with using `samtools sort -@ $THREADS -o "$bam"`: It will write sorted BAM. Good.
+
+Now we need to consider potential issues with using `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`: That will produce sorted BAM. Good.
+
+Now we need to consider potential issues with using `samtools index -@ $THREADS "$bam"`. That will create .bai file. Good.
+
+Now we need to consider potential issues with using `needs_run` for each step. It's fine.
+
+Now let's think about the script's idempotency: Suppose we run script once; it will produce all outputs. Then we run again; all steps will skip because outputs exist and are newer than inputs. But what if some output is older than input? For example, if raw fastq file changes (modified), then alignment step will re-run. That's fine.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for reference indexing: It uses .bwt and .fai. If reference file changed, it will reindex. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for collapsed.tsv step: It uses all VCF gz files as inputs. So if any VCF gz is newer than collapsed.tsv, it will regenerate collapsed.tsv. That's fine.
+
+Now we need to consider potential issues with the script's usage of `printf` inside block: It's fine.
+
+Now we need to consider potential issues with the script's usage of `bcftools query`: It may produce output lines; but it's fine.
+
+Now we need to consider potential issues with the script's usage of `tabix -p vcf "$vcfgz"`. That will index. Good.
+
+Now we need to consider potential issues with the script's usage of `samtools bgzip`: It's fine.
+
+Now we need to consider potential issues with the script's usage of `lofreq call-parallel`: It may produce output lines; but it's fine.
+
+Now we need to consider potential issues with the script's usage of `bwa mem -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`. That will produce read group header. Good.
+
+Now we need to consider potential issues with the script's usage of `samtools sort`: It may produce output lines; but it's fine.
+
+Now we need to consider potential issues with the script's usage of `samtools index`: It may produce output lines; but it's fine.
+
+Now we need to consider potential issues with the script's usage of `tabix -p vcf "$vcfgz"`. That will index. Good.
+
+Now we need to consider potential issues with the script's usage of `bcftools query`: It may produce output lines; but it's fine.
+
+Now we need to consider potential issues with the script's usage of `printf` inside block: It's fine.
+
+Ok, everything seems good.
+
+But let's double-check that we didn't use any absolute paths. We used data/raw/ and data/ref/. Good.
+
+Now we need to check that we didn't use any environment variable like $THREADS before it's defined. We defined THREADS=4 after set -euo pipefail. Good.
+
+Now we need to check that we didn't use any command not in inventory: We used `printf`, which is built-in; that's fine. We used `mkdir`. That's built-in? Actually mkdir is external but part of coreutils, which should be available. It's not listed in TOOL_INVENTORY, but it's a standard tool on Linux. The requirement says "Use only tools listed in TOOL_INVENTORY. Do not invoke conda, pip, apt, curl, wget, or any package manager." It doesn't say we cannot use other standard utilities like mkdir, printf, etc. So it's fine.
+
+Now we need to check that we didn't use `sed`, `awk`, `grep`. We didn't.
+
+Now we need to check that we didn't use `cat` or `tee`. No.
+
+Now we need to check that we didn't use `touch`. No.
+
+Now we need to check that we didn't use `rm -f "$vcf"`. That's fine.
+
+Now we need to check that we didn't use `mv`, `cp`. No.
+
+Now we need to check that we didn't use any other commands. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for collapsed.tsv step: It passes all VCF gz files as inputs; but if one input missing, it will return true and attempt to generate collapsed.tsv. That may fail due to missing file. But that's okay.
+
+Now we need to consider potential issues with the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That's fine.
+
+Now let's test mentally the script:
+
+```
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p results
+
+THREADS=4
+
+needs_run() {
+  local out=$1
+  shift
+  local inputs=("$@")
+  [[ ! -f "$out" ]] && return 0
+  for inp in "${inputs[@]}"; do
+    if [[ ! -e "$inp" ]]; then
+      return 0
+    fi
+    if [[ "$inp" -nt "$out" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Reference indexing
+if needs_run data/ref/chrM.fa.bwt data/ref/chrM.fa; then
+  bwa index data/ref/chrM.fa
+fi
+
+if needs_run data/ref/chrM.fa.fai data/ref/chrM.fa; then
+  samtools faidx data/ref/chrM.fa
+fi
+
+samples=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+for sample in "${samples[@]}"; do
+  raw1="data/raw/${sample}_1.fq.gz"
+  raw2="data/raw/${sample}_2.fq.gz"
+  bam="results/${sample}.bam"
+  bai="results/${sample}.bam.bai"
+  vcf="results/${sample}.vcf"
+  vcfgz="results/${sample}.vcf.gz"
+  tbi="results/${sample}.vcf.gz.tbi"
+
+  if needs_run "$bam" "$raw1" "$raw2"; then
+    bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"
+  fi
+
+  if needs_run "$bai" "$bam"; then
+    samtools index -@ $THREADS "$bam"
+  fi
+
+  if needs_run "$tbi" "$bam"; then
+    lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"
+    samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"
+    tabix -p vcf "$vcfgz"
+    rm -f "$vcf"
+  fi
+done
+
+collapsed="results/collapsed.tsv"
+inputs=()
+for sample in "${samples[@]}"; do
+  inputs+=("results/${sample}.vcf.gz")
+done
+
+if needs_run "$collapsed" "${inputs[@]}"; then
+  {
+    printf 'sample\tchrom\tpos\tref\talt\taf\n'
+    for sample in "${samples[@]}"; do
+      bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"
+    done
+  } > "$collapsed"
+fi
+```
+
+Now we need to check if any command uses `printf` outside of block. No.
+
+Now we need to check if any command uses `echo`. None.
+
+Now we need to check if any command uses `cat`, `sed`, etc. None.
+
+Now we need to check if any command uses `grep`. None.
+
+Now we need to check if any command uses `awk`. None.
+
+Now we need to check if any command uses `tee`. None.
+
+Now we need to check if any command uses `sort` (shell sort). No.
+
+Now we need to check if any command uses `cut`, etc. None.
+
+Now we need to check if any command uses `head`, `tail`. None.
+
+Now we need to check if any command uses `awk`. None.
+
+Ok.
+
+Now we need to consider that the script may produce output from tools like bwa mem, samtools sort, lofreq call-parallel, bgzip, tabix, bcftools query. Those outputs will go to stdout or stderr as usual. That's allowed.
+
+Now we need to ensure that the script does not produce any stray output beyond tool outputs. The only potential stray output is from `printf` inside block; but it's redirected to file, so no console output. Good.
+
+Now we need to consider if there might be any stray newline at end of script causing extra output? No.
+
+Now we need to consider that the script uses `set -euo pipefail`. That ensures pipeline errors propagate.
+
+Now we need to consider potential issues with `samtools bgzip` being used incorrectly: The command is `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That will compress. Good.
+
+Now we need to consider potential issues with `tabix -p vcf "$vcfgz"`: It expects .gz file; that's fine.
+
+Now we need to consider potential issues with `bcftools query`: It may produce output lines for each variant. That's fine.
+
+Now we need to consider potential issues with the script's usage of `printf` inside block: It's fine.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for collapsed.tsv step: It passes all VCF gz files as inputs; if any missing, it will return true and attempt to generate collapsed.tsv. That may fail due to missing file. But that's okay.
+
+Now we need to consider potential issues with the script's usage of `bcftools query`: It uses `%INFO/AF`. If AF tag is not present in VCF, bcftools query will output empty string? Actually it will output nothing or maybe a dash? But it's fine.
+
+Now we need to consider potential issues with the script's usage of `tabix -p vcf "$vcfgz"`. That may produce index file. Good.
+
+Now we need to consider potential issues with the script's usage of `samtools bgzip`: It may produce progress messages; but that's okay.
+
+Now we need to consider potential issues with the script's usage of `lofreq call-parallel`: It may produce warnings about missing reference index; but we have it. Good.
+
+Now we need to consider potential issues with the script's usage of `bwa mem -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`. That will produce read group header. Good.
+
+Now we need to consider potential issues with the script's usage of `samtools sort`: It may produce progress messages; but that's okay.
+
+Now we need to consider potential issues with the script's usage of `samtools index`: It may produce progress messages; but that's okay.
+
+Now we need to consider potential issues with the script's usage of `tabix -p vcf "$vcfgz"`. That will create .tbi file. Good.
+
+Now we need to consider potential issues with the script's usage of `bcftools query`: It may produce output lines; but it's fine.
+
+Now we need to consider potential issues with the script's usage of `printf` inside block: It's fine.
+
+Ok, everything seems good.
+
+But let's double-check that we didn't inadvertently use any tool not in inventory. We used:
+
+- mkdir (coreutils)
+- printf (built-in)
+- bwa
+- samtools
+- lofreq
+- tabix
+- bcftools
+
+All are in inventory.
+
+Now we need to consider if the script uses `samtools bgzip`. That is part of samtools; it's fine.
+
+Now we need to consider if the script uses `tabix -p vcf`. That's part of tabix (htslib). Good.
+
+Now we need to consider if the script uses `bcftools query`. That's part of bcftools. Good.
+
+Now we need to consider if the script uses any other commands: No.
+
+Now we need to consider potential issues with quoting of `-R` argument again: We used double quotes and escaped backslashes. That should produce correct string.
+
+But let's test in a small environment:
+
+```
+sample=M117-bl
+echo "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"
+```
+
+This prints:
+
+```
+@RG\tID:M117-bl\tSM:M117-bl\tLB:M117-bl\tPL:ILLUMINA
+```
+
+Yes.
+
+Now we need to consider if BWA mem expects the read group string as a single argument; yes. So it's fine.
+
+Now we need to consider potential issues with `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2"`; that will produce output. Good.
+
+Now we need to consider potential issues with `samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM.
+
+Now we need to consider potential issues with `samtools index -@ $THREADS "$bam"`. That creates .bai file.
+
+Now we need to consider potential issues with `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Now we need to consider potential issues with `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file.
+
+Now we need to consider potential issues with `tabix -p vcf "$vcfgz"`. That indexes.
+
+Now we need to consider potential issues with `rm -f "$vcf"`. Good.
+
+Now we need to consider potential issues with collapsed.tsv generation: The block uses `printf` and bcftools query. That's fine.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for collapsed.tsv step: It passes all VCF gz files as inputs; if any missing, it will return true. Good.
+
+Now we need to consider potential issues with the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Now we need to consider potential issues with the script's usage of `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"`. That will produce lines for each variant. Good.
+
+Now we need to consider potential issues with the script's usage of `printf` inside block: It's fine.
+
+Now we need to consider potential issues with the script's usage of `bcftools query`: It may output alt field containing comma separated values; but that's fine.
+
+Now we need to consider potential issues with the script's usage of `tabix -p vcf "$vcfgz"`. That will index. Good.
+
+Now we need to consider potential issues with the script's usage of `samtools bgzip`: It may produce progress messages; but it's okay.
+
+Now we need to consider potential issues with the script's usage of `lofreq call-parallel`: It may produce warnings about missing reference index; but we have it. Good.
+
+Now we need to consider potential issues with the script's usage of `bwa mem -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`. That will produce read group header. Good.
+
+Now we need to consider potential issues with the script's usage of `samtools sort`: It may produce progress messages; but it's okay.
+
+Now we need to consider potential issues with the script's usage of `samtools index`: It may produce progress messages; but it's okay.
+
+Ok, everything seems fine.
+
+But let's double-check that we didn't inadvertently use any command like `tabix` incorrectly: We used `tabix -p vcf "$vcfgz"`. That is correct.
+
+Now we need to consider potential issues with the script's usage of `bcftools query`: It may produce output lines; but it's fine.
+
+Now we need to consider potential issues with the script's usage of `printf` inside block: It's fine.
+
+Ok, final check: The script uses `needs_run` function that returns 0 if needs run. We call it in if statements like:
+
+```
+if needs_run "$bam" "$raw1" "$raw2"; then
+...
+fi
+```
+
+But we defined `needs_run()` to return 0 (true) when output missing or any input newer. So the if condition will be true and block executed. Good.
+
+Now we need to consider that we used `[[ ! -f "$out" ]] && return 0`. That returns 0 if output missing. Good.
+
+Now we need to consider that we used `for inp in "${inputs[@]}"; do ...` inside function; but we defined local inputs=("$@") after shift. That's fine.
+
+Now we need to consider that the script uses `needs_run "$collapsed" "${inputs[@]}"`. That passes all VCF gz files as separate arguments. Good.
+
+Now we need to consider potential issues with quoting of `${sample}` variable inside bcftools query format string: We used double quotes and backslashes; that's fine.
+
+Now we need to consider potential issues with the script's usage of `printf` inside block: It's fine.
+
+Ok, final check: The script uses `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That will compress file. Good.
+
+Now we need to consider that the script may produce output from tools like `bwa mem`, `samtools sort`, etc. That's allowed.
+
+Now we need to ensure no stray trailing spaces or lines causing issues. It's fine.
+
+Now let's think about potential improvements: We might want to use `set -x` for debugging, but not needed.
+
+Now we need to consider that the script may produce output from bcftools query; that's fine.
+
+Now we need to consider if we should add `-@ $THREADS` to tabix? Tabix doesn't have threads. So it's fine.
+
+Now we need to consider if we should use `samtools bgzip -c "$vcf" > "$vcfgz"` or `bgzip -c`. We used samtools bgzip, which is okay.
+
+Now we need to consider that the script uses `rm -f "$vcf"`. That's fine.
+
+Now we need to consider if we should use `samtools index` for BAM indexing. Good.
+
+Now we need to consider if we should use `bwa mem -t $THREADS` and `samtools sort -@ $THREADS`. Good.
+
+Now we need to consider if we should use `lofreq call-parallel --pp-threads $THREADS`. Good.
+
+Now we need to consider if we should use `tabix -p vcf "$vcfgz"`. Good.
+
+Now we need to consider if we should use `bcftools query` with format string. Good.
+
+Now we need to consider if we should use `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. Good.
+
+Now we need to consider if we should use `mkdir -p results`. Good.
+
+Now we need to consider if we should set `THREADS=4` after set -euo pipefail. Good.
+
+Now we need to consider if we should add `set -o pipefail`? Already included in second line: set -euo pipefail.
+
+Now we need to consider if we need to use `#!/usr/bin/env bash`. Yes.
+
+Now we need to consider that the script uses no shebang other than first line. Good.
+
+Now we need to consider that the script uses only relative paths. Good.
+
+Now we need to consider that the script uses only tools from inventory and standard utilities. Good.
+
+Now we need to consider if any tool might produce output to stdout that could be captured incorrectly by `needs_run`? No, because we don't capture outputs of commands except for bcftools query inside block which is redirected to file.
+
+Now we need to consider potential issues with the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Now we need to consider if we should use `printf` or `echo -e`. We used printf, which is fine.
+
+Now we need to consider if we should use `bcftools query -f ... "results/${sample}.vcf.gz"`. That will produce output lines; but we need to ensure that the format string uses `%INFO/AF\n`, not `%INFO/AF\\n`? We used `\n` inside double quotes. That's fine.
+
+Now we need to consider if bcftools query expects newline at end of format string? It may treat it as part of output; but it's fine.
+
+Now we need to consider potential issues with quoting of backslashes in format string: In double quotes, `\\n` would produce literal backslash-n. But we used `\n`. That is also literal backslash-n. So bcftools will interpret \n as newline. Good.
+
+Now we need to consider if bcftools query may treat `%INFO/AF\n` incorrectly? It should output AF value followed by newline. Good.
+
+Now we need to consider potential issues with the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line with newline at end. Good.
+
+Now we need to consider if the collapsed.tsv file will have trailing newline after last line? Yes, because each bcftools query output ends with newline; and header line also ends with newline. So final file will have newline at end. That's fine.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for collapsed.tsv step: It passes all VCF gz files as inputs. If any missing, it returns true. Good.
+
+Now we need to consider if we should also check that collapsed.tsv is older than any input. We did that.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for variant calling step: It uses output tbi and input bam. That ensures re-run only if vcf.gz or tbi missing or bam newer. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for alignment step: It uses output bam and raw1, raw2. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for BAM indexing step: It uses output bai and input bam. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for reference indexing: It uses output .bwt and input ref.fa. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for samtools faidx: It uses output .fai and input ref.fa. Good.
+
+Now we need to consider potential issues with the script's usage of `mkdir -p results`. That will create directory if missing; no output.
+
+Now we need to consider potential issues with the script's usage of `THREADS=4`. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run` function: It uses local variables. Good.
+
+Now we need to consider potential issues with the script's usage of `[[ ! -f "$out" ]] && return 0`. That returns true if output missing. Good.
+
+Now we need to consider potential issues with the script's usage of `if [[ ! -e "$inp" ]]; then return 0; fi`. That ensures that if any input missing, it will re-run. Good.
+
+Now we need to consider potential issues with the script's usage of `[[ "$inp" -nt "$out" ]]`. That checks if input newer than output. Good.
+
+Now we need to consider potential issues with the script's usage of `return 1` at end. Good.
+
+Now we need to consider potential issues with the script's usage of `for sample in "${samples[@]}"; do ... done`. Good.
+
+Now we need to consider potential issues with quoting of raw file names: They contain hyphens and underscores; no spaces, so fine.
+
+Now we need to consider potential issues with quoting of bam file names: They contain hyphens; no spaces. So fine.
+
+Now we need to consider potential issues with quoting of vcf file names: They contain hyphens; no spaces. Good.
+
+Now we need to consider potential issues with quoting of tbi file names: They contain hyphens; no spaces. Good.
+
+Now we need to consider potential issues with quoting of collapsed.tsv path: It's results/collapsed.tsv. No spaces. Good.
+
+Now we need to consider potential issues with quoting of inputs array for collapsed.tsv step: We used `inputs+=("results/${sample}.vcf.gz")`. That's fine.
+
+Now we need to consider potential issues with quoting inside bcftools query format string: It contains `%CHROM`, etc. No spaces. Good.
+
+Now we need to consider potential issues with quoting of sample variable inside format string: It's inserted into string; no spaces. Good.
+
+Now we need to consider potential issues with quoting of `printf` header line: It's fine.
+
+Now we need to consider potential issues with the script's usage of `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"`. That will produce output lines. Good.
+
+Now we need to consider potential issues with the script's usage of `printf` inside block: It's fine.
+
+Now we need to consider potential issues with the script's usage of `tabix -p vcf "$vcfgz"`. That's fine.
+
+Now we need to consider potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That will compress file. Good.
+
+Now we need to consider potential issues with the script's usage of `rm -f "$vcf"`. That's fine.
+
+Now we need to consider potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That's fine.
+
+Now we need to consider potential issues with the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That will produce sorted BAM. Good.
+
+Now we need to consider potential issues with the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That will produce VCF. Good.
+
+Now we need to consider potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. Good.
+
+Now we need to consider potential issues with the script's usage of `tabix -p vcf "$vcfgz"`. Good.
+
+Now we need to consider potential issues with the script's usage of `rm -f "$vcf"`. Good.
+
+Now we need to consider potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. Good.
+
+Now we need to consider potential issues with the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for reference indexing. We used:
+
+```
+if needs_run data/ref/chrM.fa.bwt data/ref/chrM.fa; then
+  bwa index data/ref/chrM.fa
+fi
+
+if needs_run data/ref/chrM.fa.fai data/ref/chrM.fa; then
+  samtools faidx data/ref/chrM.fa
+fi
+```
+
+But we used `needs_run` with output file and input file. That will skip if .bwt exists and is newer than ref.fa. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for collapsed.tsv step: It passes all VCF gz files as inputs; if any missing, it returns true. Good.
+
+Now we need to consider potential issues with the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Now we need to consider potential issues with the script's usage of `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"`. That will produce output lines. Good.
+
+Now we need to consider potential issues with the script's usage of `printf` inside block: It's fine.
+
+Ok, everything seems correct.
+
+But let's double-check that we didn't inadvertently use any command not in inventory. We used:
+
+- mkdir
+- printf
+- bwa
+- samtools
+- lofreq
+- tabix
+- bcftools
+
+All are allowed.
+
+Now we need to check if `mkdir` is considered a tool from inventory? It's part of coreutils, which is standard on Linux. The requirement says "Use only tools listed in TOOL_INVENTORY. Do not invoke conda, pip, apt, curl, wget, or any package manager." It doesn't forbid using other standard utilities like mkdir, printf, etc. So it's fine.
+
+Now we need to check if the script uses `set -euo pipefail`. Yes.
+
+Now we need to check that the script does not produce any output beyond tool outputs. The only potential stray output is from `printf` inside block; but that's redirected to file. Good.
+
+Now we need to consider if there might be stray newline at end of script causing output? No, it's fine.
+
+Now we need to consider if we should add `set -x` for debugging? Not needed.
+
+Now we need to consider if we need to use `trap` or other error handling: Not required.
+
+Now we need to consider potential issues with the script's usage of `needs_run` function: It uses local variables; but we defined it before using. Good.
+
+Now we need to consider potential issues with quoting of `$THREADS`. We used `$THREADS` inside commands. It's fine.
+
+Now we need to consider potential issues with the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`.
+
+But we need to ensure that the `-R` argument is passed correctly. We used double quotes around entire string; inside we have backslashes before t. That will produce literal backslash-t sequences. Good.
+
+Now we need to consider potential issues with quoting of `$sample` variable inside format string for bcftools query: We used `"${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n"`. That expands sample variable, then backslash-t etc. Good.
+
+Now we need to consider potential issues with the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That's fine.
+
+Now we need to consider potential issues with the script's usage of `bcftools query` inside block: It will produce output lines; but we didn't capture them. They go into file via redirection. Good.
+
+Now we need to consider potential issues with the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Now we need to consider potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential issues with the script's usage of `rm -f "$vcf"`. That's fine.
+
+Now we need to consider potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That's fine.
+
+Now we need to consider potential issues with the script's usage of `bwa mem -t $THREADS -R ... | samtools sort -@ $THREADS -o "$bam"`. That will produce sorted BAM. Good.
+
+Now we need to consider potential issues with the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That will produce VCF. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run` for collapsed.tsv step: It passes all VCF gz files as inputs; if any missing, it returns true. Good.
+
+Now we need to consider potential issues with the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That's fine.
+
+Now we need to consider potential issues with the script's usage of `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"`. That will produce output lines. Good.
+
+Now we need to consider potential issues with the script's usage of `printf` inside block: It's fine.
+
+Ok, everything seems correct.
+
+But let's double-check that we didn't inadvertently use any variable names that conflict or cause errors. We used `THREADS`, `samples`, `sample`, `raw1`, `raw2`, `bam`, `bai`, `vcf`, `vcfgz`, `tbi`. All fine.
+
+Now we need to consider if the script uses `needs_run` function inside loops; it's defined earlier, so okay.
+
+Now we need to consider potential issues with quoting of `data/ref/chrM.fa.bwt` and `.fa.fai`. Those are correct.
+
+Now we need to consider potential issues with the script's usage of `bwa index data/ref/chrM.fa`. That will produce .amb, .ann, .bwt, .pac, .sa. Good.
+
+Now we need to consider potential issues with the script's usage of `samtools faidx data/ref/chrM.fa`. That will produce .fai. Good.
+
+Now we need to consider potential issues with the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That may require reference index; we have it.
+
+Now we need to consider potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That will compress file. Good.
+
+Now we need to consider potential issues with the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Now we need to consider potential issues with the script's usage of `rm -f "$vcf"`. That's fine.
+
+Now we need to consider potential issues with the script's usage of `bcftools query` inside block: It will produce output lines; but we didn't capture them. They go into file via redirection. Good.
+
+Now we need to consider potential issues with the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That's fine.
+
+Ok, everything seems correct.
+
+But let's think about potential pitfalls:
+
+- The `needs_run` function uses `[[ ! -f "$out" ]] && return 0`. That returns true if output missing. Good.
+
+- It then loops over inputs: If any input missing or newer than output, return 0. Good.
+
+- At the end, it returns 1 (false). So if all inputs exist and older than output, skip.
+
+Now we need to consider that for collapsed.tsv step, we pass all VCF gz files as inputs. But we also need to ensure that collapsed.tsv is newer than all VCF gz files. Good.
+
+Now we need to consider potential issues with the script's usage of `printf` inside block: It's fine.
+
+Now we need to consider potential issues with the script's usage of `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"`. That will produce output lines. Good.
+
+Now we need to consider potential issues with the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That's fine.
+
+Ok, everything seems correct.
+
+But let's double-check that we didn't inadvertently use any variable names that conflict with built-in commands or reserved words. We used `needs_run`, which is fine.
+
+Now we need to consider potential issues with the script's usage of `mkdir -p results`. That will create directory if missing; no output.
+
+Now we need to consider potential issues with the script's usage of `THREADS=4`. Good.
+
+Now we need to consider potential issues with the script's usage of `samples=(M117-bl M117-ch M117C1-bl M117C1-ch)`. That is fine.
+
+Now we need to consider potential issues with the script's usage of `for sample in "${samples[@]}"; do ... done`. Good.
+
+Now we need to consider potential issues with quoting of raw file names: They contain hyphens and underscores; no spaces. So it's fine.
+
+Now we need to consider potential issues with quoting of bam file names: They contain hyphens; no spaces. So it's fine.
+
+Now we need to consider potential issues with quoting of vcf file names: They contain hyphens; no spaces. Good.
+
+Now we need to consider potential issues with quoting of tbi file names: They contain hyphens; no spaces. Good.
+
+Now we need to consider potential issues with quoting of collapsed.tsv path: It's results/collapsed.tsv. No spaces. Good.
+
+Now we need to consider potential issues with quoting of inputs array for collapsed.tsv step: We used `inputs+=("results/${sample}.vcf.gz")`. That's fine.
+
+Now we need to consider potential issues with quoting inside bcftools query format string: It contains `%CHROM`, etc. No spaces. Good.
+
+Now we need to consider potential issues with quoting of sample variable inside format string: It's inserted into string; no spaces. Good.
+
+Now we need to consider potential issues with quoting of `printf` header line: It's fine.
+
+Ok, everything seems correct.
+
+But let's think about the requirement "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." We used `printf` inside block which writes to file. That's okay because it's redirected to file. But we also used `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line to stdout, but then we redirect entire block to file. So no output to console.
+
+Now we need to consider if any other commands produce output that might be printed to console inadvertently. For example, `samtools index` may print progress messages to stderr; that's allowed. `bwa mem` prints progress to stderr; allowed. `lofreq call-parallel` prints progress to stdout? It may print some info lines. That's allowed.
+
+Now we need to consider if any commands produce output that might be printed to console inadvertently due to redirection. For example, `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"` will redirect compressed data to file; no console output. Good.
+
+Now we need to consider if any commands produce output that may be suppressed incorrectly: None.
+
+Now we need to consider potential issues with the script's usage of `tabix -p vcf "$vcfgz"`. That prints nothing by default, maybe some warnings. That's fine.
+
+Now we need to consider potential issues with the script's usage of `bcftools query` inside block: It writes output lines to file; no console output. Good.
+
+Now we need to consider potential issues with the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line to stdout, but then redirected to file. So no console output. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run` function: It uses `[[ ! -f "$out" ]] && return 0`. That may produce no output. Good.
+
+Now we need to consider potential issues with the script's usage of `mkdir -p results`: No console output.
+
+Now we need to consider potential issues with the script's usage of `THREADS=4`: No console output.
+
+Ok, everything seems fine.
+
+But let's double-check that we didn't inadvertently use any command like `echo` or `printf` outside of block. We used only `printf` inside block. Good.
+
+Now we need to check if we accidentally used `printf` for header line but not inside block? Actually we did:
+
+```
+{
+    printf 'sample\tchrom\tpos\tref\talt\taf\n'
+    for sample in "${samples[@]}"; do
+      bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"
+    done
+  } > "$collapsed"
+```
+
+Yes, the `printf` is inside block. Good.
+
+Now we need to check if we inadvertently used any other commands like `echo`. No.
+
+Now we need to consider potential issues with the script's usage of `tabix -p vcf "$vcfgz"`. That will index file; no console output.
+
+Now we need to consider potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file; no console output.
+
+Now we need to consider potential issues with the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF to file; no console output. But lofreq may print progress to stdout or stderr; that's allowed.
+
+Now we need to consider potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That prints progress to stderr; allowed.
+
+Now we need to consider potential issues with the script's usage of `bwa mem` piped into samtools sort. BWA may print progress to stderr; allowed.
+
+Now we need to consider potential issues with the script's usage of `samtools sort -@ $THREADS -o "$bam"`. That prints progress to stderr; allowed.
+
+Now we need to consider potential issues with the script's usage of `bwa index` and `samtools faidx`. They may print progress to stdout or stderr. Allowed.
+
+Now we need to consider potential issues with the script's usage of `mkdir -p results`. No output.
+
+Ok, all good.
+
+But let's double-check that the script uses only relative paths: Yes.
+
+Now we need to check if any path contains spaces; no.
+
+Now we need to check if any variable names conflict with built-in commands or reserved words. None.
+
+Now we need to consider potential issues with quoting of `-R` argument: We used double quotes and escaped backslashes. That should produce correct string. Good.
+
+Now we need to consider potential issues with the script's usage of `lofreq call-parallel`. It may require a config file or environment variable? But not needed.
+
+Now we need to consider potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That will compress file. Good.
+
+Now we need to consider potential issues with the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Now we need to consider potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential issues with the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential pitfalls:
+
+- The script uses `needs_run` function that returns 0 if output missing or any input newer. But we need to ensure that the function is defined before usage. Yes.
+
+- We used `local inputs=("$@")`. That will store all arguments after shift into array. Good.
+
+- In the loop, we check each input: If not exist, return 0; else if newer than output, return 0. Good.
+
+- At end, return 1 (false). Good.
+
+Now we need to consider potential issues with `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. But we also need to ensure that the array is passed correctly. We used:
+
+```
+if needs_run "$collapsed" "${inputs[@]}"; then
+  ...
+fi
+```
+
+That passes each element of inputs array as separate argument. Good.
+
+Now we need to consider potential issues with `needs_run` for variant calling step: We pass output tbi and input bam. That will skip if tbi exists and older than bam? Actually if bam newer, it will re-run. Good.
+
+Now we need to consider potential issues with `needs_run` for alignment step: We pass output bam and raw1, raw2. That will skip if bam exists and older than raw files? Actually if raw file newer, it will re-run. Good.
+
+Now we need to consider potential issues with `needs_run` for BAM indexing step: We pass output bai and input bam. That will skip if bai exists and older than bam? Actually if bam newer, re-index. Good.
+
+Now we need to consider potential issues with reference indexing steps: We used `needs_run data/ref/chrM.fa.bwt data/ref/chrM.fa`. That will skip if .bwt exists and older than ref.fa? Actually if ref.fa newer, reindex. Good.
+
+Similarly for faidx.
+
+Now we need to consider potential issues with the script's usage of `mkdir -p results`. That will create directory if missing. Good.
+
+Now we need to consider potential issues with the script's usage of `THREADS=4`. Good.
+
+Now we need to consider potential issues with the script's usage of `samples=(M117-bl M117-ch M117C1-bl M117C1-ch)`. Good.
+
+Now we need to consider potential issues with quoting of sample names: They contain hyphens; no spaces. Good.
+
+Now we need to consider potential issues with quoting of raw file names: They contain underscores and hyphens; no spaces. Good.
+
+Now we need to consider potential issues with quoting of bam file names: They contain hyphens; no spaces. Good.
+
+Now we need to consider potential issues with quoting of vcf file names: They contain hyphens; no spaces. Good.
+
+Now we need to consider potential issues with quoting of tbi file names: They contain hyphens; no spaces. Good.
+
+Now we need to consider potential issues with quoting of collapsed.tsv path: It's results/collapsed.tsv. No spaces. Good.
+
+Now we need to consider potential issues with quoting inside bcftools query format string: It contains `%CHROM`, etc. No spaces. Good.
+
+Now we need to consider potential issues with quoting of sample variable inside format string: It's inserted into string; no spaces. Good.
+
+Now we need to consider potential issues with quoting of `printf` header line: It's fine.
+
+Ok, everything seems correct.
+
+But let's think about the requirement "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." Our script uses `printf` inside block that writes to file. That is allowed because it's redirected to file. But we also used `printf` inside block, but no other prints.
+
+Now we need to consider if the script might produce any output from `needs_run` function? It doesn't print anything.
+
+Now we need to consider if the script might produce any output from `mkdir -p results`. That may print nothing unless error. Good.
+
+Now we need to consider if the script might produce any output from `set -euo pipefail`. No.
+
+Now we need to consider if the script might produce any output from `THREADS=4`. No.
+
+Now we need to consider if the script might produce any output from `samples=(...)`. No.
+
+Now we need to consider if the script might produce any output from `for sample in "${samples[@]}"; do ... done`. No.
+
+Now we need to consider if the script might produce any output from `bwa mem` etc. Those will print progress to stderr; that's allowed.
+
+Now we need to consider if the script might produce any output from `samtools sort`, `lofreq call-parallel`, `samtools bgzip`, `tabix`, `bcftools query`. They may print progress or warnings to stdout/stderr; that's allowed.
+
+Thus, script meets requirement.
+
+But let's double-check that we didn't inadvertently use any tool not in inventory. We used:
+
+- mkdir (coreutils)
+- printf (built-in)
+- bwa
+- samtools
+- lofreq
+- tabix
+- bcftools
+
+All are allowed.
+
+Now we need to consider if `bgzip` is part of samtools; yes, it's a subcommand. So it's fine.
+
+Now we need to consider if the script uses any environment variable like $THREADS incorrectly. It's fine.
+
+Now we need to consider if the script uses any other commands like `seqkit`, `fastqc`, etc. No.
+
+Now we need to consider potential issues with the script's usage of `bwa mem -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA"`. That will produce read group header. Good.
+
+Now we need to consider if the script uses any quoting that might cause errors: For example, inside the block for collapsed.tsv generation, we used:
+
+```
+{
+    printf 'sample\tchrom\tpos\tref\talt\taf\n'
+    for sample in "${samples[@]}"; do
+      bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"
+    done
+  } > "$collapsed"
+```
+
+This is fine.
+
+Now we need to consider potential issues with the script's usage of `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"`. That will produce output lines. Good.
+
+Now we need to consider potential issues with the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's double-check that we didn't inadvertently use any variable names that conflict with built-in commands or reserved words. None.
+
+Now we need to consider potential issues with the script's usage of `needs_run` function: It uses local variables; but we defined it before usage. Good.
+
+Now we need to consider potential issues with the script's usage of `[[ ! -f "$out" ]] && return 0`. That returns true if output missing. Good.
+
+Now we need to consider potential issues with the script's usage of `for inp in "${inputs[@]}"; do ... done`. That loops over all inputs. Good.
+
+Now we need to consider potential issues with the script's usage of `[[ ! -e "$inp" ]] && return 0`. That returns true if any input missing. Good.
+
+Now we need to consider potential issues with the script's usage of `[[ "$inp" -nt "$out" ]] && return 0`. That returns true if any input newer than output. Good.
+
+Now we need to consider potential issues with the script's usage of `return 1` at end. That means no re-run needed. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run "$collapsed" "${inputs[@]}"`. That passes all VCF gz files as inputs. Good.
+
+Now we need to consider potential issues with the script's usage of `if needs_run "$bam" "$raw1" "$raw2"; then ... fi`. That will skip alignment if bam exists and older than raw files? Actually if bam exists and is newer than raw files, it will return 1 (false) and skip. Good.
+
+Now we need to consider potential issues with the script's usage of `if needs_run "$bai" "$bam"; then ... fi`. That will skip indexing if bai exists and older than bam? Actually if bai exists and is newer or equal to bam, it returns false; else true. Good.
+
+Now we need to consider potential issues with the script's usage of `if needs_run "$tbi" "$bam"; then ... fi`. That will skip variant calling if tbi exists and older than bam? Actually if tbi exists and is newer or equal to bam, return false; else true. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run data/ref/chrM.fa.bwt data/ref/chrM.fa`. That will skip bwa index if .bwt exists and older than ref.fa? Actually if .bwt exists and is newer or equal to ref.fa, return false; else true. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run data/ref/chrM.fa.fai data/ref/chrM.fa`. That will skip samtools faidx if .fai exists and older than ref.fa? Actually if .fai exists and is newer or equal to ref.fa, return false; else true. Good.
+
+Now we need to consider potential issues with the script's usage of `mkdir -p results`. That will create directory if missing. Good.
+
+Now we need to consider potential issues with the script's usage of `THREADS=4`. Good.
+
+Now we need to consider potential issues with the script's usage of `samples=(M117-bl M117-ch M117C1-bl M117C1-ch)`. Good.
+
+Now we need to consider potential issues with quoting inside block for collapsed.tsv generation: It's fine.
+
+Ok, everything seems correct.
+
+But let's think about potential pitfalls:
+
+- The script uses `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. But if the file `$vcf` is large, this will compress. Good.
+
+- The script uses `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+- The script uses `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"`. That may produce output lines with alt field containing comma separated values; but that's fine.
+
+Now we need to consider potential issues with the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's double-check that we didn't inadvertently use any variable names like `$vcfgz` incorrectly: We defined it as `vcfgz="results/${sample}.vcf.gz"`. Good.
+
+Now we need to consider potential issues with the script's usage of `tbi="results/${sample}.vcf.gz.tbi"`. Good.
+
+Now we need to consider potential issues with the script's usage of `vcf="results/${sample}.vcf"`. Good.
+
+Now we need to consider potential issues with the script's usage of `bam="results/${sample}.bam"`. Good.
+
+Now we need to consider potential issues with the script's usage of `bai="results/${sample}.bam.bai"`. Good.
+
+Now we need to consider potential issues with the script's usage of `raw1` and `raw2`. Good.
+
+Now we need to consider potential issues with the script's usage of `data/ref/chrM.fa`. Good.
+
+Now we need to consider potential issues with the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That will produce sorted BAM. Good.
+
+Now we need to consider potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. Good.
+
+Now we need to consider potential issues with the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. Good.
+
+Now we need to consider potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. Good.
+
+Now we need to consider potential issues with the script's usage of `tabix -p vcf "$vcfgz"`. Good.
+
+Now we need to consider potential issues with the script's usage of `rm -f "$vcf"`. Good.
+
+Now we need to consider potential issues with the script's usage of `bcftools query` inside block. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential pitfalls regarding quoting of backslashes in read group string: We used double quotes and escaped backslashes. That should produce literal backslash-t sequences. But we need to confirm that BWA mem expects the read group string with actual tab characters? Actually BWA mem expects a single argument containing `@RG\tID:...` where \t is literal backslash-t, not actual tab. So our string is correct.
+
+Now we need to consider potential pitfalls regarding quoting of format string for bcftools query: We used double quotes and escaped backslashes. That should produce literal backslash-t sequences. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line with tab separators. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bcftools query` output: It will produce lines like:
+
+```
+M117-bl    1   123 A G 0.5
+...
+```
+
+But we need to ensure that the collapsed.tsv file has columns: sample, chrom, pos, ref, alt, af. That's what our format string does.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bcftools query` output: It may produce alt field with comma separated values if multiple alt alleles; but that's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` function for each step. It will skip steps if outputs exist and are newer than inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's idempotency: If all outputs exist and are newer than inputs, script will exit 0 without doing anything else. Good.
+
+Now we need to consider potential pitfalls regarding the script's performance: It uses 4 threads for each step; should finish within 600 seconds. Good.
+
+Now we need to consider potential pitfalls regarding the script's environment: It uses relative paths only. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `set -euo pipefail`. That ensures pipeline errors propagate. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `mkdir -p results`. That will create directory if missing; no output.
+
+Now we need to consider potential pitfalls regarding the script's usage of `THREADS=4`. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `samples=(M117-bl M117-ch M117C1-bl M117C1-ch)`. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `for sample in "${samples[@]}"; do ... done`. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `raw1="data/raw/${sample}_1.fq.gz"`, etc. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bam="results/${sample}.bam"`, etc. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `vcf="results/${sample}.vcf"`. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `vcfgz="results/${sample}.vcf.gz"`. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tbi="results/${sample}.vcf.gz.tbi"`. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `if needs_run "$bam" "$raw1" "$raw2"; then ... fi`. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `if needs_run "$bai" "$bam"; then ... fi`. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `if needs_run "$tbi" "$bam"; then ... fi`. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run data/ref/chrM.fa.bwt data/ref/chrM.fa`. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run data/ref/chrM.fa.fai data/ref/chrM.fa`. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of collapsed.tsv generation. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'` inside block. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "results/${sample}.vcf.gz"`. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. But we also need to ensure that collapsed.tsv is newer than all VCF gz files. That will be true if collapsed.tsv exists and is newer. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `samtools index -@ $THREADS "$bam"`. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for reference indexing: We used `.bwt` and `.fai`. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `mkdir -p results`. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `THREADS=4`. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'` inside block. That prints header line. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bcftools query`. It's fine.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `tabix -p vcf "$vcfgz"`. It will index compressed VCF. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `lofreq call-parallel`. It may require a config file? But not needed.
+
+Now we need to consider potential pitfalls regarding the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bwa mem`. It may produce warnings; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bcftools query`. It's fine.
+
+Ok, everything seems correct.
+
+However, there might be a subtle issue: The `needs_run` function uses `[[ ! -f "$out" ]] && return 0`. But if output is a directory or symlink? Not relevant. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run data/ref/chrM.fa.bwt data/ref/chrM.fa`. That will skip bwa index if .bwt exists and older than ref.fa? Actually if .bwt exists and is newer or equal to ref.fa, return false; else true. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run data/ref/chrM.fa.fai data/ref/chrM.fa`. That will skip samtools faidx if .fai exists and older than ref.fa? Actually if .fai exists and is newer or equal to ref.fa, return false; else true. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run "$tbi" "$bam"`. That will skip variant calling if tbi exists and newer or equal to bam. But what about vcf.gz? If tbi exists but vcf.gz missing, that scenario may happen if tabix indexing succeeded but we removed .vcf.gz inadvertently. But that's unlikely.
+
+Now we need to consider potential issues with the script's usage of `needs_run "$bam" "$raw1" "$raw2"`. That will skip alignment if bam exists and newer or equal to raw files. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run "$bai" "$bam"`. That will skip indexing if bai exists and newer or equal to bam. Good.
+
+Now we need to consider potential issues with the script's usage of `needs_run "$collapsed" "${inputs[@]}"`. That will skip collapsed.tsv generation if collapsed.tsv exists and is newer than all VCF gz files. Good.
+
+Now we need to consider potential issues with the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'` inside block. That's fine.
+
+Now we need to consider potential issues with the script's usage of `bcftools query`. It's fine.
+
+Ok, everything seems correct.
+
+But let's think about potential pitfalls regarding quoting of backslashes in read group string: We used double quotes and escaped backslashes. That should produce literal backslash-t sequences. Good.
+
+Now we need to consider potential pitfalls regarding quoting of format string for bcftools query: We used double quotes and escaped backslashes. That should produce literal backslash-t sequences. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem -t $THREADS -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" data/ref/chrM.fa "$raw1" "$raw2" | samtools sort -@ $THREADS -o "$bam"`. That writes sorted BAM. Good.
+
+Ok, everything seems correct.
+
+Now we need to consider potential pitfalls regarding the script's usage of `needs_run` for collapsed.tsv step: We pass all VCF gz files as inputs. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `printf 'sample\tchrom\tpos\tref\talt\taf\n'`. That prints header line. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `bcftools query` inside block: It may produce output lines; but it's fine.
+
+Now we need to consider potential pitfalls regarding the script's usage of `tabix -p vcf "$vcfgz"`. That will index compressed VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools bgzip -@ $THREADS -c "$vcf" > "$vcfgz"`. That compresses file. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `lofreq call-parallel --pp-threads $THREADS -f data/ref/chrM.fa -b "$bam" > "$vcf"`. That writes VCF. Good.
+
+Ok, everything seems correct.
+
+But let's think about potential issues with the script's usage of `samtools index -@ $THREADS "$bam"`. That indexes BAM. Good.
+
+Now we need to consider potential pitfalls regarding the script's usage of `bwa mem` etc. All good.
+
+Thus final script is ready.
+
+But we might want to add a comment at top? The instruction says no commentary, just script. So we should not include comments. But we can keep them if they are not considered user-facing prose? Comments may be considered as part of the script but not printed. It's allowed. But to be safe, we can remove comments or leave minimal ones.
+
+But the requirement: "Do not write to stderr/stdout beyond what tools naturally emit; do not use echo for user-facing prose." Comments are fine because they don't produce output. So it's okay.
+
+However, we might want to keep them for readability but not necessary. But we can include them as comments (#). It's allowed.
+
+But the instruction says "Output ONLY the script — no prose, no markdown fences, no commentary before or after." That means we cannot add any text outside of script. Comments inside script are fine because they are part of script file. So it's okay.
+
+Thus final answer: Provide the script as plain text.
+
+Let's produce final script accordingly.

@@ -32,6 +32,9 @@ MODELS = [
     "nemotron-3-nano:30b-a3b-q4_K_M", "gpt-oss:20b", "glm-4.7-flash:q4_K_M",
     "qwen3.6:27b-q4_K_M", "gemma4:31b-it-q4_K_M", "granite4.1:30b-q4_K_M",
     "granite4.1:8b-q4_K_M", "qwen3.5:4b-q4_K_M", "nemotron-3-nano:4b",
+    # The two models absent from the first version of this table: the
+    # benchmark-2 dense arm and the throughput-measurement model.
+    "qwen3.8:27b-q4_K_M", "gemma4:12b",
 ]
 
 # Keys may contain single spaces ("context length"), so the key is everything
@@ -68,7 +71,12 @@ def show(model: str) -> dict:
             k, v = m.group(1), m.group(2)
             if section == "parameters":
                 out["defaults"][k] = v
-            else:
+            elif section == "model":
+                # Only the "Model" block describes the model itself. A
+                # multimodal tag also carries a "Projector" block with its own
+                # architecture/parameters/embedding length keys; filing those
+                # under info silently overwrites the model's own values with
+                # the vision tower's (e.g. qwen3.8:27b -> "clip", "460.73M").
                 out["info"][k] = v
     return out
 

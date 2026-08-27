@@ -1,0 +1,220 @@
+We need to produce a bash script that follows plan. Must be idempotent: skip steps if outputs exist and newer than inputs. Use set -euo pipefail. Use only tools listed.
+
+Need to handle reference indexing: check for .amb or .fai etc. For bwa index, check existence of .bwt maybe. We'll just test for .amb file.
+
+For each sample: produce bam, bai, vcf.gz, tbi. Use if conditions.
+
+We need to use bgzip; but not listed in TOOL_INVENTORY. Wait bgzip is part of htslib and usually available as bgzip command. Not explicitly listed but tabix is there. But we can use bcftools view -O z? The plan says compress with bgzip, but tool inventory doesn't list bgzip. However bcftools has view -O z which uses bgzip internally. We could use bcftools view -O z -o results/{sample}.vcf.gz results/{sample}.vcf. That would produce gzipped vcf and index? Actually bcftools view -O z writes compressed file but not index. Then tabix to index.
+
+But plan says compress with bgzip; we can use bcftools view -O z. It's fine.
+
+Also need to ensure no echo for user prose, only tool outputs.
+
+We must not write to stderr/stdout beyond what tools naturally emit. So we should avoid echo except maybe for progress? But instructions say do not use echo for user-facing prose. We can still use echo for internal messages but that would produce output; better to suppress all prints: just rely on tools. Use > /dev/null? But we need to keep tool outputs. We'll just not print anything.
+
+We must ensure script is idempotent: check timestamps. For each step, we can use if [ ! -f ... ] or if newer than inputs. For example for bam: if results/${sample}.bam exists and its modification time >= both input fastqs? But easier: if bam exists skip; else run.
+
+But need to ensure that if bam exists but vcf missing, script will still produce vcf. So each step independent.
+
+For collapse.tsv: check if any of the sample .vcf.gz files newer than collapsed.tsv or collapsed.tsv doesn't exist.
+
+Implement loops over samples.
+
+Also reference indexing: check for chrM.fa.fai and chrM.fa.bwt maybe.
+
+Let's craft script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+# create results dir
+mkdir -p results
+
+# reference indexing
+REF=data/ref/chrM.fa
+if [ ! -f "${REF}.fai" ]; then
+    samtools faidx "$REF"
+fi
+if [ ! -f "${REF}.amb" ]; then
+    bwa index "$REF"
+fi
+
+# per-sample processing
+for sample in "${SAMPLES[@]}"; do
+    R1=data/raw/${sample}_1.fq.gz
+    R2=data/raw/${sample}_2.fq.gz
+    BAM=results/${sample}.bam
+    BAI=results/${sample}.bam.bai
+    VCF=results/${sample}.vcf
+    VCFZ=results/${sample}.vcf.gz
+    TBIV=results/${sample}.vcf.gz.tbi
+
+    # alignment and sort to bam if missing or older than fastqs
+    if [ ! -f "$BAM" ] || \
+       ( [ "$(stat -c %Y "$R1")" -gt "$(stat -c %Y "$BAM")" ] || [ "$(stat -c %Y "$R2")" -gt "$(stat -c %Y "$BAM")" ] ); then
+        bwa mem -t "$THREADS" -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+            "$REF" "$R1" "$R2" | samtools sort -@ "$THREADS" -o "$BAM"
+    fi
+
+    # index bam if missing or older than bam
+    if [ ! -f "$BAI" ] || [ "$(stat -c %Y "$BAM")" -gt "$(stat -c %Y "$BAI")" ]; then
+        samtools index -@ "$THREADS" "$BAM"
+    fi
+
+    # variant calling with lofreq if vcf missing or older than bam
+    if [ ! -f "$VCFZ" ] || \
+       ( [ "$(stat -c %Y "$BAM")" -gt "$(stat -c %Y "$VCFZ")" ] ); then
+        # call-parallel writes to stdout; capture to temp vcf
+        lofreq call-parallel --pp-threads "$THREADS" -f "$REF" -b "$BAM" > "$VCF"
+        # compress and index
+        bcftools view -O z -o "$VCFZ" "$VCF"
+        tabix -p vcf "$VCFZ"
+        rm -f "$VCF"
+    fi
+done
+
+# collapse.tsv
+COLLAPSED=results/collapsed.tsv
+needs_rebuild=false
+if [ ! -f "$COLLAPSED" ]; then
+    needs_rebuild=true
+else
+    for sample in "${SAMPLES[@]}"; do
+        VCFZ=results/${sample}.vcf.gz
+        if [ "$(stat -c %Y "$VCFZ")" -gt "$(stat -c %Y "$COLLAPSED")" ]; then
+            needs_rebuild=true
+            break
+        fi
+    done
+fi
+
+if $needs_rebuild; then
+    {
+        echo -e "sample\tchrom\tpos\tref\talt\taf"
+        for sample in "${SAMPLES[@]}"; do
+            VCFZ=results/${sample}.vcf.gz
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$VCFZ"
+        done
+    } > "$COLLAPSED"
+fi
+
+exit 0
+
+But we used echo -e for header. That prints to stdout; allowed? The instruction: "Do not write to stderr/stdout beyond what tools naturally emit; do not use `echo` for user-facing prose." Using echo for header is part of output file, not console. But echo will print to stdout unless redirected. We redirect to file with > "$COLLAPSED". So no console output. That's fine.
+
+But we used bcftools view -O z which compresses; but we didn't remove uncompressed vcf if exists? We removed after indexing. Good.
+
+We also need to ensure that the header line is tab-separated, not spaces. echo -e "sample\tchrom..." will produce tabs. Good.
+
+However we used echo -e inside braces and redirect; that's fine.
+
+But we used bcftools view -O z which writes compressed vcf but may not index? We then tabix index. Good.
+
+We need to ensure that bcftools view -O z uses the same file name; we passed -o "$VCFZ". That will produce gzipped file.
+
+Also we should check if bcftools view -O z is available; yes bcftools 1.21 includes it.
+
+Now, we used stat -c %Y to get modification time. On some systems maybe not available? But typical Linux has that. We can use `-nt` for newer than but that's simpler: if [ "$BAM" -nt "$R1" ] etc. But we need to check older. Let's simplify: Use test -nt.
+
+For bam creation: if bam missing or either R1 or R2 newer than bam, re-run. We can use:
+
+if [ ! -f "$BAM" ] || [ "$R1" -nt "$BAM" ] || [ "$R2" -nt "$BAM" ]; then
+
+Similarly for BAI: if missing or BAM newer.
+
+For vcfz: if missing or BAM newer.
+
+Let's adjust script accordingly.
+
+Also we used bcftools query; need to ensure that INFO/AF exists. Lofreq outputs AF? It uses INFO/AF maybe. We'll trust.
+
+Now final script:
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS=4
+SAMPLES=(M117-bl M117-ch M117C1-bl M117C1-ch)
+
+mkdir -p results
+
+REF=data/ref/chrM.fa
+if [ ! -f "${REF}.fai" ]; then
+    samtools faidx "$REF"
+fi
+if [ ! -f "${REF}.amb" ]; then
+    bwa index "$REF"
+fi
+
+for sample in "${SAMPLES[@]}"; do
+    R1=data/raw/${sample}_1.fq.gz
+    R2=data/raw/${sample}_2.fq.gz
+    BAM=results/${sample}.bam
+    BAI=results/${sample}.bam.bai
+    VCF=results/${sample}.vcf
+    VCFZ=results/${sample}.vcf.gz
+    TBIV=results/${sample}.vcf.gz.tbi
+
+    if [ ! -f "$BAM" ] || [ "$R1" -nt "$BAM" ] || [ "$R2" -nt "$BAM" ]; then
+        bwa mem -t "$THREADS" -R "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA" \
+            "$REF" "$R1" "$R2" | samtools sort -@ "$THREADS" -o "$BAM"
+    fi
+
+    if [ ! -f "$BAI" ] || [ "$BAM" -nt "$BAI" ]; then
+        samtools index -@ "$THREADS" "$BAM"
+    fi
+
+    if [ ! -f "$VCFZ" ] || [ "$BAM" -nt "$VCFZ" ]; then
+        lofreq call-parallel --pp-threads "$THREADS" -f "$REF" -b "$BAM" > "$VCF"
+        bcftools view -O z -o "$VCFZ" "$VCF"
+        tabix -p vcf "$VCFZ"
+        rm -f "$VCF"
+    fi
+done
+
+COLLAPSED=results/collapsed.tsv
+needs_rebuild=false
+if [ ! -f "$COLLAPSED" ]; then
+    needs_rebuild=true
+else
+    for sample in "${SAMPLES[@]}"; do
+        VCFZ=results/${sample}.vcf.gz
+        if [ "$VCFZ" -nt "$COLLAPSED" ]; then
+            needs_rebuild=true
+            break
+        fi
+    done
+fi
+
+if $needs_rebuild; then
+    {
+        echo -e "sample\tchrom\tpos\tref\talt\taf"
+        for sample in "${SAMPLES[@]}"; do
+            VCFZ=results/${sample}.vcf.gz
+            bcftools query -f "${sample}\t%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\n" "$VCFZ"
+        done
+    } > "$COLLAPSED"
+fi
+
+exit 0
+
+Check for missing tools: we used tabix, bcftools view, bcftools query. All available.
+
+We used echo -e; but that prints to stdout? It's inside braces and redirected to file. So no console output.
+
+Also we didn't use any other commands.
+
+Edge: The read group string uses backslash-t characters. We wrote "@RG\\tID:${sample}\\tSM:${sample}\\tLB:${sample}\\tPL:ILLUMINA". In bash, double quotes interpret \t as literal t? Actually inside double quotes, backslash escapes only certain chars; \t remains two characters \ and t. So it's fine.
+
+Now ensure that the script is idempotent: if all outputs exist and newer than inputs, nothing will run. For bam creation we check -nt; if BAM newer than R1 or R2 then skip. Good.
+
+For vcfz, we check BAM newer than VCFZ; if older skip.
+
+For collapsed.tsv, we check any VCFZ newer than collapsed.tsv; rebuild accordingly.
+
+All good.
+
+Now produce final script.

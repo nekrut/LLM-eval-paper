@@ -515,8 +515,8 @@ think-on; both framings give the same picture):
 |---|---|---|---|
 | B (no plan) | 0.07 | 0.09 | +0.02 |
 | v0.5 | 0.03 | 0.10 | +0.07 |
-| **v1** | 0.23 | 0.41 | **+0.18** |
-| v1g | 0.23 | 0.29 | +0.05 |
+| **v1** | 0.23 | 0.40 | **+0.17** |
+| v1g | 0.23 | 0.27 | +0.03 |
 | **v1.25** | 0.43 | 0.67 | **+0.23** |
 | v1.5 | 0.83 | 0.90 | +0.07 |
 | **v2** | 0.93 | 0.73 | **-0.20** |
@@ -617,6 +617,13 @@ directly comparable to the published data).
 
 M3 (variant-set agreement with truth):
 
+**CORRECTED 2026-08-26.** The table below was produced by the naive
+per-plan-file aggregation this project warns against: it does NOT collapse
+Track B, so no-plan runs were folded into the v1 and v2 columns. The corrected
+table, computed with `column(plan, track)` from `revision/scripts/gradient.py`,
+is given second and is the one the manuscript uses.
+
+WRONG (uncollapsed — do not reuse):
 ```
 model                      B    v0.5      v1     v1g   v1.25    v1.5      v2
 claude-opus-5           0.63    0.78    0.83    1.00    1.00    1.00    0.97
@@ -624,8 +631,16 @@ claude-sonnet-5         0.65    0.96    0.98    1.00    1.00    1.00    0.99
 claude-haiku-4-5        1.00    0.67    0.97    1.00    1.00    1.00    0.83
 ```
 
-Two observations: the gradient **saturates at v1g** — v1.25 and v1.5 buy
-nothing for frontier models; and from v1g onward Haiku is indistinguishable
+CORRECT (Track B collapsed; B pools 9 cells per model, others 3):
+```
+model                      B    v0.5      v1     v1g   v1.25    v1.5      v2
+claude-opus-5          0.743   0.778   1.000   1.000   1.000   1.000   1.000
+claude-sonnet-5        0.861   0.959   1.000   1.000   1.000   1.000   1.000
+claude-haiku-4-5       0.870   0.667   1.000   1.000   1.000   1.000   1.000
+```
+
+Two observations: the gradient **saturates at v1** — v1g, v1.25 and v1.5 buy
+nothing for frontier models; and from v1 onward Haiku is indistinguishable
 from Opus, which strengthens the cost argument. Two cells run backwards
 (Haiku 1.00 at B but 0.67 at v0.5; Opus 0.97 at v2) — almost certainly n=3
 noise, and prime candidates for the n=10 pass.
@@ -696,8 +711,11 @@ Zero CUDA faults across ~41 h since `OLLAMA_FLASH_ATTENTION=false`. All cells
 resumable (any cell with `score.json` is skipped), so `run_full_matrix.sh` can
 be re-run at any time to fill gaps.
 
-Matrix: 12 local models × 7 plan columns (B, v0.5, v1, v1g, v1.25, v1.5, v2) ×
-3 seeds. **This gradient has never existed for the Jetson** — the published
+Matrix: 12 local models × **9 (plan file, track) cells** × 3 seeds = 324.
+The 9 cells collapse to 7 plan columns (B, v0.5, v1, v1g, v1.25, v1.5, v2) at
+analysis, because Track B occupies three of them (plan b; plan v1 Track B;
+plan v2 Track B). CORRECTED 2026-08-26: this line previously read "12 × 7 × 3",
+which is 252, not 324. **This gradient has never existed for the Jetson** — the published
 Jetson data is a single-column screen at plan v2 only; the 7-column gradient
 exists only for the RTX 5080. New work, not a reproduction.
 
@@ -722,8 +740,15 @@ Fig 3 is the new result. Reasoning effect by plan column, over the 10 models
 runnable in both arms:
 
 ```
-B   +0.02   v0.5 +0.07   v1 +0.20   v1g +0.10   v1.25 +0.23   v1.5 +0.07   v2 -0.20
+B   +0.02   v0.5 +0.07   v1 +0.17   v1g +0.03   v1.25 +0.23   v1.5 +0.07   v2 -0.20
 ```
+(CORRECTED 2026-08-26. This block previously read v1 +0.20 / v1g +0.10, which
+conflicted with the table above it and reproduced under neither truncation
+convention. Recomputed from `matrix_jetson_thinkon.jsonl` and
+`matrix_jetson_thinkoff.jsonl` over the 10 both-arm models, scoring truncated
+generations 0 and retaining them — the convention the manuscript states.
+Dropping truncated cells instead gives +0.03 / +0.08 / +0.23 / +0.07 / +0.26 /
++0.07 / -0.20.)
 
 Reasoning substitutes for plan detail in the middle of the gradient and
 **hurts once the plan is already near-executable** — at v2, 4 of 10 models
@@ -1335,3 +1360,109 @@ D. **`num_predict` in the methods.** The *Inference settings* subsection is
 - No `git commit`, no `git push`, no branch changes.
 - No Anthropic API spend beyond the completed 81-cell run.
 - No ollama service config changes.
+
+---
+
+## Context-distance hypothesis: tested, inconclusive (2026-08-16)
+
+**Question.** Why is accuracy worse with reasoning enabled? Proposed mechanism:
+the script is emitted after thousands of tokens of chain-of-thought, so the
+plan text is far back in context when the model finally copies a command, and
+literal-copy fidelity decays with distance.
+
+**A prior claim of mine that did not survive contact with the data.** I had
+described reasoning-on scripts as systematically more elaborate — inventing
+build machinery, paraphrasing rather than copying. That is true of
+`qwen3.8:27b` and **does not generalise**. Median reasoning-on/off script-size
+ratio at v2 across the other ten models is **1.00x**. Same length, more bugs.
+
+**What the reasoning-on failures at v2 actually are** (30/33 cells produced a
+script; 8 scored zero) — ordinary bad bash, not over-engineering:
+
+```
+run.sh: line 45: syntax error: unexpected end of file
+run.sh: line 22: syntax error in conditional expression
+samtools sort: failed to read header from "-"      (x3, malformed pipe)
+[main] unrecognized command 'bgzip'                (hallucinated subcommand)
+[E::fai_build_core] Format error, unexpected "c"
+```
+
+**The test I first proposed was unsound.** Repeating the plan at the end of the
+prompt does not shorten the relevant gap: the prompt is consumed in full before
+generation starts, and what intervenes between plan and script is the model's
+own thinking. Prompt layout cannot manipulate it.
+
+**The test that was available.** If distance causes errors, then within a
+single (model, plan) cell the seeds that think longer should fail more. Track-B
+conditions must be collapsed first — Track B ignores the plan file, so with a
+fixed seed the b/v1/v2 Track-B "cells" are byte-identical repeats, not
+independent observations (this is the fourth time that trap has appeared).
+
+| | |
+|---|---|
+| independent mixed cells | 23 |
+| failing seed thought longer | **16 / 23** |
+| one-sided binomial p | 0.047 |
+| **two-sided p** | **0.093** |
+
+**Verdict: not supported, not refuted.** Directionally consistent, statistically
+marginal. Reported as inconclusive because (a) the hypothesis was generated from
+this same data, so the one-sided test is illegitimate and 0.093 is the honest
+figure; and (b) causal direction is unidentified — longer thinking may be a
+symptom of a seed wandering into a confused trajectory rather than the cause of
+the resulting errors.
+
+**What would settle it.** An intervention, not an observation: vary reasoning
+length directly at fixed prompt and seed (e.g. `gpt-oss:20b` exposes a
+reasoning-effort control) and see whether error rate tracks it. Until then the
+paper should continue to report the effect without a mechanism, which is what
+the drafted Results text already does.
+
+---
+
+## Effort experiment: context-distance REFUTED, and a caveat for the paper
+
+**Design.** `gpt-oss:20b` exposes a reasoning-effort control (ollama accepts
+`think: "low"|"medium"|"high"`). Prompt, seed, plan, model and hardware held
+fixed; only effort varies. 3 plans x 3 seeds x 3 levels. Low/medium ran at
+num_ctx 32768; the high arm was re-run at 131072 (the model's native ceiling,
+30 GB / 100% GPU) after truncating at 32k — that first high arm measured the
+budget, not reasoning, and was discarded.
+
+**Manipulation check:** mean thinking 480 / 10,053 / 139,705 chars. A 290x
+range from one parameter.
+
+| effort | thinking | v1 | v1.25 | v2 | mean M3 |
+|---|---|---|---|---|---|
+| low | 480 | 0/3 | 0/3 | 3/3 | 0.33 |
+| medium | 10,053 | 0/3 | **2/3** | 3/3 | **0.56** |
+| high | 139,705 | 0/3 | 0/3 | 3/3 | 0.33 |
+
+**1. The context-distance hypothesis is refuted.** It predicted that longer
+reasoning degrades literal-command fidelity, so v2 should break at high effort.
+At 290x the reasoning length, v2 is still 3/3. Distance from plan to script
+does not cause the errors.
+
+**2. The plan dominates; reasoning length is second-order.** Sufficient plan
+(v2): perfect at every effort. Insufficient plan (v1): fails at every effort.
+Reasoning only moves the result in the narrow band between (v1.25), and there
+non-monotonically — an inverted U, with medium beating both ends. This is a
+*strengthening* of the paper's central claim, arrived at from the opposite
+direction: not even a 290x swing in reasoning substitutes for plan detail.
+
+**3. CAVEAT FOR THE DRAFTED RESULTS SUBSECTION.** The main matrix recorded
+gpt-oss:20b at v2 as 3/3 reasoning-off and 2/3 reasoning-on (num_ctx 16384),
+one of the observations behind "reasoning fails hardest where the instructions
+are most complete". At generous budget it is **3/3 at every effort level**.
+The penalty did not reproduce.
+
+Stated carefully in both directions: 2/3 vs 3/3 is a single seed and this does
+not establish the 16k result was an artifact — noise fits equally well. But the
+v2 penalty is **not robust** for this model, and the drafted paragraph leans on
+it. The qwen3.8 result is unaffected: that model truncated even at 64k and was
+1/3 correct when it did finish, which is a different and much larger effect.
+
+**Action:** before submission, either (a) soften the v2 generalisation to name
+qwen3.8 specifically, or (b) re-run the reasoning-on v2 cells for the other
+models at a generous budget to see whether any v2 penalty survives. (b) is
+~12 cells and would settle it.

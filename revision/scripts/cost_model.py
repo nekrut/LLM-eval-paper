@@ -57,6 +57,12 @@ def main() -> int:
     ap.add_argument("--staff-rate", type=float, default=75.0, help="USD/hour loaded")
     ap.add_argument("--runs-per-year", type=float, default=5000.0,
                     help="only affects the amortised view, not the break-even")
+    ap.add_argument("--api-staff-hours-setup", type=float, default=0.0,
+                    help="API-side one-time labour: harness setup, key and quota "
+                         "management, prompt maintenance (R2.17). Default 0 reproduces "
+                         "the asymmetric accounting of the first revision.")
+    ap.add_argument("--api-staff-hours-year", type=float, default=0.0,
+                    help="API-side recurring labour, hours per year (R2.17)")
     args = ap.parse_args()
 
     kwh_per_run = args.watts / 1000 * (JETSON_S_PER_RUN / 3600)
@@ -122,6 +128,40 @@ def main() -> int:
                       (5.00, "long-context repo-scale task")):
         be = horizon_total / (api - elec_per_run)
         print(f"    ${api:>9.2f}  {be:>12,.0f}   {be / 5000:>11.1f}   {note}")
+
+    # ------------------------------------------------------------------
+    # R2.17: like-for-like ANNUALISED comparison.
+    #
+    # The runs-to-break-even figure above amortises hardware over three years
+    # but is reached, at plausible run rates, only after fifteen -- i.e. after
+    # five hardware refreshes and five setup cycles that the model never
+    # charges. The annualised form avoids that inconsistency: both columns are
+    # a cost per year at a stated run rate, and the local column charges a
+    # hardware and setup refresh every depreciation period.
+    # ------------------------------------------------------------------
+    local_annual_fixed = (args.hardware + args.staff_hours_setup * args.staff_rate) \
+        / args.depreciation_years + annual_staff + annual_idle
+    api_annual_fixed = (args.api_staff_hours_setup * args.staff_rate) \
+        / args.depreciation_years + args.api_staff_hours_year * args.staff_rate
+    print("\n" + "=" * 66)
+    print("ANNUALISED BREAK-EVEN (like-for-like)")
+    print("=" * 66)
+    print(f"  Local fixed cost per year     ${local_annual_fixed:,.0f}"
+          f"   [hardware+setup / {args.depreciation_years:.0f} yr, plus maintenance and idle power]")
+    print(f"  API fixed cost per year       ${api_annual_fixed:,.0f}"
+          f"   [API-side setup and maintenance labour]")
+    if api_annual_fixed < local_annual_fixed:
+        be_annual = (local_annual_fixed - api_annual_fixed) / saving
+        print(f"  Runs per year at which the two are equal: {be_annual:>10,.0f}")
+    else:
+        print("  API fixed cost exceeds local fixed cost: local is cheaper at any run rate.")
+    print("\n  Sensitivity to API-side labour (hours/yr, setup amortised at 2x that):")
+    for h in (0, 2, 4, 8, 16):
+        af = (2 * h * args.staff_rate) / args.depreciation_years + h * args.staff_rate
+        if af >= local_annual_fixed:
+            print(f"    {h:>2} h/yr:  local cheaper at any run rate")
+        else:
+            print(f"    {h:>2} h/yr:  {(local_annual_fixed - af) / saving:>10,.0f} runs/yr")
 
     print("\n  NOTE: the local column is *marginal* cost. It excludes the wall-clock")
     print("  penalty — a Jetson run takes ~87 s against a few seconds for the API —")
