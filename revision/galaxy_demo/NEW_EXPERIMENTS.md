@@ -80,3 +80,51 @@ Failures die at the first step: `bwa_idx_build fail to open file`.
   fails silently at the first path.
 - Limitations: n=3 per model in the perturbed condition; single perturbation
   type (path move); no frontier arm.
+
+## 3. Bounded repair arm (T3.1, C1) — run 2026-08-27
+
+Design: the perturbed condition, plus feedback. If the script exits nonzero,
+the model sees its own script, the exit code, and the last 40 lines of the
+execution log. It may submit a fix. At most 3 attempts. The retry signal is
+the exit code only. The score is computed afterward and never shown.
+13 models x 3 seeds. Log: `revision/logs/matrix_jetson_repair.jsonl`;
+runs and per-attempt scripts under `revision/runs_repair/`.
+
+Result by model (attempts used, M3 per seed):
+
+| tier | models | outcome |
+|---|---|---|
+| Bind on attempt 1 | gemma4:31b, gpt-oss:20b | 1 attempt, perfect, all seeds (controls; unchanged) |
+| Repair on attempt 2 | qwen3.6:27b, qwen3.8:27b | perfect on attempt 2, all 3 seeds each |
+| Partial repair | laguna-xs-2.1 | 2 of 3 seeds perfect on attempt 2 |
+| No repair | the remaining 8 models | 0 of 24 seeds recovered in 3 attempts |
+
+Copier seeds rescued: 8/33. Class success with repair: 14/39, against 6/39
+one-shot and 34/36 unperturbed.
+
+Verified from the scripts:
+- qwen3.6:27b's fix is a genuine repair. Attempt 2 tests for the old path,
+  falls back to the path stated in the prompt, and proceeds. It used the
+  prompt's information once the error pointed at the file.
+- qwen3.6:35b-a3b resubmitted the identical dead path in all three attempts,
+  with the error naming that path in front of it.
+- granite4.1:30b and gemma4:26b guessed `data/ref/rCRS.fa` on attempt 3:
+  the correct filename from the prompt, in the wrong directory. They used
+  part of the prompt's information and did not check the rest.
+
+### What this adds to the claims
+
+1. The single-pass constraint accounts for part of the transcription
+   finding, not all of it. Three of eleven copiers repair when shown the
+   error. Eight do not, though the error names the missing file and the
+   correct path is in their prompt.
+2. The taxonomy is three tiers: bind (2), repair (3), neither (8).
+   One retry converts qwen3.6:27b and qwen3.8:27b from total failure to
+   perfect. For those models, an execute-and-retry loop is worth more than
+   any amount of plan prose.
+3. Failure to repair is not failure to act. The non-repairers changed
+   other things — flags, loops, index names — while keeping the dead path.
+   One model changed the path to a plausible wrong guess rather than the
+   stated one.
+4. Caveats: n=3 per model; one perturbation type; retry only on nonzero
+   exit; no frontier arm.

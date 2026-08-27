@@ -5,8 +5,8 @@ Supplement to "In a single pass, most local 4-bit executors transcribe a detaile
 Contents:
 
 - **Supplementary Methods** (Tables S1–S9): study-design ledger; plan conditions and prompts; data-governance audit; hardware sizing and residency; inference settings; execution environment; scoring conventions; error injection; benchmark-2 protocol; the fabrication study; platforms and reproducibility metadata; the cost model.
-- **Supplementary Results** (Tables S10–S17): generation outcomes; per-model repeated sampling; conventional variant-calling metrics; the emitted-script constraint audit; the reasoning arms; wall time by platform; benchmark-2 per-sample counts and the defect ledger; the seed extension at the discriminating conditions; the perturbed-plan pass.
-- **Supplementary Discussion**: the workflow-class taxonomy (Table S18); production concerns for a shared deployment (Table S19); the agent-harness survey.
+- **Supplementary Results** (Tables S10–S18): generation outcomes; per-model repeated sampling; conventional variant-calling metrics; the emitted-script constraint audit; the reasoning arms; wall time by platform; benchmark-2 per-sample counts and the defect ledger; the seed extension at the discriminating conditions; the perturbed-plan pass; the bounded repair arm.
+- **Supplementary Discussion**: the workflow-class taxonomy (Table S19); production concerns for a shared deployment (Table S20); the agent-harness survey.
 - **Verbatim prompts and plan files.**
 - **Supplementary Figures S1–S4.**
 
@@ -511,10 +511,35 @@ The design is in the main text (Methods, *The perturbed-plan condition*). Plan v
 Three cautions bound this table. Each per-model figure is three seeds, so a 3/3 is [0.29, 1.00] and a 0/3 is [0.00, 0.71]. The result is the sharpness of the split across 39 cells, not any per-model rate. The perturbation is a single type — one moved path. It says nothing about renamed samples, added samples, permuted steps or wrong output paths. No frontier executor was run on the perturbed plan, so whether frontier models bind under it is unknown. <!-- addresses: R2.1, R3.preamble, R3.8 -->
 
 
+### The bounded repair arm
+
+The repair arm re-ran the perturbed condition with feedback (main text, Results, *Three attempts separate transcribers that repair from transcribers that do not*). If the generated script exited nonzero, the model saw its own script, the exit code and the last 40 lines of the execution log, and could submit a fix. At most three attempts were allowed. The retry signal was the exit code only; the score was computed afterward and never shown. Thirteen local executors × 3 seeds = 39 cells, reasoning off, Track A. The log is `revision/logs/matrix_jetson_repair.jsonl`; per-attempt scripts are under `revision/runs_repair/`. <!-- addresses: T3.1, C1, R2.10 -->
+
+**Table S18.** The bounded repair arm, per model: attempts used and M3 per seed (seeds 42/43/44). An attempts entry of 1 means the first script succeeded. An entry of 2 means the model repaired after one error report. An entry of 3 means the model used every attempt; every such seed ended at M3 = 0. Copier seeds rescued: 8 of 33. Class success with repair: 14/39, against 6/39 one-shot and 34/36 unperturbed.
+
+| Model | Tier | Attempts (42/43/44) | M3 (42/43/44) |
+|---|---|---|---|
+| `gemma4:31b` | bind on attempt 1 | 1 / 1 / 1 | 1.0 / 1.0 / 1.0 |
+| `gpt-oss:20b` | bind on attempt 1 | 1 / 1 / 1 | 1.0 / 1.0 / 1.0 |
+| `qwen3.6:27b` | repair on attempt 2 | 2 / 2 / 2 | 1.0 / 1.0 / 1.0 |
+| `qwen3.8:27b` | repair on attempt 2 | 2 / 2 / 2 | 1.0 / 1.0 / 1.0 |
+| `laguna-xs-2.1` | partial repair | 2 / 3 / 2 | 1.0 / 0.0 / 1.0 |
+| `gemma4:26b-a4b` | no repair | 3 / 3 / 3 | 0.0 / 0.0 / 0.0 |
+| `glm-4.7-flash` | no repair | 3 / 3 / 3 | 0.0 / 0.0 / 0.0 |
+| `granite4.1:30b` | no repair | 3 / 3 / 3 | 0.0 / 0.0 / 0.0 |
+| `granite4.1:8b` | no repair | 3 / 3 / 3 | 0.0 / 0.0 / 0.0 |
+| `nemotron-3-nano:30b-a3b` | no repair | 3 / 3 / 3 | 0.0 / 0.0 / 0.0 |
+| `nemotron-3-nano:4b` | no repair | 3 / 3 / 3 | 0.0 / 0.0 / 0.0 |
+| `qwen3.5:4b` | no repair | 3 / 3 / 3 | 0.0 / 0.0 / 0.0 |
+| `qwen3.6:35b-a3b` | no repair | 3 / 3 / 3 | 0.0 / 0.0 / 0.0 |
+
+The caveats of the perturbed pass carry over: three seeds per model, one perturbation type, no frontier arm. The repair arm adds one of its own: it retried only on a nonzero exit. <!-- addresses: T3.1, C1, R2.10, R3.8 -->
+
+
 ## Supplementary Discussion
 
 ### Candidate workflow classes for a local executor
-**Table S18.** Candidate workflow classes for a local executor.
+**Table S19.** Candidate workflow classes for a local executor.
 
 The compressed six-class table that carried this content in the main text of the first version has been removed. Four of its six rows were author opinion with no measurement behind them. A numbered main-text table gave them a standing they had not earned. The boundary they were there to draw is stated in prose in *Scope, study design, and what each benchmark can and cannot show*. The expanded version is retained here, for readers who want the reasoning per class, with every qualitative judgement marked. It adds the representative analysis and the reason each class stresses a different part of an executor. Step counts and I/O footprints are measured only for the two classes that were run. For the four classes that were not run, plan complexity and I/O footprint are qualitative estimates by the author with no measurement behind them, and they are marked as such. No numeric step count is offered for them, because no source in the released artifacts gives one.
 
@@ -533,9 +558,9 @@ The table makes one pattern visible. The two classes run here are the two in whi
 ### Production concerns for a shared-cluster deployment
 The case study supplies part of the answer to what changes in a production setting, because usegalaxy.org is one. The executor operated under an external scheduler with real queueing, per-tool containerisation and server-side provenance recorded independently of the agent. Its credential was account-scoped, so its blast radius was the account rather than the history. What narrowed the blast radius in practice was the MCP server's bounded verb set, not the credential.
 
-Four production concerns remain untested. For each, this study has enough behind it to say something more useful than a list (Table S19).
+Four production concerns remain untested. For each, this study has enough behind it to say something more useful than a list (Table S20).
 
-**Table S19.** Production concerns a shared-cluster deployment must settle, what benchmark 2 supplied, and what this study's own failures recommend. No row is a tested result.
+**Table S20.** Production concerns a shared-cluster deployment must settle, what benchmark 2 supplied, and what this study's own failures recommend. No row is a tested result.
 
 | Concern | What benchmark 2 supplied | What remains untested | Recommended mitigation |
 |---|---|---|---|

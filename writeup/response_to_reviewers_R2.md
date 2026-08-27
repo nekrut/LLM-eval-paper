@@ -5,7 +5,7 @@
 **Revised title:** *In a single pass, most local 4-bit executors transcribe a detailed plan; two of thirteen bind it*
 **Decision:** Return for Revision (22 July 2026)
 
-Revised files: `writeup_R2.md` (main text) and `supplement_R2.md` (Supplementary Methods, Results, Discussion, Tables S1–S19, Figures S1–S4). Every passage cited below is present in those files. The source files map each passage to a review point with `<!-- addresses: ... -->` comments. Any claim in this letter can therefore be checked against the text it refers to.
+Revised files: `writeup_R2.md` (main text) and `supplement_R2.md` (Supplementary Methods, Results, Discussion, Tables S1–S20, Figures S1–S4). Every passage cited below is present in those files. The source files map each passage to a review point with `<!-- addresses: ... -->` comments. Any claim in this letter can therefore be checked against the text it refers to.
 
 ---
 
@@ -39,7 +39,7 @@ We have also removed material rather than only adding it. The model catalogue, t
 
 | ID | Issue | Disposition |
 |---|---|---|
-| C1 | Not an agentic loop | **Accepted.** "Agentic" removed from title; benchmark 1 explicitly described as non-agentic; benchmark 2 added to supply the loop. Bounded-repair arm **not run**. |
+| C1 | Not an agentic loop | **Accepted.** "Agentic" removed from title; benchmark 1 explicitly described as non-agentic; benchmark 2 added to supply the loop. Bounded repair arm **run** at the perturbed condition: three of eleven transcribers repair when shown the error, eight do not (§5.1). |
 | C2 | One small workflow; conclusions broader than evidence | **Accepted.** Second workflow class run as a case study; claims narrowed to tasks with no data-dependent parameter choices; six-class scope table moved to Supplement with qualitative rows marked. |
 | C3 | Jaccard alone is the wrong metric | **Accepted.** Precision/recall/F1 and TP/FP/FN added (Table S12); pass/fail ladder M1/M2/M3 defined in one place; degeneracy of the local M3 stated outright. |
 | C4 | "Seed" does not control determinism | **Accepted.** All determinism language rewritten; API integer identified as a run identifier; a new `top_k`/`top_p` confound disclosed. |
@@ -76,7 +76,7 @@ We have also removed material rather than only adding it. The model catalogue, t
 | ID | Issue | Disposition |
 |---|---|---|
 | R3.preamble | Success at the detailed end may be transcription | **Conceded, measured, then tested directly.** Transcription index quantifies the copying; the perturbed-plan experiment **was run** and shows transcription in 11 of 13 local models, binding in 2. |
-| R3.1 | "Agentic" is not earned | **Accepted.** Retitled; benchmark 2 supplies a real loop; bounded-repair arm **not run**. |
+| R3.1 | "Agentic" is not earned | **Accepted.** Retitled; benchmark 2 supplies a real loop; bounded repair arm since **run** at the perturbed condition (§5.1). |
 | R3.2 | Why an LLM at all? | **Accepted, and conceded further than asked.** Introduction concedes the deterministic baseline; Discussion concedes the best lean plan is itself a shell script. Templater baseline **not run**. |
 | R3.3 | Scope beyond one workflow | **Accepted in part.** Second workflow class run; it carries no plan gradient and does not extend the plan-sufficiency result. |
 | R3.4 | Conventional variant-calling metrics | **Accepted.** Table S12; new Results section. |
@@ -97,7 +97,7 @@ We have also removed material rather than only adding it. The model catalogue, t
 
 | ID | Experiment | Status |
 |---|---|---|
-| T3.1 | Bounded iterative repair arm | **Not run.** |
+| T3.1 | Bounded iterative repair arm | **Run**, at the perturbed condition: bind 2 / repair 3 / no repair 8; class 14/39 with repair against 6/39 one-shot. The v1/v1.25 variant remains unrun (§5.1). |
 | T3.2 | Planner comparison (expert / second frontier / documentation) | **Documentation arm answered by v1g; the other two not run.** |
 | T3.3 | Exploratory/confirmatory separation | **Partly.** Declared exploratory; the frozen protocol was violated and we say how. |
 | T3.4 | Second biological benchmark | **Run**, as a case study, without perturbations. |
@@ -154,7 +154,7 @@ One thing did not survive the swap. R2.3 asked for a residency discussion. Resid
 
 **The point.** The paper called its system agentic. It is not. The model emits one script and never sees what happens to it. There is no observation, no repair, no ability to add a step in response to what it finds. Nothing about the design earns the word.
 
-**Response.** Correct, and the word is removed from the title. We did two things: stated the limitation in the paper's own voice wherever the design is described, and added a second benchmark that actually has the loop.
+**Response.** Correct, and the word is removed from the title. We did three things: stated the limitation in the paper's own voice wherever the design is described, added a second benchmark that actually has the loop, and ran the bounded repair arm (T3.1) this comment asked for.
 
 **What changed.**
 
@@ -164,8 +164,9 @@ One thing did not survive the swap. R2.3 asked for a residency discussion. Resid
 - Results, *Injected failures*: the single-pass constraint is turned into the motivation for the loop rather than defended — "These runs had no opportunity to retry, so **a 12.5% recovery rate under a single pass is the strongest internal motivation for the repair loop reviewers asked for**, and the honest reading of benchmark 1 is that it measures what a model does without a loop."
 - Results, *Failure modes visible only in the agentic setting*: three modes that a single-pass design cannot produce — an uncompleted final step invisible to an invocation-only scorer, a model stuck on its own stale durable note (losing ~2 h of correct upstream compute), and a zero-tool-call empty turn in 6 of 30 launches.
 - Supplement, *Agent harnesses and bioinformatics agents*: "That was a deliberate choice — it isolates plan detail as the only variable — but it is also precisely the limitation three reviewers of the first version of this manuscript identified, and the resulting system should not be called agentic."
+- Results, *Three attempts separate transcribers that repair from transcribers that do not*: the bounded repair arm, run at the perturbed condition (main-text Table 7; Supplementary Table S18).
 
-**Not addressed by new data.** The bounded-repair arm (T3.1) was **not run**. See §5.1.
+**Addressed by new data.** The bounded repair arm was run after the second review cycle, at the perturbed condition — the setting where every transcriber fails. Design: on a nonzero exit, the model saw its own script, the exit code and the last 40 lines of the log, and could resubmit, up to three attempts. The retry signal was the exit code only; the score was never shown. Result, in tiers: the two binders were perfect on attempt 1; `qwen3.6:27b` and `qwen3.8:27b` were perfect on attempt 2 in all three seeds; `laguna-xs-2.1` in two of three; the remaining eight models recovered 0 of 24 seeds. Class success with repair is 14/39, against 6/39 one-shot. What this concedes: the single-pass design hid a real capability. For three models, one look at the error did what no plan prose did. What it does not concede: that a loop makes the class work. Eight models failed all three attempts, with the error naming the missing file and the correct path in their prompt. Full disposition: §5.1.
 
 ---
 
@@ -215,7 +216,7 @@ One thing did not survive the swap. R2.3 asked for a residency discussion. Resid
 - Full decoding parameters are reported: ollama 0.32.5, `temperature = 0.2`, `num_ctx = num_predict = 16384`, with per-model defaults in Table S8.
 - The new finding, disclosed in Methods rather than buried: "**A confound, not merely a disclosure:** the harness overrode only `temperature`, leaving `top_k` and `top_p` at each model's own defaults, which are not uniform across families and are absent altogether for `qwen3.8:27b` (Supplementary Table S8), so every cross-model comparison here compares models decoded from different distributions. The gradient itself is a within-model comparison and is unaffected."
 
-See R2.6 for the unrun repair.
+See R2.6 for the unrun pinned-decoder re-run.
 
 ---
 
@@ -443,9 +444,9 @@ A comparison table from the first version was deleted. The reason given: "every 
 
 #### R2.10 — Single-pass generation is not agentic
 
-Identical in substance to C1 and R3.1; see C1 for the full disposition. In addition, the Discussion ties the paper's central claim to the single-pass constraint rather than to the models.
+Identical in substance to C1 and R3.1; see C1 for the full disposition, including the repair arm. In addition, the Discussion ties the paper's central claim to the single-pass constraint rather than to the models, and now reports the arm that tested it.
 
-> "**the requirement for near-executable plans holds only under this study's single-pass constraint, which is a property of the harness and not of the models**, and a bounded-repair arm at v1 and v1.25 would test whether what these executors need is feedback rather than specification."
+> "**The requirement for near-executable plans holds only under this study's single-pass constraint, which is a property of the harness and not of the models**. A bounded repair arm was run at the perturbed condition, with the error fed back and up to three attempts. It answers the question in part. Three of the eleven transcribers fixed the stale path when shown the error, and eight did not."
 
 ---
 
@@ -489,7 +490,7 @@ Identical in substance to C1 and R3.1; see C1 for the full disposition. In addit
 
 #### R3.1 — Fix "agentic" in the title and throughout, or earn it
 
-Accepted; see C1. The title no longer contains the word. The bounded-repair arm that would earn it was not run (§5.1).
+Accepted; see C1. The title no longer contains the word. The bounded repair arm has since been run at the perturbed condition (§5.1). It adds a bounded retry, not an open agentic loop, and the title still does not claim the word.
 
 ---
 
@@ -771,13 +772,17 @@ The three caveats that must travel with the case-study result are in the main te
 
 ---
 
-## 5. Experiments that were not run, and one that since was
+## 5. Experiments that were not run, and two that since were
 
-We list these together so that no reader has to reconstruct what is missing from prose. Two entries from the previous version of this list have since been run. They are the seed extension at the discriminating conditions (§4.6, T3.6) and one variant of the perturbed-plan control (§5.3 below). The remainder were not run, and no result in the manuscript depends on any of them. They are tabulated in main-text Table 7, captioned "Experiments that would each resolve a claim this paper states conditionally. None was run".
+We list these together so that no reader has to reconstruct what is missing from prose. Three entries from the previous version of this list have since been run. They are the seed extension at the discriminating conditions (§4.6, T3.6), one variant of the perturbed-plan control (§5.3 below), and the bounded repair arm (§5.1 below). The remainder were not run, and no result in the manuscript depends on any of them. They are tabulated in main-text Table 8, captioned "Experiments that would each resolve a claim this paper states conditionally. None was run".
 
 ### 5.1 T3.1 — Bounded iterative repair arm (C1, R2.10, R3.1)
 
-**Not run.** Why: it is the largest of the outstanding items, it requires harness work beyond re-running an existing sweep — feeding stdout, stderr and exit codes back into a second and third generation, with a stopping rule — and the revision window was spent on the second workflow class, the repeated-sampling pass, the metrics rewrite and the transcription analysis. What it would take: 72 base cells at v1 and v1.25, at most 216 generations with three repair rounds, on hardware already in hand; the harness already captures the logs the arm would consume. What it would settle, quoted from Table 7: "Whether these executors need specification or feedback; bounds the title." The manuscript states the dependency directly: the requirement for near-executable plans "holds only under this study's single-pass constraint, which is a property of the harness and not of the models."
+**Run, after the second review cycle, at the perturbed condition.** The previous version of this letter declined this arm for its harness cost. It has now been run where it matters most: against the perturbed plan, on which every transcriber fails. The design: if the script exits nonzero, the model sees its own script, the exit code and the last 40 lines of the execution log, and may submit a fix. At most three attempts are allowed. The retry signal is the exit code only; the score is computed afterward and never shown. Thirteen models × 3 seeds (`revision/logs/matrix_jetson_repair.jsonl`; per-attempt scripts under `revision/runs_repair/`).
+
+The result has three tiers. The two binders were perfect on attempt 1, unchanged. `qwen3.6:27b` and `qwen3.8:27b` were perfect on attempt 2 in all three seeds; `laguna-xs-2.1` in two of three. The remaining eight models recovered 0 of 24 seeds in three attempts. Repair rescued 8 of 33 copier seeds. Class success with repair is 14/39, against 6/39 one-shot and 34/36 unperturbed (Results, *Three attempts separate transcribers that repair from transcribers that do not*; main-text Table 7; Supplementary Table S18).
+
+What the arm concedes: the single-pass constraint accounts for part of the transcription finding. For three models, one look at the error replaced the current path the plan lacked. `qwen3.6:27b`'s second attempt tests for the old path, falls back to the path stated in the prompt, and proceeds. What it does not concede: that feedback fixes the class. Eight models failed all three attempts, with the error naming the missing file and the correct path in their prompt. They were not idle. They changed flags, loops and index names while keeping the dead path. Two guessed `data/ref/rCRS.fa` on attempt 3 — the correct filename from the prompt, in the wrong directory. Still not run: repair at the lean plans v1 and v1.25, and any frontier arm. The arm ran at three seeds, under one perturbation type, with a retry only on a nonzero exit.
 
 ### 5.2 T3.2 / R3.6 — Human-expert and second-frontier planner arms
 
@@ -785,7 +790,7 @@ We list these together so that no reader has to reconstruct what is missing from
 
 ### 5.3 R2.1 / R3.preamble — The v2-shifted anti-copy control
 
-**Run, in one variant, after the second review cycle.** The previous version of this letter called this the single most valuable missing experiment in the paper; it has now been run in its moved-reference form: plan v2 verbatim, the reference at `data/ref/GRCh38_chrM/rCRS.fa` instead of the plan's literal `data/ref/chrM.fa`, the real path stated in the prompt's DATASET section, the sandbox validated with a hand-written copier (fails) and binder (succeeds) before any model ran. Thirteen local models × 3 seeds: **6/39 perfect against a 34/36 control, and every model is 3/3 or 0/3.** Eleven of thirteen models copied the stale path verbatim and died at the first step; `gemma4:31b` and `gpt-oss:20b` rebound every path and stayed perfect. The result is the manuscript's central finding (Results, *A one-path perturbation separates transcription from binding*; Table 6; Supplementary Table S17). Still not run: the other perturbation variants — renamed samples, an extra sample, permuted step order, a wrong output path — and any frontier arm, for which no API spend was authorised; these are the first row of main-text Table 7.
+**Run, in one variant, after the second review cycle.** The previous version of this letter called this the single most valuable missing experiment in the paper; it has now been run in its moved-reference form: plan v2 verbatim, the reference at `data/ref/GRCh38_chrM/rCRS.fa` instead of the plan's literal `data/ref/chrM.fa`, the real path stated in the prompt's DATASET section, the sandbox validated with a hand-written copier (fails) and binder (succeeds) before any model ran. Thirteen local models × 3 seeds: **6/39 perfect against a 34/36 control, and every model is 3/3 or 0/3.** Eleven of thirteen models copied the stale path verbatim and died at the first step; `gemma4:31b` and `gpt-oss:20b` rebound every path and stayed perfect. The result is the manuscript's central finding (Results, *A one-path perturbation separates transcription from binding*; Table 6; Supplementary Table S17). Still not run: the other perturbation variants — renamed samples, an extra sample, permuted step order, a wrong output path — and any frontier arm, for which no API spend was authorised; these are the first row of main-text Table 8.
 
 ### 5.4 R2.6 / C4 — The pinned `top_p` / `top_k` re-run
 
@@ -793,7 +798,7 @@ We list these together so that no reader has to reconstruct what is missing from
 
 ### 5.5 R3.2 — The deterministic templater baseline
 
-**Not run.** Why: on the inputs this study used, the outcome is not in doubt — a 20-line templater will produce a correct pipeline every time — so the comparison is only informative on *perturbed* inputs. The perturbed-plan pass (§5.3) now supplies the perturbed side of that comparison without the templater itself: eleven of thirteen local models behaved exactly as a fixed template would — reproduced the stale path and failed — and two did what no template can, rebinding the paths. The manuscript states this in the Discussion: "For most of this model class, then, the objection stands: the model adds nothing a template does not. For two models it demonstrably adds the one thing that matters." The templater itself was still never scored beside the models; what it would take, from Table 7: "no GPU", plus the perturbed input set.
+**Not run.** Why: on the inputs this study used, the outcome is not in doubt — a 20-line templater will produce a correct pipeline every time — so the comparison is only informative on *perturbed* inputs. The perturbed-plan pass (§5.3) now supplies the perturbed side of that comparison without the templater itself: eleven of thirteen local models behaved exactly as a fixed template would — reproduced the stale path and failed — and two did what no template can, rebinding the paths. The manuscript states this in the Discussion: "For most of this model class, then, the objection stands: the model adds nothing a template does not. For two models it demonstrably adds the one thing that matters." The templater itself was still never scored beside the models; what it would take, from Table 8: "no GPU", plus the perturbed input set.
 
 ### 5.6 R3.3 / C2 — A plan gradient inside benchmark 2
 
@@ -827,8 +832,8 @@ We think it is worth stating plainly which of our own claims did not survive thi
 4. **The run-level metric is degenerate on the local arm.** M3 takes only 0.0 and 1.0 across all 324 local reasoning-off cells. Precision is 1.000 by construction.
 5. **No Galaxy executor completed the reporting step.** Neither arm reported a single per-sample number in the two runs of step 7; a human read the six values out of the server. "Both executors submitted a correct invocation" is true; "both executors succeeded" is not.
 6. **The headline finding is close to a restatement of the task-selection criterion.** Both tasks were chosen for having no data-dependent parameter choices. The finding is that a plan works when it states the parameters.
-7. **What was measured at the detailed plan is, for most models, copying. The experiment that separates copying from binding was run and says so.** One moved path, stated in the prompt, sent eleven of thirteen local models from a 34/36 condition to 0. The original headline model is among the eleven. Two models bind. The title no longer claims binding for the class.
+7. **What was measured at the detailed plan is, for most models, copying. The experiment that separates copying from binding was run and says so.** One moved path, stated in the prompt, sent eleven of thirteen local models from a 34/36 condition to 0. The original headline model is among the eleven. Two models bind. With the error fed back, three of the eleven copiers repair within three attempts and eight do not (§5.1). The title no longer claims binding for the class.
 8. **Cross-model orderings are provisional**, because `top_k` and `top_p` sat at differing per-model defaults.
 9. **Four artifact classes are not released**: the Galaxy plan files, the fabrication study's code and per-cell outcomes, the defect ledger with its diffs, and the `loom` session logs. Several benchmark-2 counts therefore rest on a hand-typed contemporaneous record. They are marked as such at every point of use.
 
-What survives is narrower than the first submission claimed and, we think, more useful. A small local 4-bit model reliably produces a working pipeline when the plan hands it invocations it can copy verbatim. For eleven of the thirteen models tested, "copy" is literal: the plan works only while its paths match the data, because the model transcribes rather than binds. Two models bind. The explanation around the invocations adds nothing detectable at these sample sizes. Frontier executors need none of it. And the reason to run an executor locally is data governance rather than cost.
+What survives is narrower than the first submission claimed and, we think, more useful. A small local 4-bit model reliably produces a working pipeline when the plan hands it invocations it can copy verbatim. For eleven of the thirteen models tested, "copy" is literal: the plan works only while its paths match the data, because the model transcribes rather than binds. Two models bind. Three more repair when shown the error, and eight do not. The explanation around the invocations adds nothing detectable at these sample sizes. Frontier executors need none of it. And the reason to run an executor locally is data governance rather than cost.
