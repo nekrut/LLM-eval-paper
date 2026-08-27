@@ -184,7 +184,7 @@ One thing did not survive the swap. R2.3 asked for a residency discussion. Resid
 - Discussion, *Scope*: "**The plan-sufficiency result is conditional on tasks with no data-dependent parameter choices**, and may be in part a restatement of the criterion by which the two tasks were selected. The results support the use of local executors for binding and running pipelines; they say nothing about local executors making analytical decisions."
 - The second benchmark is explicitly not allowed to do work it cannot do: "the case study does not extend the plan-sufficiency result, because it contains no plan gradient" and "no claim is supported by pooling the two."
 
-**Concession.** The near-tautology is now in the paper rather than left for a reviewer to find: the tasks were selected for having no data-dependent parameters, and the headline finding is that a plan works when it states the parameters. We do not think this voids the result. The *quantitative* content — that literal invocations, not prose, account for the difference — is not implied by the selection criterion. But we no longer present the qualitative headline as if it were a discovery independent of the design.
+**Limitation.** We selected tasks that had no data-dependent parameters. Thus, the finding that a complete plan works is partly a result of the selection rule. The quantitative syntax result does not follow from that rule. Literal commands improved outcomes more than explanatory prose. The revised manuscript states both points.
 
 ---
 
@@ -192,7 +192,7 @@ One thing did not survive the swap. R2.3 asked for a residency discussion. Resid
 
 **The point.** A tolerant Jaccard overlap is not a variant-calling metric anyone uses, and the manuscript never said what counts as success.
 
-**Response.** Accepted in full. Conventional metrics were added, the pass/fail criterion is now defined in exactly one place, and the resulting section reports something that hurts: precision is 1.000 by construction and therefore uninformative about calling quality.
+**Response.** Accepted. We added conventional metrics. We also define the pass/fail criterion in one place. Precision was 1.000 because the reference output used the same deterministic caller. Thus, precision does not measure caller quality in this study.
 
 **What changed.**
 
@@ -200,7 +200,7 @@ One thing did not survive the swap. R2.3 asked for a residency discussion. Resid
 - New Results section, *The conventional metrics are not degenerate*: TP = 1,042, FP = 0, FN = 1,874 over 324 reasoning-disabled runs, with per-condition recall (0.086 at Track B, 0.306 at v1, 0.485 at v1.25, 0.886 at v1.5) reported against the run-level success rate in each (Table S12).
 - Table S5 enumerates each departure from the nearest published convention.
 
-**The concession this produced.** "precision is 1.000 by construction, because the truth set is the canonical output of the same deterministic caller." And: "What they cannot do is separate a good caller from a bad one, because the truth set is the same caller's own output, and no perturbation series that would vary accuracy continuously was run." The metrics measure plumbing, not calling. We report them because they *do* separate two failure classes the run-level metric conflates — 8% of runs get partial biology right, and 2.5% get the biology entirely right and then exit non-zero — but they are not a variant-calling evaluation and we no longer imply that they are.
+**Resulting limitation.** Precision was 1.000 because the truth set used the same deterministic caller. The metrics cannot compare the quality of different callers. They do separate two workflow failure types. Eight percent of runs produced a partial call set. Another 2.5% produced the complete call set but then returned a nonzero exit status. We do not describe these metrics as a variant-caller evaluation.
 
 ---
 
@@ -245,7 +245,7 @@ See R2.6 for the unrun pinned-decoder re-run.
 
 **The point.** The paper describes a language model writing shell code that is then executed, and says nothing about what constrains it. This was R1's first comment.
 
-**Response.** Accepted. The honest answer is that benchmark 1 ran essentially unsandboxed, and we say so rather than describing an intended architecture. We also replaced the assertion that nothing bad happened with a measurement.
+**Response.** Accepted. Benchmark 1 did not use an adequate sandbox. The revised manuscript states this directly. It also reports a lexical audit instead of an unsupported safety statement.
 
 **What changed.**
 
@@ -502,7 +502,7 @@ Accepted; see C1. The title no longer contains the word. The bounded repair arm 
 
 **What changed.**
 
-- Introduction concedes the baseline first: "The honest baseline deserves stating without hedging. For any pipeline that is stable and repeatedly run, a validated shell script under version control, a Snakemake or Nextflow rule set, a CWL description, or a saved Galaxy workflow is simply better than a language model … A language model earns its keep at the edges of that template — one-off analyses, adaptation when layouts or tool versions change, a natural-language interface for people who can evaluate a result but do not write code, and *binding*".
+- The Introduction states the baseline first. Stable pipelines do not require a language model. A validated script or workflow system is a better choice. The text then lists possible uses for a model: one-time analyses, changes to inputs or tools, a natural-language interface, and binding a workflow to local inputs.
 - Discussion turns our own best result against the architecture: "The best-performing lean plan, v1.5, is 159 words and ten literal command lines, and local scripts reproduce 0.942 of its tokens. **A 159-word artifact that is ten command lines, version-controlled, reviewed and reproduced at 94% fidelity is a shell script**".
 - The remaining question was narrowed by the moved-path experiment: eleven of thirteen models behaved like a fixed stale template, whereas two rebound the path. The deterministic templater itself was not run, so this is evidence about model behaviour under one perturbation rather than a direct model-versus-templater comparison.
 - The Conclusion carries the same concession rather than dropping it after the Discussion: "the leanest plan that works here is short and literal enough to be a shell script, a comparison this study did not run."
@@ -578,7 +578,7 @@ The minimum viable fix R3 proposed — freeze the protocol, run it on a held-out
 
 **The point.** Some injected "errors" are latency or log-tolerance tests, not failures. Relabel along true-failure vs noise-tolerance axes and rescore.
 
-**Response.** Accepted, and it cost the paper its most favourable error-handling number.
+**Response.** Accepted. The revised classification reduced the reported recovery rate.
 
 **What changed.**
 
@@ -595,13 +595,13 @@ The minimum viable fix R3 proposed — freeze the protocol, run it on a held-out
 
 **The point.** 3/3 supports roughly a 29–100% interval. Either add replicates or soften every claim resting on three trials.
 
-**Response.** Accepted, and we did both. The result is that the original headline did not survive.
+**Response.** Accepted. We added intervals and more sampled generations. The n = 10 results were lower for three models than the n = 3 results.
 
 **What changed.**
 
 - Every proportion carries a Clopper–Pearson exact 95% interval, and the width is stated where a reader might skip it: "3/3 gives [0.29, 1.00], 10/10 gives [0.69, 1.00]."
 - Intervals are applied against our own favourable numbers, not only the unfavourable ones: "That saturation should be read against its interval, since 9/9 is [0.66, 1.00], whose lower bound is not separated from several local cells."
-- New Results section, *Repeated sampling at the headline condition*: "The n = 3 headline does not survive repeated sampling. Adding 7 seeds to the original 3 at v2 Track A … nine of 12 executors are 10/10 (exact 95% CI [0.69, 1.00]); `gpt-oss:20b` is 9/10, `qwen3.5:4b`, which scored 3/3 at n = 3, is 7/10, and `nemotron-3-nano:4b` is 1/10 ([0.00, 0.45]). Every model that moved, moved down, which is the expected direction rather than symmetric noise, so we report n = 10 as the headline and treat every n = 3 cell as an interval."
+- New Results section, *Repeated sampling with plan v2*: "The n = 3 headline does not survive repeated sampling. Adding 7 seeds to the original 3 at v2 Track A … nine of 12 executors are 10/10 (exact 95% CI [0.69, 1.00]); `gpt-oss:20b` is 9/10, `qwen3.5:4b`, which scored 3/3 at n = 3, is 7/10, and `nemotron-3-nano:4b` is 1/10 ([0.00, 0.45]). Every model that moved, moved down, which is the expected direction rather than symmetric noise, so we report n = 10 as the headline and treat every n = 3 cell as an interval."
 - What n = 10 is and is not: "This is **repeated sampling from a single configuration, not replication**: ten seeds on one machine, one engine build, one quantisation, one plan and one scorer vary the sampler and nothing else."
 - The seed extension raised v1g, v1.25 and v1.5 to as many as ten seeds per model (273 new cells, `matrix_jetson_seedext.jsonl`): pooled descriptive totals are 31/126, 63/127 and 109/127. The primary paired model-level analysis gives a mean difference of 0.253 for v1.25 minus v1g (exact sign-flip p = 0.027) and 0.354 for v1.5 minus v1.25 (p = 0.0039). Prose removal remains "not resolved at these sample sizes" (paired sign-test p = 0.63).
 - The flagged adjective is gone; Limitations now states that the one contrast still unresolved is prose removal, and that the v1g/v1.25 contrast and the one-to-ten-command-lines step are resolved at ten seeds.
