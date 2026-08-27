@@ -98,3 +98,21 @@ open('$(TMP).mmd','w').write(m.group(1))"
 
 clean:
 	rm -f $(PDF) $(TMP)
+
+# --- R2 revision PDFs (pandoc >= 2.5; the tablewidths/tablecaptions lua
+# filters need pandoc >= 2.10 and are skipped here) ---
+R2_SRCS := writeup_R2.md response_to_reviewers_R2.md supplement_R2.md
+
+.PHONY: r2
+r2: $(R2_SRCS:.md=.pdf)
+
+%_R2.pdf: %_R2.md $(HEADER)
+	@python3 -c "import re; s=open('$<').read(); \
+s=re.sub(r'<!--\\s*addresses:.*?-->','',s,flags=re.S); \
+open('/tmp/$<','w').write(s)"
+	pandoc /tmp/$< -o $@ \
+	    --pdf-engine=pdflatex \
+	    --resource-path=.:..:../figures:../revision/figures:../revision/galaxy_demo \
+	    -V geometry:margin=1in -V fontsize=10pt -V colorlinks=true \
+	    -V documentclass=article \
+	    -H $(HEADER)
